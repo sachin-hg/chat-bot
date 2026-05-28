@@ -2018,11 +2018,11 @@ FILTER_REGISTRY: list[FilterRecord] = [
     type='boolean',
     default_operation='REPLACE',
     service_scope='both',
-    description='Set to True when user refers to their live location ("near me", "around me"). Orchestrator emits a get_location SSE event; client requests geolocation and sends coordinates in the next POST.',
+    description='Set to True when user refers to their live location ("near me", "around me"). derive_node short-circuits and emits a share_location template (FE renders location permission button). User grants permission → sends location_shared action with coordinates in the next POST.',
     examples=[
       FilterExample(user_says='properties near me', filter_delta={'user_location_needed': True}),
     ],
-    wire_transform='emit get_location SSE event → client responds via next POST with coordinates',
+    wire_transform='derive_node short-circuit → share_location template → client sends location_shared action with coordinates',
     clear_on_pivot_to=[],
   ),
 ]
@@ -2249,11 +2249,10 @@ class BotState(TypedDict):
     validated_text: Optional[str]
 
     # Set by respond_node (full turn) OR by any short-circuiting node.
-    # Type is dict (BotComplete) for structured Tier 3 responses; str for fast canned responses
-    # from safety_node, normalize_node (gibberish), or route_node (tier 0).
-    # The graph runner emits state['bot_response'] as an SSE event after every exit path —
-    # nodes that short-circuit only set this field; they do NOT call emit_sse_event directly.
-    # This invariant ensures exactly one SSE emission per request regardless of exit path.
+    # For full turns: respond_node emits chat_event frames directly and sets this to the last
+    # event dict. For short-circuit paths (safety, clarify, route Tier 0/1/2, etc.): the node
+    # sets this field and emit_final_state in the HTTP handler wraps it in a ChatEventToUser
+    # envelope. Short-circuit nodes never call emit_sse directly.
     bot_response: Optional[dict | str]
 
     # ── Observability ────────────────────────────────────────────────────
@@ -2471,6 +2470,11 @@ async def validate_slm_node(state: BotState) -> dict:
     elif cn is False or cn == '':
         c['clarification_needed'] = None
 
+    # clarification_data must be present when clarification_needed is set.
+    # Old SLM output without structured options — wrap as free-text question.
+    if c.get('clarification_needed') and not c.get('clarification_data'):
+        c['clarification_data'] = {'question_id': 'q1', 'options': []}
+
     # entities_mentioned items must each have 'name' and 'type' keys
     entities = [
         e for e in c.get('entities_mentioned', [])
@@ -2535,6 +2539,17 @@ async def derive_node(state: BotState) -> dict:
     filters = dict(session.get('active_filters', {}))
     derived: dict = {}
 
+    # user_location_needed: SLM set this flag on explore_nearby when user has no saved location.
+    # Short-circuit here — emit share_location template (FE renders a location permission button).
+    # The pipeline resumes on the next turn when the user sends location_shared or location_denied.
+    if filters.get('user_location_needed'):
+        return {
+            'bot_response': {
+                'template_id': 'share_location',
+                'data':        {},
+            },
+        }
+
     if filters.get('price_per_sqft'):
         price_range = convert_price_per_sqft_to_absolute(
             filters['price_per_sqft'],
@@ -2562,16 +2577,26 @@ async def derive_node(state: BotState) -> dict:
 
 # ── 7. clarify_node ───────────────────────────────────────────────────
 # Short-circuits if SLM signalled clarification_needed.
-# Input:  state['classification']['clarification_needed']
-# Output: emits nested_qna SSE event; sets bot_response to stop graph.
+# validate_slm_node guarantees clarification_data is present (with empty options for
+# free-text questions) before this node runs, so no fallback is needed here.
+# Input:  state['classification']['clarification_needed'], state['classification']['clarification_data']
+# Output: sets bot_response with nested_qna template payload; graph exits to emit_final_state.
 async def clarify_node(state: BotState) -> dict:
     c = state.get('classification') or {}
     if c.get('clarification_needed'):
-        # The graph runner detects bot_response is set and emits the SSE event.
+        clarification_data = c.get('clarification_data', {})
+        nested_qna_payload = {
+            'selections': [{
+                'questionId': clarification_data.get('question_id', 'q1'),
+                'title':      c['clarification_needed'],
+                'type':       'single_select' if clarification_data.get('options') else 'text_input',
+                'options':    clarification_data.get('options', []),
+            }]
+        }
         return {
             'bot_response': {
-                'type':    'nested_qna',
-                'payload': c['clarification_needed'],
+                'template_id': 'nested_qna',
+                'data':        nested_qna_payload,
             },
             'clarification_emitted': True,
         }
@@ -2782,16 +2807,37 @@ MODELS: dict[str, str] = {
 # job: NLG over pre-fetched data already in the prompt. Only property_about
 # exposes getNearbyLandmarks as a residual tool for combined queries.
 # Input:  state['system_prompt'], state['tool_definitions'], state['session']['turn_history'], state['routing']['model']
-# Output: state['llm_response'], state['tool_results']
+# Output: state['llm_response'] (includes text_message_id), state['tool_results']
 async def llm_node(state: BotState, llm: LLMPort, emit_sse) -> dict:
     routing = state['routing']
     model   = MODELS['haiku'] if routing['model'] == 'haiku' else MODELS['sonnet']
 
+    # Stable ID for the text row. Generated here so message_delta events and the
+    # final chat_event (text) emitted by respond_node share the same messageId.
+    text_message_id = str(uuid.uuid4())
+    source_msg_id   = state['request_id']
+    chunk_index     = 0
+
+    def on_chunk(chunk: str):
+        nonlocal chunk_index
+        delta_event = {
+            'messageId':       text_message_id,
+            'sourceMessageId': source_msg_id,
+            'sequenceNumber':  0,
+            'chunkIndex':      chunk_index,
+            'content':         {'text': chunk},
+        }
+        if chunk_index == 0:
+            delta_event['messageType'] = 'text'   # 'markdown' for Sonnet intents
+        emit_sse('message_delta', delta_event)
+        chunk_index += 1
+
     async def on_tool_use(tool: str, params: dict) -> Any:
-        # Only reachable for residual tools (get_nearby_landmarks) or Tier B tools
-        # (calculate_emi, calculate_affordability, convert_unit).
+        # Only reachable for residual tools (getNearbyLandmarks) or Tier B tools
+        # (calculateEMI, calculateAffordability, convertUnit).
         # Tier B tools are internal computation: timeout is 500ms (no network hop).
-        # get_nearby_landmarks is an Odin API call: timeout is TOOL_DEFAULT_TIMEOUTS[tool].
+        # getNearbyLandmarks is an Odin API call: timeout is TOOL_DEFAULT_TIMEOUTS[tool].
+        # bot_tool_event is intentionally NOT emitted — FE has no handler for it.
         validation = validate_tool_call(tool, params)
         if not validation['valid']:
             return build_missing_param_error(validation)
@@ -2809,10 +2855,14 @@ async def llm_node(state: BotState, llm: LLMPort, emit_sse) -> dict:
         messages=state['session']['turn_history'],
         tools=state['tool_definitions'],    # usually [] — no tool call capability
         on_tool_use=on_tool_use,
-        on_chunk=lambda chunk: emit_sse({'type': 'bot_chunk',       'text': chunk}),
-        on_tool_event=lambda msg: emit_sse({'type': 'bot_tool_event', 'message': msg}),
+        on_chunk=on_chunk,
+        on_tool_event=None,                 # bot_tool_event dropped — FE has no handler
     )
-    return {'llm_response': llm_response.get('response'), 'tool_results': llm_response.get('tool_results', [])}
+    response = llm_response.get('response') or {}
+    return {
+        'llm_response': {**response, 'text_message_id': text_message_id},
+        'tool_results':  llm_response.get('tool_results', []),
+    }
 
 # ── 13. validate_output_node ──────────────────────────────────────────
 # Strips prohibited content from LLM text output using OUTPUT_RULES registry.
@@ -2832,36 +2882,67 @@ async def validate_output_node(state: BotState) -> dict:
     return {'validated_text': cleaned_text}
 
 # ── 14. respond_node ──────────────────────────────────────────────────
-# Assembles bot_complete frame, persists to Kafka, updates session state.
-# Cards are built from pre_fetched_data (primary) + any residual tool_results.
+# Builds the full ChatEventToUser sequence for this turn and emits each event over SSE.
+# One turn = one text chat_event + zero or more template chat_events (property_carousel,
+# locality_carousel, etc.), all sharing the same sourceMessageId = request_id.
+# This node calls emit_sse directly — NOT via bot_response — because a multi-template turn
+# requires multiple SSE frames. Short-circuiting nodes (clarify, route, etc.) still use
+# bot_response only; emit_final_state in the HTTP handler wraps those.
 # Input:  state['validated_text'], state['pre_fetched_data'], state['tool_results'], state['session']
-# Output: state['bot_response']; emits bot_complete SSE event
-async def respond_node(state: BotState) -> dict:
-    c = state['classification']
-    cards = build_cards_from_tool_results(
-        merge_pre_fetched_and_residual(
-            state.get('pre_fetched_data'),
-            state.get('tool_results') or [],
-        ),
-        c,
+# Output: state['bot_response'] (last event dict); emits chat_event SSE frames directly
+async def respond_node(state: BotState, emit_sse: Callable) -> dict:
+    c               = state['classification']
+    source_msg_id   = state['request_id']   # user turn's request_id = sourceMessageId
+    conversation_id = state['session']['session_id']
+    now             = datetime.utcnow().isoformat() + 'Z'
+    # Reuse the text_message_id generated by llm_node so message_delta and chat_event share it.
+    text_message_id = (state.get('llm_response') or {}).get('text_message_id') or str(uuid.uuid4())
+
+    events: list[ChatEventToUser] = []
+
+    # 1. Text event (always present when validated_text is non-empty)
+    if state.get('validated_text'):
+        events.append(ChatEventToUser(
+            conversation_id      = conversation_id,
+            message_id           = text_message_id,
+            source_message_id    = source_msg_id,
+            message_type         = 'markdown' if is_markdown(state['validated_text']) else 'text',
+            message_state        = 'COMPLETED',
+            source_message_state = 'IN_PROGRESS',  # updated to COMPLETED on last event below
+            created_at           = now,
+            sequence_number      = 0,
+            sender               = {'type': 'bot'},
+            content              = MessageContent(text=state['validated_text']),
+        ))
+
+    # 2. Template events derived from pre_fetched_data + residual tool_results
+    template_events = build_template_events(
+        classification   = c,
+        pre_fetched_data = state.get('pre_fetched_data') or {},
+        tool_results     = state.get('tool_results') or [],
+        session          = state['session'],
+        source_msg_id    = source_msg_id,
+        conversation_id  = conversation_id,
+        seq_start        = len(events),
+        now              = now,
     )
-    bot_response = {
-        'type':  'bot_complete',
-        'text':  state['validated_text'],
-        'cards': cards,
-        'intent': {
-            'main_intent': c['main_intent'],
-            'sub_intent':  c['sub_intent'],
-        },
-    }
+    events.extend(template_events)
+
+    # Last event marks the full turn as COMPLETED
+    if events:
+        events[-1].source_message_state = 'COMPLETED'
+
+    # Emit all events — respond_node calls emit_sse directly for multi-event turns
+    for event in events:
+        emit_sse('chat_event', event.model_dump(by_alias=True))
+
+    bot_response = events[-1].model_dump(by_alias=True) if events else None
 
     # Persist + update session state. Both are reliable (not fire-and-forget) —
     # see Part 8 for Kafka retry queue and optimistic session locking details.
-    await persist_to_kafka(state['session']['session_id'], bot_response)
+    await persist_to_kafka(conversation_id, [e.model_dump(by_alias=True) for e in events])
     session = state['session']
-    saved = await update_session_state(
-        session, c, state.get('tool_results') or [],
-    )
+    saved   = await update_session_state(session, c, state.get('tool_results') or [])
     if not saved:
         # Optimistic lock conflict: another concurrent turn wrote first.
         # Re-fetch session and apply non-destructive fields (turn list append).
@@ -3004,7 +3085,8 @@ def build_params_from_entity(tool_name: str, entity: dict, session: dict) -> dic
 # Tier 1: direct orchestrator action, no LLM call.
 # Write-side tools (contactSeller, shortlistProperty, createSearchAlert) always emit
 # a confirmation card first; the action executes only after user taps "Confirm".
-# Returns a bot_complete dict or a confirmation_required dict.
+# Returns a dict with 'template_id' key (e.g. 'shortlist_property', 'contact_seller')
+# or a plain text dict with 'text' key. emit_final_state handles the SSE wrapping.
 # Receives executor via partial injection at graph construction time.
 async def execute_tier1_action(state: BotState, executor: CachedExecutorPort) -> dict:
     c = state['classification']
@@ -3077,6 +3159,7 @@ graph.add_node('derive',           derive_node)
 graph.add_node('clarify',          clarify_node)
 graph.add_node('resolve_entities', resolve_entities_node)
 graph.add_node('route',            route_node)
+graph.add_node('experiment',       experiment_node)
 graph.add_node('fetch_data',       fetch_data_node)
 graph.add_node('build_prompt',     build_prompt_node)
 graph.add_node('llm',              llm_node)
@@ -3096,7 +3179,8 @@ for src, dst in [
     ('derive',           'clarify'),
     ('clarify',          'resolve_entities'),
     ('resolve_entities', 'route'),
-    ('route',            'fetch_data'),
+    ('route',            'experiment'),      # experiment_node inserted here (Part 12)
+    ('experiment',       'fetch_data'),
     ('fetch_data',       'build_prompt'),
     ('build_prompt',     'llm'),
     ('llm',              'validate_output'),
@@ -3111,10 +3195,15 @@ bot_pipeline = graph.compile()
 
 ### Graph Node Invariants
 
-**Graph runner invariant:** After the graph completes (via full traversal OR early END),
-the runner checks `state['bot_response']`. If set, it emits one `bot_complete` SSE event.
-Nodes that short-circuit only set `bot_response` — they never call `emit_sse_event` directly.
-This guarantees exactly one SSE emission per request regardless of exit path.
+**Graph runner invariant (updated — multi-emit model):**
+- `respond_node` calls `emit_sse('chat_event', ...)` directly for each event in the turn (text row + zero or more template rows).
+- `llm_node` calls `emit_sse('message_delta', ...)` for each streaming chunk when `streamingEnabled=true`.
+- All other nodes that short-circuit only set `bot_response` — they never call `emit_sse` directly.
+- After the graph exits, the HTTP handler calls `emit_final_state()` which emits `bot_response` as a `chat_event` if `respond_node` did NOT run (short-circuit path).
+- `connection_ack` is emitted by the HTTP handler **before** the graph starts.
+- `connection_close` is emitted by the HTTP handler **after** the graph exits.
+
+This replaces the old single-emit-per-request guarantee with: exactly one emission for short-circuit paths (via `emit_final_state`), and one text + N template emissions for full turns (via `respond_node`).
 
 | Node | Short-circuits? | Mutates session? | External I/O? |
 |---|---|---|---|
@@ -3124,15 +3213,16 @@ This guarantees exactly one SSE emission per request regardless of exit path.
 | validate_slm_node | Yes (invalid/unknown) | No | No |
 | filter_apply_node | No | Yes (filters) | No |
 | sanitize_node | No | Yes (filters) | No |
-| derive_node | No | Yes (filters) | Yes (autosuggest for anchor, timeout 2s) |
-| clarify_node | Yes (clarify) | No | No (SSE emit via runner) |
+| derive_node | Yes (user_location_needed) | Yes (filters) | Yes (autosuggest for anchor, timeout 2s) |
+| clarify_node | Yes (clarify) | No | No — sets bot_response; emit_final_state handles SSE |
 | resolve_entities_node | No | Yes (entity map) | Yes (autosuggest, parallel) |
 | route_node | Yes (0/1/2/auth) | No | Yes (tier 1/2 actions) |
+| experiment_node | No | No | No |
 | fetch_data_node | Yes (all failed) | No | Yes (Khoj, Casa, etc.) |
 | build_prompt_node | No | No | No |
 | llm_node | No | No | Yes (Claude; Tier B + residual tools) |
 | validate_output_node | No | No | No |
-| respond_node | No | Yes (turn list) | Yes (Kafka, Redis) |
+| respond_node | No | Yes (turn list) | Yes (Kafka, Redis) — emits SSE directly |
 
 ---
 
@@ -3632,46 +3722,168 @@ Every turn has a unique `request_id` (UUID4) generated by the FastAPI handler be
 It is the single correlation key across all systems: log lines, LangSmith traces, Datadog metrics, and error alerts.
 
 ```python
-import uuid, json
-from fastapi import FastAPI, Request
+import uuid, json, asyncio
+from functools import partial
+from datetime import datetime
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 
 app = FastAPI()
 
-@app.post('/chat/message')
-async def handle_message(request: Request):
-    body       = await request.json()
+def sse_frame(event_name: str, data: dict) -> str:
+    return f'event: {event_name}\ndata: {json.dumps(data)}\n\n'
+
+@app.post('/api/v1/chat/send-message-streamed')
+async def handle_message_streamed(
+    request:          Request,
+    streamingEnabled: bool = Query(default=False),
+):
+    body       = ChatEventFromUser.model_validate(await request.json())
     request_id = str(uuid.uuid4())
-    session    = await session_store.load(body['session_token'])
+    session    = await session_store.load_by_conversation(body.conversation_id, request)
+
+    # Convert incoming message to raw_message for the SLM
+    if body.message_type == 'user_action':
+        action      = (body.content.data or {}).get('action', '')
+        raw_message = map_user_action_to_text(action, body.content.data or {}, session)
+    elif body.message_type == 'context':
+        await update_session_from_context(body, session)
+        return non_streaming_ack(body, request_id)
+    else:
+        raw_message = body.content.text or ''
 
     initial_state: BotState = {
-        'raw_message':          body['content'],
+        'raw_message':          raw_message,
         'session':              session,
         'request_id':           request_id,
         'experiment_id':        None,
         'experiment_variant':   None,
-        # All other fields: None
-        **{k: None for k in BotState.__annotations__ if k not in ('raw_message', 'session', 'request_id', 'experiment_id', 'experiment_variant')},
+        **{k: None for k in BotState.__annotations__
+           if k not in ('raw_message', 'session', 'request_id', 'experiment_id', 'experiment_variant')},
     }
 
-    # Pass request_id to LangSmith as run_id — every node trace is searchable by it.
     run_config = {
         'run_id':   request_id,
         'tags':     [session['session_id']],
         'metadata': {'session_id': session['session_id'], 'request_id': request_id},
     }
 
-    async def generate():
-        async for event in bot_pipeline.astream_events(initial_state, config=run_config, version='v2'):
-            if event['event'] == 'on_chat_model_stream':
-                yield f'data: {json.dumps({"type": "bot_chunk", "text": event["data"]["chunk"].content})}\n\n'
-        final = (await bot_pipeline.aget_state(run_config)).values
-        if final.get('bot_response'):
-            yield f'data: {json.dumps(final["bot_response"])}\n\n'
-        yield 'data: [DONE]\n\n'
+    sse_queue: asyncio.Queue = asyncio.Queue()
 
-    return StreamingResponse(generate(), media_type='text/event-stream',
-                             headers={'X-Request-ID': request_id})
+    def emit_sse(event_name: str, data: dict):
+        sse_queue.put_nowait(sse_frame(event_name, data))
+
+    # Wire emit_sse into nodes that call it directly (llm_node, respond_node)
+    pipeline = bot_pipeline.with_config({
+        'configurable': {
+            'llm':      partial(llm_node, emit_sse=emit_sse if streamingEnabled else lambda *a, **k: None),
+            'respond':  partial(respond_node, emit_sse=emit_sse),
+        }
+    })
+
+    async def generate():
+        # 1. connection_ack — emitted before graph starts
+        yield sse_frame('connection_ack', {
+            'messageId':    request_id,
+            'messageState': 'IN_PROGRESS',
+        })
+
+        # Run graph in background; drain sse_queue as events arrive
+        graph_task = asyncio.create_task(
+            pipeline.ainvoke(initial_state, config=run_config)
+        )
+
+        while not graph_task.done() or not sse_queue.empty():
+            try:
+                frame = sse_queue.get_nowait()
+                yield frame
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0)
+
+        # Collect final state
+        final_state = graph_task.result()
+
+        # 2. emit_final_state — handles short-circuit bot_response (clarify, route, safety, etc.)
+        #    respond_node emits directly AND sets validated_text (via validate_output_node).
+        #    If validated_text is None, the graph exited before respond_node — short-circuit path.
+        if final_state.get('bot_response') and final_state.get('validated_text') is None:
+            async for frame in emit_final_state(final_state, emit_sse):
+                yield frame
+
+        # Drain any remaining queued frames (e.g. from emit_final_state)
+        while not sse_queue.empty():
+            yield sse_queue.get_nowait()
+
+        # 3. connection_close — emitted after graph exits
+        yield sse_frame('connection_close', {'reason': 'response_complete'})
+
+    return StreamingResponse(
+        generate(),
+        media_type='text/event-stream',
+        headers={'X-Request-ID': request_id, 'Cache-Control': 'no-cache'},
+    )
+
+
+async def emit_final_state(state: BotState, emit_sse: Callable):
+    """Wraps short-circuit bot_response values in a proper ChatEventToUser envelope."""
+    bot_response = state.get('bot_response')
+    if bot_response is None:
+        return
+
+    conversation_id = state['session']['session_id']
+    source_msg_id   = state['request_id']
+    now             = datetime.utcnow().isoformat() + 'Z'
+
+    if isinstance(bot_response, str):
+        event = ChatEventToUser(
+            conversation_id      = conversation_id,
+            message_id           = str(uuid.uuid4()),
+            source_message_id    = source_msg_id,
+            message_type         = 'text',
+            message_state        = 'COMPLETED',
+            source_message_state = 'COMPLETED',
+            created_at           = now,
+            sequence_number      = 0,
+            sender               = {'type': 'bot'},
+            content              = MessageContent(text=bot_response),
+        )
+        emit_sse('chat_event', event.model_dump(by_alias=True))
+
+    elif isinstance(bot_response, dict) and bot_response.get('template_id'):
+        # Template short-circuits: nested_qna, share_location, shortlist_property, contact_seller
+        event = ChatEventToUser(
+            conversation_id      = conversation_id,
+            message_id           = str(uuid.uuid4()),
+            source_message_id    = source_msg_id,
+            message_type         = 'template',
+            message_state        = 'COMPLETED',
+            source_message_state = 'COMPLETED',
+            created_at           = now,
+            sequence_number      = 0,
+            sender               = {'type': 'bot'},
+            content              = MessageContent(
+                template_id = bot_response['template_id'],
+                data        = bot_response.get('data', {}),
+            ),
+        )
+        emit_sse('chat_event', event.model_dump(by_alias=True))
+
+    elif isinstance(bot_response, dict) and bot_response.get('text'):
+        # auth_required, fetch_error canned messages — emit as text
+        event = ChatEventToUser(
+            conversation_id      = conversation_id,
+            message_id           = str(uuid.uuid4()),
+            source_message_id    = source_msg_id,
+            message_type         = 'text',
+            message_state        = 'COMPLETED',
+            source_message_state = 'COMPLETED',
+            created_at           = now,
+            sequence_number      = 0,
+            sender               = {'type': 'bot'},
+            content              = MessageContent(text=bot_response['text']),
+        )
+        emit_sse('chat_event', event.model_dump(by_alias=True))
 ```
 
 ### NodeMetrics: Per-Node Business Metrics
@@ -3874,7 +4086,7 @@ fetch_data_node      6 fetches parallel [152ms]  HITS: getRatingsReviews:0, getR
 build_prompt_node    system=3218 tokens  tools=0
 llm_node             sonnet [920ms, 3218→3218 in, 412 out, $0.0103, ttft=240ms]
 validate_output_node PASS
-respond_node         bot_complete  2 cards  session saved
+respond_node         2 chat_events emitted (text + locality_carousel)  session saved
 ```
 
 ### Request Replay
@@ -4031,11 +4243,9 @@ async def experiment_node(state: BotState) -> dict:
     return result
 ```
 
-Graph wiring:
-```python
-graph.add_node('experiment', experiment_node)
-# ... edge changes:
-# route → experiment → fetch_data  (was: route → fetch_data)
+Graph wiring (see Part 5 for full graph — `experiment` node is included there):
+```
+route → experiment → fetch_data
 ```
 
 ### Experiment Graduation Criteria
