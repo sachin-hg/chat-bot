@@ -22,20 +22,19 @@ These are the failure modes the system is explicitly designed to prevent. Every 
 
 ### Tool Call Violations
 
-| Prohibited Behavior | Why | Guardrail |
-|---|---|---|
-| Call `searchProperties` without a resolved city | Returns mumbai-wide garbage or empty results | System prompt: require city in session state before search |
-| Call `searchProperties` more than once per turn | Double result set confuses session state | System prompt: "collect all filter signals, then call once" |
-| Call `getPropertyDetail` for a property already fully in context | Wastes tokens and adds latency | Orchestrator checks if detail already in turn history |
-| Call `resolveEntity` for a locality already stored in `active_locality_id` | Redundant, wastes tokens | Orchestrator pre-populates resolved entities as context |
-| Call `contactSeller` or `shortlistProperty` without auth check | Will fail; bad UX | Orchestrator validates auth token before tool is routed |
-| Call write-side tools without explicit user confirmation | Unintended side effects | System prompt: "never call contact/shortlist unless user explicitly said yes" |
-| Fabricate a `property_id`, `locality_id`, or `project_id` | Non-existent IDs cause tool errors | System prompt: "IDs must come from tool results only" |
-| Call tools sequentially when they can run in parallel | Doubles latency unnecessarily | System prompt: "if two tool calls don't depend on each other, call both simultaneously" |
-| Call `calculateEMI` without `property_price` | All other params have safe defaults; price is the only required field | System prompt: "only property_price is required — extract it from context or ask once" |
-| Call `calculateAffordability` without salary | Salary cannot be defaulted or guessed | System prompt: "never guess income — always ask if not in context" |
-| Call `getNearbyLandmarks` without locality_id or coordinates | Cannot resolve nearby without a location anchor | Orchestrator resolves location from session before tool call; if unresolvable, returns error to LLM so it can ask user |
-| Call `convertUnit` with `bigha` as from/to without `state` | Bigha size varies 10x across states | System prompt: "always ask which state before converting bigha" |
+> **Note:** Most tool call violations listed here are now **architectural impossibilities** under the
+> pre-fetch model. The LLM's `tool_definitions` list is empty for 31 of 32 intents — it cannot call
+> what it cannot see. The remaining items apply to `getNearbyLandmarks` (the one residual tool).
+
+| Prohibited Behavior | Why | Guardrail | Still possible? |
+|---|---|---|---|
+| Call `searchProperties` / `getPropertyDetail` / etc. at runtime | These are orchestrator-only | `llm_visible: false` — not in tool list | **No — architectural** |
+| Call `resolveEntity` to look up an ID | Orchestrator-only (EntityResolutionMiddleware) | `llm_visible: false` | **No — architectural** |
+| Call `contactSeller` or `shortlistProperty` directly | Tier 1 direct actions; orchestrator handles | `llm_visible: false` | **No — architectural** |
+| Call `applyFilter` | Removed entirely; SLM `filter_delta` → `FilterApplyMiddleware` | Tool does not exist in registry | **No — removed** |
+| Fabricate a `property_id`, `locality_id`, or `project_id` | Non-existent IDs cause tool errors | System prompt: "IDs must come from pre-fetched data only" | **Yes — NLG violation** |
+| Call `getNearbyLandmarks` without having a property in session | Cannot resolve location anchor | Orchestrator injects `property_id` from session; if missing, `DataFetchMiddleware` skips | **Residual tool only** |
+| Call Tier B tools (`calculateEMI`, `calculateAffordability`, `convertUnit`) without a concrete input value | Tool requires a number; LLM cannot invent one | System prompt: "Only call Tier B tools when the user has stated all required inputs explicitly" | **Yes — must be guarded** |
 
 ### Response Generation Violations
 
@@ -59,10 +58,10 @@ These are the failure modes the system is explicitly designed to prevent. Every 
 The following are **orchestrator responsibilities**, not LLM responsibilities. The LLM should not attempt to handle them:
 
 - Area unit conversion (sqft → sqyard etc.) — orchestrator `convertAreaUnit()` pre-processes this
-- Per-sqft price to absolute budget conversion — orchestrator `convertPricePerSqftToAbsolute()` pre-processes this
+- Per-sqft price to absolute budget conversion — orchestrator `convert_price_per_sqft_to_absolute()` pre-processes this
 - Ordinal reference resolution ("the 3rd one") — orchestrator `resolveOrdinalReference()` resolves before LLM call
 - BHK additive vs replace semantics — SLM classifier (ADD/REPLACE semantics) + orchestrator applies delta
-- Price sanity check (is ₹30K valid for buy?) — orchestrator `sanitizeFiltersOnPivot()` runs first
+- Price sanity check (is ₹30K valid for buy?) — orchestrator `sanitize_filters_on_pivot()` runs first
 - Service/price consistency (rent session + 5Cr price → nullify price) — orchestrator
 - City-change locality clearing (new city → old localities invalid) — orchestrator
 - Auth state validation — orchestrator checks before routing tool calls
@@ -80,49 +79,52 @@ The bot handles exactly one domain: residential real estate in India. Everything
 
 Runs in the Bot Orchestrator **before** the SLM is even called. Pattern-match on raw user text:
 
-```typescript
-interface ContentCheckResult {
-  blocked: boolean;
-  reason?: 'injection_attempt' | 'vulgar' | 'pii_request' | 'out_of_domain_hard';
-  response?: string;  // deterministic response if blocked
-}
+```python
+import re
+from dataclasses import dataclass, field
+from typing import Optional, Literal
 
-function checkContentSafety(text: string): ContentCheckResult {
-  // Prompt injection patterns
-  const injectionPatterns = [
-    /ignore (previous|all|above) (instructions|prompts|rules)/i,
-    /system:\s*you are/i,
-    /\[INST\]|\[\/INST\]/,                // Llama injection markers
-    /{{.*}}|<%.*%>/,                       // template injection
-    /<script[\s>]|<img[\s>]|javascript:/i, // XSS
-    /\$\{.*\}/,                            // JS template literal injection
-  ];
+@dataclass
+class ContentCheckResult:
+    blocked: bool
+    reason: Optional[Literal['injection_attempt', 'vulgar', 'pii_request', 'out_of_domain_hard']] = None
+    response: Optional[str] = None  # deterministic response if blocked
 
-  // PII / credential extraction attempts
-  const piiPatterns = [
-    /api.?key|access.?token|secret.?key/i,
-    /show me (all )?(user|phone|email|contact|seller) (data|numbers|addresses|list)/i,
-    /what is your (system prompt|instructions|prompt)/i,
-  ];
+def check_content_safety(text: str) -> ContentCheckResult:
+    # Prompt injection patterns
+    injection_patterns = [
+        re.compile(r'ignore (previous|all|above) (instructions|prompts|rules)', re.IGNORECASE),
+        re.compile(r'system:\s*you are', re.IGNORECASE),
+        re.compile(r'\[INST\]|\[\/INST\]'),                # Llama injection markers
+        re.compile(r'{{.*}}|<%.*%>'),                       # template injection
+        re.compile(r'<script[\s>]|<img[\s>]|javascript:', re.IGNORECASE),  # XSS
+        re.compile(r'\$\{.*\}'),                            # template literal injection
+    ]
 
-  // Hard out-of-domain (no point sending to SLM)
-  const hardOutOfDomain = [
-    /\b(covid|coronavirus|vaccine|cancer|diabetes|prescription)\b/i,
-    /\b(stock market|nifty|sensex|crypto|bitcoin|trading)\b/i,
-    /\b(election|politics|political party|bjp|congress|aap)\b/i,
-    /\b(write (me )?(code|script|program|function))\b/i,
-  ];
+    # PII / credential extraction attempts
+    pii_patterns = [
+        re.compile(r'api.?key|access.?token|secret.?key', re.IGNORECASE),
+        re.compile(r'show me (all )?(user|phone|email|contact|seller) (data|numbers|addresses|list)', re.IGNORECASE),
+        re.compile(r'what is your (system prompt|instructions|prompt)', re.IGNORECASE),
+    ]
 
-  for (const p of injectionPatterns) {
-    if (p.test(text)) return {
-      blocked: true, reason: 'injection_attempt',
-      response: "I can only help with property searches and real estate questions."
-    };
-  }
-  // ... similar for other pattern groups
+    # Hard out-of-domain (no point sending to SLM)
+    hard_out_of_domain = [
+        re.compile(r'\b(covid|coronavirus|vaccine|cancer|diabetes|prescription)\b', re.IGNORECASE),
+        re.compile(r'\b(stock market|nifty|sensex|crypto|bitcoin|trading)\b', re.IGNORECASE),
+        re.compile(r'\b(election|politics|political party|bjp|congress|aap)\b', re.IGNORECASE),
+        re.compile(r'\b(write (me )?(code|script|program|function))\b', re.IGNORECASE),
+    ]
 
-  return { blocked: false };
-}
+    for p in injection_patterns:
+        if p.search(text):
+            return ContentCheckResult(
+                blocked=True, reason='injection_attempt',
+                response="I can only help with property searches and real estate questions."
+            )
+    # ... similar for other pattern groups
+
+    return ContentCheckResult(blocked=False)
 ```
 
 **Blocked messages return an immediate deterministic response. No SLM call. No LLM call.**
@@ -158,28 +160,55 @@ Do not escalate, do not repeat the language, do not lecture further.
 
 Runs on `bot_complete.text` before sending to client:
 
-```typescript
-function validateBotOutput(text: string): { valid: boolean; violations: string[] } {
-  const violations: string[] = [];
+```python
+from dataclasses import dataclass, field
 
-  // URLs in text response (FE builds all links)
-  if (/https?:\/\//.test(text)) violations.push('url_in_text');
+@dataclass
+class BotOutputValidation:
+    valid: bool
+    violations: list[str]
 
-  // Phone numbers (10-digit Indian format)
-  if (/[6-9]\d{9}/.test(text)) violations.push('phone_number_in_text');
+@dataclass
+class OutputRule:
+    violation_key: str       # tag added to violations list on match
+    pattern:       re.Pattern
+    action:        Literal['block', 'strip', 'log']
+    # block: remove the match from text + log violation
+    # strip: same as block but does not count toward valid=False
+    # log:   only log; do not modify text
 
-  // Email addresses
-  if (/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/.test(text)) violations.push('email_in_text');
+# OCP: adding a new rule = adding one OutputRule entry here; validate_bot_output never changes.
+OUTPUT_RULES: list[OutputRule] = [
+    OutputRule('url_in_text',          re.compile(r'https?://\S+'),                                            action='block'),
+    OutputRule('phone_number_in_text', re.compile(r'[6-9]\d{9}'),                                              action='block'),
+    OutputRule('email_in_text',        re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),         action='block'),
+    OutputRule('markdown_table',       re.compile(r'\|[-:]+\|'),                                                action='block'),
+    # Soft: log only — hard to distinguish tool-grounded prices from hallucinated ones
+    OutputRule('bare_price_claim',     re.compile(r'(?<!\{)₹\s*\d[\d,.]+\s*(lakh|crore|L|Cr)', re.IGNORECASE), action='log'),
+]
 
-  // Markdown tables
-  if (/\|[-:]+\|/.test(text)) violations.push('markdown_table');
+def validate_bot_output(text: str) -> tuple[str, BotOutputValidation]:
+    """Returns (cleaned_text, validation_result).
+    'block' rules: strip the matched substring from the text.
+    'log' rules: leave the text unchanged; violation is recorded but valid remains True.
+    """
+    violations: list[str] = []
+    cleaned = text
 
-  // Price claims that look LLM-generated (heuristic: numbers without source attribution)
-  // This is a soft check — logged but not blocked, as it's hard to distinguish from tool-grounded prices
+    for rule in OUTPUT_RULES:
+        if rule.pattern.search(cleaned):
+            violations.append(rule.violation_key)
+            if rule.action == 'block':
+                cleaned = rule.pattern.sub('[removed]', cleaned)
+            # 'log' action: no text change
+    # valid=False only for blocking violations (strip/log violations do not invalidate)
+    blocking = {r.violation_key for r in OUTPUT_RULES if r.action == 'block'}
+    valid    = not any(v in blocking for v in violations)
+    return cleaned, BotOutputValidation(valid=valid, violations=violations)
 
-  return { valid: violations.length === 0, violations };
-}
-// If violations found: log for monitoring. Strip URLs/PII. Replace markdown tables with plain text.
+# validate_output_node calls this and uses the returned cleaned text, not the original:
+#   cleaned_text, validation = validate_bot_output(llm_resp['text'])
+#   return {'validated_text': cleaned_text}   # cleaned_text is what the user sees
 ```
 
 ---
@@ -214,58 +243,37 @@ Max 3 chips. Only append this line for Tier 3a (Haiku) turns — Sonnet generate
 
 ### Structured Tool Call Parameter Validation
 
-Before executing any tool call, the orchestrator validates required parameters:
+There are two validation paths, depending on who is calling the tool.
 
-```typescript
-interface ToolCallValidation {
-  tool: string;
-  params: Record<string, unknown>;
-  valid: boolean;
-  missing: string[];
-}
+**Orchestrator-called tools** (all tools except `getNearbyLandmarks`): params come from session state or
+`DataFetchMiddleware`. Required param lists are derived from `TOOL_REGISTRY` via `getRequiredParams(tool)`.
+No LLM involvement, so no error is returned to the LLM.
 
-function validateToolCall(tool: string, params: Record<string, unknown>): ToolCallValidation {
-  const requiredParams: Record<string, string[]> = {
-    searchProperties:       ['filters'],
-    getPropertyDetail:      ['property_id'],
-    getLocalityDetail:      ['locality', 'city'],
-    getPriceTrends:         ['locality', 'city', 'transaction_type'],
-    resolveEntity:          ['raw_name', 'entity_type'],
-    contactSeller:          ['property_id', 'seller_id'],
-    calculateEMI:           ['property_price'],                    // all others have defaults
-    calculateAffordability: [],                                    // validated separately (need salary OR annual_salary)
-    convertUnit:            ['value', 'from', 'to'],
-    getNearbyLandmarks:     [],                                    // validated separately (need locality_id OR coordinates)
-  };
+**LLM-called tools** (`getNearbyLandmarks` only, residual for `property_about`): params come from the LLM.
+The orchestrator validates and, if invalid, returns a structured error to the LLM so it can either
+infer the missing value from context or ask the user.
 
-  // Custom multi-field validations
-  if (tool === 'calculateAffordability' && !params.monthly_salary && !params.annual_salary) {
-    return { tool, params, valid: false, missing: ['monthly_salary or annual_salary'] };
-  }
-  if (tool === 'getNearbyLandmarks' && !params.locality_id && !params.coordinates) {
-    return { tool, params, valid: false, missing: ['locality_id or coordinates'] };
-  }
-  if (tool === 'convertUnit' && (params.from === 'bigha' || params.to === 'bigha') && !params.state) {
-    return { tool, params, valid: false, missing: ['state (required for bigha conversion)'] };
-  }
+```python
+# For the one residual tool — validates LLM-supplied params
+def validate_residual_tool_call(
+    tool: str,
+    params: dict[str, object],
+) -> dict:
 
-  const required = requiredParams[tool] ?? [];
-  const missing = required.filter(k => !params[k]);
+    # getNearbyLandmarks: location is injected by orchestrator from session, so
+    # the LLM only supplies optional category/radius. No required params to validate here.
+    # If orchestrator cannot resolve a location anchor, it short-circuits before the LLM call.
 
-  if (missing.length > 0) {
-    // Don't execute the tool. Return error to LLM so it can ask user for missing input.
-    return { tool, params, valid: false, missing };
-  }
-  return { tool, params, valid: true, missing: [] };
-}
+    required = get_required_params(tool)  # from TOOL_REGISTRY
+    missing = [k for k in required if not params.get(k)]
+    if missing:
+        return {'tool': tool, 'params': params, 'valid': False, 'missing': missing}
+    return {'tool': tool, 'params': params, 'valid': True, 'missing': []}
 ```
 
-If a tool call is invalid (missing required params), the orchestrator returns a structured error to the LLM:
+If `getNearbyLandmarks` is called with invalid params, the orchestrator returns:
 ```json
-{ "error": "missing_params", "tool": "calculateEMI", "missing": ["property_price"], "message": "Ask the user for the property price before calling this tool." }
-{ "error": "missing_params", "tool": "calculateAffordability", "missing": ["monthly_salary or annual_salary"], "message": "Ask the user for their monthly or annual salary before calling this tool. Never guess." }
-{ "error": "missing_params", "tool": "convertUnit", "missing": ["state (required for bigha conversion)"], "message": "Ask the user which state they are in — bigha varies significantly by state." }
-{ "error": "missing_params", "tool": "getNearbyLandmarks", "missing": ["locality_id or coordinates"], "message": "No location context available. Ask user to share their location or specify a locality." }
+{ "error": "missing_params", "tool": "getNearbyLandmarks", "missing": ["..."], "message": "..." }
 ```
 
 ---
@@ -296,12 +304,13 @@ CRITICAL RULES — FACTS:
 - You may express opinions on tradeoffs ("this locality has good connectivity but fewer schools") only when grounding them in tool-returned data.
 
 CRITICAL RULES — TOOL USE:
-- Collect ALL filter signals from the user's message before calling searchProperties. Call it once per turn.
-- Do not call resolveEntity for a locality already in session state as active_locality_id.
-- Do not call contactSeller or shortlistProperty unless the user explicitly confirmed they want to.
-- IDs (property_id, locality_id, project_id) must only come from tool results. Never invent them.
-- If two tool calls don't depend on each other, call both simultaneously — never chain what can be parallelised.
-- If a required input for a calculator tool is missing, ask the user for it before calling the tool.
+- You have no search, filter, or data-fetching tools. All property data, locality data, price trends,
+  and calculation results are already in your context — fetched by the orchestrator before this call.
+  Base your entire response on what is in the context. Do not invent any facts not present.
+- IDs (property_id, locality_id, project_id) must only come from data already in your context.
+  Never invent or guess an ID.
+- For property_about queries, you MAY call getNearbyLandmarks if the user asked about what is nearby.
+  Do not call it otherwise.
 
 CRITICAL RULES — OUTPUT:
 - Begin EVERY response with exactly one sentence starting with a verb that summarises what you understood.
@@ -334,16 +343,31 @@ Detect language from the user's message. Respond in the same language (Hindi, Ma
 
 ### Section 2: Tool Definitions
 
-Loaded based on session state:
+The LLM's tool list is assembled by `buildAllLLMTools()` using two sources:
 
-| Session State | Tools Loaded |
+**1. Residual tools** — intent-specific, from `INTENT_REGISTRY.residual_tools`. Usually `[]`.
+
+**2. Tier B tools** — always injected for all Tier 3 intents EXCEPT `calculator/*` (where the
+result is already pre-fetched inline). Three tools: `calculateEMI`, `calculateAffordability`,
+`convertUnit`. All are pure local computation (no API calls, sub-50ms). The LLM may call
+these when a financial question appears mid-session regardless of which intent was classified.
+
+| Intent | LLM tools |
 |---|---|
-| `BOT_ACTIVE` | All property/locality/search tools |
-| `PROPERTY_SELECTED` | getPropertyDetail, getSimilarProperties, getFloorPlans, getTransactionHistory, getPriceTrends, getPaymentPlans, getProjectDetail, contactSeller |
-| `SUPPORT_BOT` | getSupportHistory, raiseTicket, getOrderStatus, getPolicyDoc |
-| `P2P + BOT_ASSIST` | getPropertyDetail (read-only, no search) |
+| `calculator/*` | `[]` — orchestrator pre-fetched the result; nothing to call |
+| All other Tier 3 intents except `property_about` | `[calculateEMI, calculateAffordability, convertUnit]` |
+| `property_detail / property_about` | `[getNearbyLandmarks, calculateEMI, calculateAffordability, convertUnit]` |
 
-This keeps the tool list small — the LLM only sees tools relevant to the current state, reducing hallucinated tool calls and token cost.
+**Constraint for Tier B tool calls:**
+The LLM must only call Tier B tools when the user has explicitly stated all required inputs.
+`calculateEMI` requires a property price — the LLM cannot invent one.
+`calculateAffordability` requires a salary — same rule.
+`convertUnit` requires value + units — same rule.
+If required inputs are missing, ask the user, do not call with guessed values.
+
+This replaces the old session-state-based tool loading. The LLM no longer decides what to fetch —
+it receives the data and formats a response. Prompt size reduction: ~1200–2800 tokens per Haiku
+call vs. the previous full tool definition set (Tier B adds ~300 tokens back, net improvement holds).
 
 ### Section 3: Conversation State (injected per request)
 
@@ -375,10 +399,15 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 ### `searchProperties`
 
-```typescript
+> **Orchestrator-only tool** (`llm_visible: false`). Pre-fetched by `DataFetchMiddleware` using
+> session `active_filters` as params. The LLM never calls this — it receives the result inline.
+> Filter changes come from the SLM's `filter_delta`; `FilterApplyMiddleware` applies them before
+> any LLM call.
+
+```json
 {
   name: "searchProperties",
-  description: "Search for properties matching the user's requirements. Call this when the user describes what they are looking for. Do not call this more than once per user message — collect all filter signals from the message first, then call once.",
+  description: "Search for properties matching active session filters.",
   input_schema: {
     type: "object",
     properties: {
@@ -408,16 +437,21 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
           listed_by:          { type: "string", enum: ["owner", "broker", "builder"], description: "Who listed the property. Maps to contact_person_id (owner=4, broker=1, builder=3)." },
           search_type:        { type: "string", enum: ["project", "resale"], description: "New project vs resale/secondary market. Maps to type param in Khoj." },
           facing:             { type: "array", items: { type: "string", enum: ["east", "west", "north", "south"] } },
-          is_verified:        { type: "boolean", description: "Housing.com verified listings only." },
-          is_rera_verified:   { type: "boolean", description: "RERA registered projects only." },
-          paid:               { type: "boolean", description: "Filter to promoted/paid listings (true) or non-promoted (false). Omit to show both." },
-          possession_by:      { type: "integer", description: "For under-construction: max months to possession. Maps to max_poss in Khoj." },
-          max_available_in:   { type: "integer", description: "Rent only: property available within N days. Maps to max_available_in in Khoj." }
+          is_verified:             { type: "boolean", description: "Housing.com verified listings only." },
+          is_rera_verified:        { type: "boolean", description: "RERA registered projects only." },
+          paid:                    { type: "boolean", description: "Filter to promoted/paid listings (true) or non-promoted (false). Omit to show both." },
+          possession_status:       { type: "string", enum: ["ready_to_move", "under_construction", "new_launch"], description: "Orchestrator expands to Khoj wire params: ready_to_move → max_poss=0; new_launch → current_status + initiation_date." },
+          availability_within_days: { type: "integer", description: "Rent only: property available within N days. Maps to custom_available_in=1, max_available_in=N in Khoj." },
+          owner_only:              { type: "boolean", description: "Direct owner listings only (no brokers). Maps to contact_person_id=2 in Khoj." },
+          family_friendly:         { type: "boolean", description: "Family-friendly properties only. Maps to family_friendly_properties=true + lease_type_ids=1 in Khoj." },
+          media_filter:            { type: "string", enum: ["video_tour", "3d_tour"], description: "Only listings that have a video or 3D tour. Maps to media_filter in Khoj." },
+          days_filter:             { type: "integer", description: "Only listings added within the last N days. Maps to days_filter in Khoj." }
         }
       },
       sort_by: {
         type: "string",
         enum: ["relevance", "price_asc", "price_desc", "newest", "area_desc"],
+        description: "Maps to sort_key in Khoj. Default: relevance.",
         default: "relevance"
       },
       page: { type: "integer", default: 1 },
@@ -430,7 +464,7 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 **Return schema (tool result — normalized from Khoj `data.hits[]`):**
 
-```typescript
+```json
 {
   search_result_set_id: string,    // opaque ID stored in session state for pagination/refinement
   total_count: number,             // Khoj: resale_total_count + np_total_count for buy; total for rent
@@ -462,24 +496,33 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 ### `getPropertyDetail`
 
-```typescript
+> **Orchestrator-only tool** (`llm_visible: false`). Pre-fetched by `DataFetchMiddleware`; LLM
+> receives the result inline. `property_type` is injected from session state and controls which
+> backend service is called — the LLM never passes routing parameters.
+>
+> **Backend routing by `property_type` (orchestrator-injected):**
+> | `property_type` | Service | Endpoint |
+> |---|---|---|
+> | `project` | Venus | `/api/v9/new-projects/{id}/webapp` |
+> | `resale` | Casa | `/api/v2/flat/{id}/resale/details` |
+> | `rent` | Casa | `/api/v2/flat/{id}/rent/details` |
+> | `paying_guest` | Casa | `/api/v1/flat/{id}/rent/details` |
+> | `commercial` | Jasprr | `/api/v0/commercial/{id}` |
+> | `flatmate` | Jasprr | `/api/v0/residential/flatmates/{id}/details` |
+>
+> Response always includes `coordinates: {lat, lng}` and `polygon_uuid` — these are stored in
+> session state and used by `getTravelTime` and `getDemandSupplyInsight` respectively.
+
+```json
 {
   name: "getPropertyDetail",
-  description: "Fetch complete details for a specific property. Call this when the user selects a property or asks about its specifics (price, area, floor, amenities, seller info). Always call this before answering detail questions — never guess.",
+  description: "Fetch complete details for a specific property.",
   input_schema: {
     type: "object",
     properties: {
-      property_id:      { type: "string" },
-      transaction_type: {
-        type: "string",
-        enum: ["rent", "resale"],
-        description: "Required to route to the correct Casa endpoint: resale → /flat/{id}/resale/details, rent → /flat/{id}/rent/details. If omitted, orchestrator injects from session state."
-      },
-      property_kind: {
-        type: "string",
-        enum: ["flat", "project"],
-        description: "Flat (resale/rent listing) vs project (new launch). Orchestrator routes accordingly. If omitted, defaults to 'flat'."
-      }
+      property_id: { type: "string", description: "ID from search results or session context" }
+      // property_type — orchestrator injects from session.active_property_kind
+      // transaction_type — orchestrator injects from session.transaction_type
     },
     required: ["property_id"]
   }
@@ -488,7 +531,7 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 **Return schema:**
 
-```typescript
+```json
 {
   property_id: string,
   title: string,
@@ -533,10 +576,13 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 ### `getLocalityDetail`
 
-```typescript
+> **Orchestrator-only tool** (`llm_visible: false`). Pre-fetched for locality research and
+> comparison intents. LLM receives the result inline.
+
+```json
 {
   name: "getLocalityDetail",
-  description: "Get amenity, connectivity, review, and school data for a locality. Call this when user asks about an area rather than a specific property — commute times, nearby schools, safety, vibe.",
+  description: "Get amenity, connectivity, review, and school data for a locality.",
   input_schema: {
     type: "object",
     properties: {
@@ -551,7 +597,7 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 **Return schema:**
 
-```typescript
+```json
 {
   locality: string,
   city: string,
@@ -592,10 +638,13 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 ### `getPriceTrends`
 
-```typescript
+> **Orchestrator-only tool** (`llm_visible: false`). Pre-fetched for price trend and comparison
+> intents. LLM receives the result inline.
+
+```json
 {
   name: "getPriceTrends",
-  description: "Fetch historical price trend data for a locality. Call when user asks about price direction, appreciation, or 'is it a good time to buy'.",
+  description: "Fetch historical price trend data for a locality.",
   input_schema: {
     type: "object",
     properties: {
@@ -611,7 +660,7 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 **Return schema:**
 
-```typescript
+```json
 {
   locality: string,
   transaction_type: "rent" | "buy",
@@ -634,7 +683,7 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 ### `getTransactionHistory`
 
-```typescript
+```json
 {
   name: "getTransactionHistory",
   description: "Fetch actual registered sale/rental transactions in a locality. Use for grounding price discussions in real data.",
@@ -656,7 +705,7 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 ### `getProjectDetail`
 
-```typescript
+```json
 {
   name: "getProjectDetail",
   description: "Fetch builder, construction status, phases, RERA, and payment plan data for a housing project. Use when user asks about under-construction properties, builder reputation, or delivery timelines.",
@@ -672,7 +721,7 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 **Return schema:**
 
-```typescript
+```json
 {
   project_id: string,
   name: string,
@@ -711,7 +760,7 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 ### `getFloorPlans`
 
-```typescript
+```json
 {
   name: "getFloorPlans",
   description: "Fetch floor plan images AND room dimension data for a property or project configuration. Always produces two outputs: (1) template floor_plans sent to FE for visual display, (2) dimension data read by LLM to write a textual layout analysis in markdown.",
@@ -728,7 +777,7 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 **Return schema (dual output):**
 
-```typescript
+```json
 {
   plans: Array<{
     plan_id: string,
@@ -759,18 +808,22 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 
 **Bot Orchestrator dual-output handling:**
 
-```typescript
-// After getFloorPlans tool call:
-// 1. Full result (images + dimensions) → NOT sent to LLM as-is (too many tokens)
-// 2. Template payload (images only, no dimension data) → FE via bot_complete
-// 3. Dimension summary → LLM context for generating text analysis
+```python
+# After getFloorPlans tool call:
+# 1. Full result (images + dimensions) → NOT sent to LLM as-is (too many tokens)
+# 2. Template payload (images only, no dimension data) → FE via bot_complete
+# 3. Dimension summary → LLM context for generating text analysis
 
-function summariseFloorPlans(result: FloorPlanResult): string {
-  return result.plans.map(p => {
-    const rooms = p.rooms.map(r => `${r.name}: ${r.dimensions}`).join(', ');
-    return `${p.bhk}BHK ${p.area_sqft}sqft — Rooms: ${rooms}. Balconies: ${p.balconies}. Layout: ${p.layout_notes ?? 'standard'}.`;
-  }).join('\n');
-}
+def summarise_floor_plans(result: dict) -> str:
+    lines = []
+    for p in result.get('plans', []):
+        rooms = ', '.join(f"{r['name']}: {r['dimensions']}" for r in p.get('rooms', []))
+        layout = p.get('layout_notes') or 'standard'
+        lines.append(
+            f"{p['bhk']}BHK {p['area_sqft']}sqft — Rooms: {rooms}. "
+            f"Balconies: {p['balconies']}. Layout: {layout}."
+        )
+    return '\n'.join(lines)
 ```
 
 LLM receives the summary and generates the markdown analysis (entry, kitchen, bedrooms, bathrooms, balconies, layout feel sections visible in the design screens). FE receives the image carousel template separately via the `template` field in `bot_complete`.
@@ -780,18 +833,23 @@ LLM receives the summary and generates the markdown analysis (entry, kitchen, be
 
 ### `getSimilarProperties`
 
-```typescript
+> **Orchestrator-only tool** (`llm_visible: false`). The `variant` param controls the Khoj
+> similarity algorithm. SLM injects `similarity_variant` into `filter_delta` based on the
+> user's phrasing; orchestrator reads it and passes to the tool.
+
+```json
 {
   name: "getSimilarProperties",
-  description: "Fetch properties similar to a given one. Use when user says 'show me more like this' or asks for alternatives.",
+  description: "Fetch properties similar to a given one. Variant controls the comparison axis.",
   input_schema: {
     type: "object",
     properties: {
-      property_id:  { type: "string" },
-      similarity_by: {
+      property_id: { type: "string" },
+      variant: {
         type: "string",
-        enum: ["price", "locality", "size", "project", "overall"],
-        default: "overall"
+        enum: ["default", "better_priced", "compare_properties", "top_new_projects"],
+        description: "default = overall similar | better_priced = cheaper alternatives | compare_properties = same config for side-by-side comparison | top_new_projects = similar new launches",
+        default: "default"
       },
       count: { type: "integer", default: 3, maximum: 5 }
     },
@@ -804,23 +862,20 @@ LLM receives the summary and generates the markdown analysis (entry, kitchen, be
 
 ### `getTrendingLocalities`
 
-```typescript
+> **Orchestrator-only tool** (`llm_visible: false`). Pre-fetched by `DataFetchMiddleware`.
+> `budget_range` removed — orchestrator injects from session `price_min`/`price_max` directly.
+
+```json
 {
   name: "getTrendingLocalities",
-  description: "Get localities trending in searches, price appreciation, or new supply. Use when user is open to location suggestions.",
+  description: "Get localities trending in searches, price appreciation, or new supply.",
   input_schema: {
     type: "object",
     properties: {
       city:             { type: "string" },
       transaction_type: { type: "string", enum: ["rent", "buy"] },
-      ranked_by:        { type: "string", enum: ["search_volume", "price_appreciation", "new_supply", "overall"], default: "overall" },
-      budget_range: {
-        type: "object",
-        properties: {
-          min: { type: "number" },
-          max: { type: "number" }
-        }
-      }
+      ranked_by:        { type: "string", enum: ["search_volume", "price_appreciation", "new_supply", "overall"], default: "overall" }
+      // budget_range — orchestrator injects from session.active_filters.price_min / price_max
     },
     required: ["city", "transaction_type"]
   }
@@ -831,18 +886,18 @@ LLM receives the summary and generates the markdown analysis (entry, kitchen, be
 
 ### `resolveEntity`
 
-```typescript
+```json
 {
   name: "resolveEntity",
-  description: "Resolve a free-text locality, project, developer, or landmark name to structured IDs for use in other tools. Call this when the user names a location not already in session state (active_locality_id / active_city). Do NOT call if the entity is already resolved — check session state first.",
+  description: "Resolve a free-text locality, project, developer, landmark, or building name to structured IDs. Called by EntityResolutionMiddleware — never by the LLM.",
   input_schema: {
     type: "object",
     properties: {
-      query:        { type: "string", description: "The user-supplied name to resolve. e.g. 'Bandra West', 'Lodha Palava', 'DLF'." },
+      query:        { type: "string", description: "The user-supplied name to resolve. e.g. 'Bandra West', 'Lodha Palava', 'DLF', 'Manyata Tech Park'." },
       entity_type:  {
         type: "string",
-        enum: ["locality", "project", "developer", "landmark", "city"],
-        description: "Hint for autosuggest filtering. Use 'locality' for area names, 'project' for housing projects, 'developer' for builder names."
+        enum: ["locality", "project", "developer", "landmark", "building", "city"],
+        description: "Hint for autosuggest filtering. locality = area/neighbourhood, project = housing project, developer = builder, landmark = POI/establishment, building = specific society or building."
       },
       city:         { type: "string", description: "Optional city scope to narrow results." },
       service:      { type: "string", enum: ["buy", "rent"], description: "Transaction context — affects autosuggest ranking." }
@@ -856,17 +911,21 @@ LLM receives the summary and generates the markdown analysis (entry, kitchen, be
 
 **Return schema:**
 
-```typescript
+```json
 {
   resolved: boolean,
   candidates: Array<{
     uuid:          string,          // polygon UUID — use as poly param in Khoj, locality_uuid in Gandalf/Odin
     id:            string,          // entity ID (may differ from uuid for projects/developers)
     display_name:  string,          // canonical display name e.g. "Bandra West, Mumbai"
-    type:          string,          // "locality" | "project" | "developer" | "landmark" | "city"
+    type:          string,          // "locality" | "project" | "developer" | "landmark" | "building" | "city"
+    filter_key:    string,          // Khoj query param for this entity type:
+                                    //   locality → "poly" | landmark → "est" | developer → "uuid"
+                                    //   project → "region_entity_id" | building → "bldng"
     city_name:     string,
     city_uuid:     string,
-    coordinates:   [number, number] | null,  // [lat, lng] — present for landmarks/establishments
+    coordinates:   [number, number] | null,  // [lat, lng] — present for landmarks AND buildings
+                                              // Required for getTravelTime destination resolution
     score:         number           // autosuggest confidence, 0–1
   }>,
   // If resolved=true and candidates.length=1: orchestrator auto-populates active_locality_id / active_city
@@ -877,66 +936,50 @@ LLM receives the summary and generates the markdown analysis (entry, kitchen, be
 
 **Key rules:**
 - If `needs_disambiguation: true`, the LLM must show options to the user — never pick one silently.
-- The top candidate's `uuid` maps directly to Khoj's `poly` param and Gandalf's `uuid` param.
-- The top candidate's `city_uuid` maps to Khoj's `city_uuid` param.
-- For landmarks/establishments: `coordinates` drives `lat`+`long`+`outer_radius` in Khoj.
+- The top candidate's `filter_key` determines which Khoj param to populate (not always `poly`).
+- The top candidate's `uuid` maps to Gandalf's `uuid` param and Odin's `locality_uuid` param.
+- `coordinates` is populated for landmarks AND buildings — orchestrator uses it as the destination in `getTravelTime` when the user names a destination by building or POI name.
 
 ---
 
-### `applyFilter`
+### `applyFilter` — removed from LLM tool set
 
-```typescript
-{
-  name: "applyFilter",
-  description: "Modify the active search filters based on user refinement. Call this instead of searchProperties when the user is narrowing an existing result set (e.g., 'filter to under 70k', 'only show furnished'). Updates session state and returns a new result set.",
-  input_schema: {
-    type: "object",
-    properties: {
-      search_result_set_id: { type: "string", description: "The srset_* ID from the active search" },
-      filter_delta: {
-        type: "object",
-        description: "Only include keys that are changing. Existing filters not mentioned are preserved.",
-        properties: {
-          price_max:    { type: "number" },
-          price_min:    { type: "number" },
-          localities:   { type: "array", items: { type: "string" } },
-          bhk:          { type: "array", items: { type: "integer" } },
-          furnishing:   { type: "string" },
-          amenities:    { type: "array", items: { type: "string" } },
-          verified_only: { type: "boolean" }
-        }
-      },
-      sort_by: { type: "string", enum: ["relevance", "price_asc", "price_desc", "newest"] }
-    },
-    required: ["search_result_set_id", "filter_delta"]
-  }
-}
-```
+> **Orchestrator-internal only.** `applyFilter` is not a tool the LLM ever calls. Filter changes
+> are expressed by the SLM as a `filter_delta` in its classification output. `FilterApplyMiddleware`
+> applies the delta to session state deterministically before any LLM call. The LLM then receives
+> `searchProperties` results (pre-fetched by `DataFetchMiddleware`) with filters already applied.
+>
+> There is no case where the LLM should modify filters at runtime — that pathway is removed.
 
 ---
 
-### `contactSeller`
+### `contactSeller` — Tier 1 direct action
 
-```typescript
+> **Orchestrator-only** (`llm_visible: false`). Not an LLM tool call — a Tier 1 direct action
+> handled entirely by `RoutingMiddleware` before any LLM call.
+
+When `contact_seller` intent is classified:
+
+1. Orchestrator confirms `active_property_id` and `seller_id` are in session state
+2. If auth is missing → emit `auth_required` frame, stop
+3. If not yet confirmed by user → emit a confirmation card ("Contact this seller?"), stop
+4. On confirmation → call `contactSeller` API directly, publish `session_state_change` event to Kafka
+5. Kafka → Redis → client receives `session_state_change` WS frame → routing gateway switches to `user_seller_chat` service
+
+```json
 {
-  name: "contactSeller",
-  description: "Initiate contact with a property seller. This triggers a session state transition to P2P_ACTIVE. Only call after user explicitly confirms they want to contact the seller.",
-  input_schema: {
-    type: "object",
-    properties: {
-      property_id: { type: "string" },
-      seller_id:   { type: "string" },
-      user_message: {
-        type: "string",
-        description: "Optional opening message from the user to the seller"
-      }
-    },
-    required: ["property_id", "seller_id"]
+  "name": "contactSeller",
+  "input": {
+    "property_id": "<string>",
+    "seller_id":   "<string>"
   }
 }
 ```
+<!-- Orchestrator executes directly — never passed to LLM.
+     property_id from session.active_property_id; seller_id from session.active_seller_id. -->
 
-**This tool is special.** It doesn't just fetch data — it triggers a side effect: session state transition to `P2P_ACTIVE`. The tool executor publishes a `session_state_change` event to Kafka, which flows to Redis and out to the client as a `session_state_change` WS frame.
+The LLM is not involved. The "seamless transition" to P2P chat is a routing gateway event, not a
+bot response.
 
 ---
 
@@ -956,26 +999,40 @@ The LLM uses clean, human-readable parameter names. The orchestrator translates 
 | `property_type: "apartment"` | `property_type_id=1` | apartment=1, villa=2, plot=4, builder_floor=3 |
 | `furnishing: "furnished"` | `furnish_type_id=1` | furnished=1, semi=2, unfurnished=3 |
 | `amenities: ["gym","pool"]` | `gym=true&pool=true` | Each amenity becomes a separate boolean key |
-| `construction_status: ["new_launch"]` | `initiation_date=1.0&min_poss=0` | Special Khoj v9 handling |
-| `construction_status: ["under_construction","ready_to_move"]` | `construction_filters=under_construction,ready_to_move` | |
+| `possession_status: "new_launch"` | `current_status=Under Construction&initiation_date={1yr ago epoch}` | Orchestrator expands |
+| `possession_status: "ready_to_move"` | `max_poss=0` | |
+| `possession_status: "under_construction"` | `current_status=Under Construction` | |
 | `listed_by: "owner"` | `contact_person_id=4` | owner=4, broker=1, builder=3 |
-| `listed_by: "broker"` | `contact_person_id=1` | |
-| `listed_by: "builder"` | `contact_person_id=3` | |
-| `search_type: "project"` | `type=project` | |
-| `search_type: "resale"` | `type=resale` | |
+| `owner_only: true` | `contact_person_id=2` | Stricter owner-only filter |
+| `family_friendly: true` | `family_friendly_properties=true&lease_type_ids=1` | |
+| `media_filter: "video_tour"` | `media_filter=video_tour` | |
+| `days_filter: 7` | `days_filter=7` | Last N days |
+| `sort_by: "price_asc"` | `sort_key=price_asc` | |
+| `availability_within_days: 7` | `custom_available_in=1&max_available_in=7` | Rent only |
 | `is_verified: true` | `is_verified=true` | |
 | `is_rera_verified: true` | `is_rera_verified=true` | |
-| `paid: true` | `paid=true` | |
-| `possession_by: 24` | `max_poss=24` | months |
-| Cursor pagination | `p={page}&cursor={cursor}` | Buy also: `resale_total_count`, `np_total_count` |
+| Cursor pagination | `p={page}&cursor={cursor}` | Buy: `resale_total_count`, `np_total_count` |
+| Bot mode | `reduce_data_size=true&for_bot=true` | Always injected by orchestrator; uses `/bot/filter` endpoint |
 
-### `getPropertyDetail` → Casa
+### `getPropertyDetail` → multi-service routing
 
-| Condition | Endpoint |
-|-----------|----------|
-| `transaction_type: "resale"` (or session service=buy) | `GET casa.housing.com/api/v1/flat/{id}/resale/details` |
-| `transaction_type: "rent"` (or session service=rent) | `GET casa.housing.com/api/v1/flat/{id}/rent/details` |
-| `property_kind: "project"` | `GET venus.housing.com/api/v8/new-projects/{id}/android` |
+| `property_type` (session) | Service | Endpoint |
+|--------------------------|---------|----------|
+| `project` | Venus | `/api/v9/new-projects/{id}/webapp?fixed_images_hash=true` |
+| `resale` | Casa | `/api/v2/flat/{id}/resale/details` |
+| `rent` | Casa | `/api/v2/flat/{id}/rent/details` |
+| `paying_guest` | Casa | `/api/v1/flat/{id}/rent/details` |
+| `commercial` | Jasprr | `/api/v0/commercial/{id}?service_id={serviceId}` |
+| `flatmate` | Jasprr | `/api/v0/residential/flatmates/{id}/details` |
+
+All responses include `coordinates: {lat, lng}` (stored as `session.active_property_coordinates`) and `polygon_uuid` (stored as `session.active_locality_id`) for downstream use by `getTravelTime` and `getDemandSupplyInsight`.
+
+### `getPriceTrends` vs `getProjectPriceTrends`
+
+| Context | Tool | Backend | Param |
+|---|---|---|---|
+| User asks about a **locality** | `getPriceTrends` | Gandalf `polygon_price_trend_details` | `uuid` = polygon UUID |
+| User asks about a **specific project** | `getProjectPriceTrends` | Gandalf `NEW_PRICE_TRENDS` | `projectIds[]` |
 
 ### `getPriceTrends` → Gandalf
 
@@ -1000,78 +1057,235 @@ GET autosuggest.housing.com/v3/suggest?query={name}&service={buy|rent}&size=5
 Response: { data: { templates: [ { uuid, id, type, city_name, city_uuid, bbx_uuid, lon_lat } ] } }
 ```
 
+### `getTravelTime` → Regions
+
+Two-phase orchestration for commute_time intent:
+
+1. **Phase 1 (parallel_group 1):** `getPropertyDetail` if `session.active_property_coordinates` is not set — populates origin lat/lng from property detail response.
+2. **Phase 2 (parallel_group 2):** `EntityResolutionMiddleware` has already resolved destination names to coordinates via `resolveEntity`. `DataFetchMiddleware` calls `getTravelTime` with:
+   - `origin`: `{ lat: session.active_property_coordinates.lat, lng: session.active_property_coordinates.lng }`
+   - `destinations`: `ctx.resolved_entities.map(e => ({ id: e.id, lat: e.coordinates[0], lng: e.coordinates[1] }))`
+
+```
+GET regions.housing.com/api/v1/travel-distance-and-time
+  ?origin={encoded JSON lat/lng}
+  &destinations={encoded JSON array of {id, lat, lng}}
+
+Response: { [destination_id]: { distance, duration, distance_text, duration_text } }
+```
+
+### `getDemandSupplyInsight` → Casa
+
+```
+GET casa.housing.com/api/v2/flat/locality-bhk-demand-supply
+  ?polygonUuid={polygon_uuid}
+  &serviceType={buy|rent}
+
+Response fields used:
+  buyer_interest              — free-text sentiment string from backend, used verbatim in bot response
+  potential_buyer_count       — integer, active buyers searching this locality
+  potential_seller_count      — integer, active listings / sellers
+  buyer_count_percentage_change  — MoM change in buyer count
+  demand_percentages          — { bhk_1: pct, bhk_2: pct, ... } — what BHK configs buyers want
+  supply                      — { bhk_1: listing_count, ... } — what BHK configs are listed
+  demand_percentage_change    — overall demand MoM change
+  supply_percentage_change    — overall supply MoM change
+```
+
+`polygon_uuid` is injected from `session.active_locality_id` (set when `getPropertyDetail` runs and stores `polygon_uuid`, or from `resolveEntity` for locality research intents).
+
+### `getPriceBuckets` → Khoj
+
+```
+GET khoj.internal/api/v7/buy/search-count?showBucket=true&{active_filters}
+    (or /v1/rent/search-count for rent)
+
+Response fields:
+  aggregations.price_aggs     — histogram buckets (buy)
+  aggregations.percentile_aggs['90.0']  — 90th percentile price (rent)
+  aggregations.price_aggregations_5k_bucket.price_aggs  — 5K-width rent buckets
+```
+
+### `getProjectPriceTrends` → Gandalf
+
+```
+GET data.housing.com/price_trends_housing/new_price_trends
+  ?projectIds[]={ids}
+  &flatType={1|2}          (1=buy, 2=rent from serviceMap)
+  &apartmentTypeIds[]={bhk_ids}
+  &propertyTypeId={1|2}
+
+Response: { data: { projectTrends: { [listing_id]: { trend[], percent_growth, avg_price_per_sqft } } } }
+```
+
+### `createSearchAlert` → Subscriptions
+
+```
+POST subscriptions.housing.com/token_api/v3/create-filter
+Body: {
+  mailing_option: "daily" | "instant",
+  filters: <backend codec encoding of session.active_filters>,
+  service: "np_buy" | "rent"   (note: buy maps to "np_buy" for subscriptions service)
+}
+
+Response: { status, result: boolean, message }
+Duplicate detection: status "DUPLICATE_FILTER" → "You are already subscribed to this search"
+Cap enforcement: 400 → "You have reached the max limit of 5 alerts."
+```
+
 ---
 
-## Tool Chaining Patterns
+## Tool Visibility
 
-The LLM frequently needs to call multiple tools in sequence. These are the most common chains.
+Tools are split into two categories. The LLM only ever sees `llm_visible: true` tools.
 
-### Pattern 1: Search → Expand
+| Category | Tools | Who calls them |
+|---|---|---|
+| **LLM-visible** | `getNearbyLandmarks` | LLM (residual, property_about only) |
+| **Orchestrator-only** | `searchProperties`, `resolveEntity`, `getPropertyDetail`, `getFloorPlans`, `getBrochure`, `getSimilarProperties`, `getLocalityDetail`, `getPriceTrends`, `getProjectPriceTrends`, `getTransactionHistory`, `getRatingsReviews`, `getTrendingLocalities`, `getTrendingProjects`, `getProjectDetail`, `getDemandSupplyInsight`, `getTravelTime`, `getPriceBuckets`, `getFilterSuggestions`, `getCollections`, `getPopularCityLandmarks`, `getTopSocieties`, `calculateEMI`, `calculateAffordability`, `convertUnit`, `shortlistProperty`, `removeFromShortlist`, `contactSeller`, `getSavedProperties`, `getViewedProperties`, `getRecentlyViewed`, `getRecommendations`, `createSearchAlert` | DataFetchMiddleware, RoutingMiddleware |
 
-```
-User: "Show me 2BHK flats in Bandra under 80k"
+The LLM's job is **NLG** (natural language generation) over data that arrives pre-loaded in its context. It does not discover, fetch, or choose which APIs to call — the orchestrator does that based on `data_requirements` in `INTENT_REGISTRY`.
 
-Turn 1:
-  LLM calls: searchProperties({ filters: { bhk:[2], localities:["Bandra"], price_max:80000 } })
-  Tool returns: 5 listings with render_as: "property_card"
-  LLM responds: "Here are 5 options in Bandra..." [renders cards]
+---
 
-User: "Tell me more about the second one"
-
-Turn 2:
-  LLM calls: getPropertyDetail({ property_id: "prop_341" })
-  Tool returns: full detail with render_as: "property_detail_card"
-  LLM responds: "This is a 2BHK on the 8th floor..." [renders detail card]
-```
-
-### Pattern 2: Parallel Tool Calls (same turn)
-
-When the user asks a multi-part question, the LLM can call multiple tools in one response:
+## Data Flow (Pre-fetch model)
 
 ```
-User: "Compare Bandra and Andheri West — which is better value and what are the price trends?"
+SLM classifies → DataFetchMiddleware fetches → PromptBuildMiddleware injects → LLM formats
 
-LLM calls simultaneously:
-  - getLocalityDetail({ locality: "Bandra", city: "Mumbai" })
-  - getLocalityDetail({ locality: "Andheri West", city: "Mumbai" })
-  - getPriceTrends({ locality: "Bandra", city: "Mumbai", transaction_type: "rent" })
-  - getPriceTrends({ locality: "Andheri West", city: "Mumbai", transaction_type: "rent" })
+Pattern 1: Search → Expand (two turns, not two tool calls)
+─────────────────────────────────────────────────────────
+Turn 1:  "Show me 2BHK flats in Bandra under 80k"
+  DataFetchMiddleware: searchProperties({ bhk:[2], localities:["Bandra"], price_max:80000 })
+  LLM receives results inline → "Here are 5 options in Bandra..." [renders cards]
 
-All 4 tool results arrive → LLM synthesizes comparison
-```
+Turn 2:  "Tell me more about the second one"
+  DataFetchMiddleware: getPropertyDetail({ property_id: "prop_341" })
+  LLM receives detail inline → "This is a 2BHK on the 8th floor..." [renders detail card]
 
-Claude supports parallel tool calls natively. The Bot Orchestrator executes all tools concurrently (Promise.all / goroutine fan-out) and returns all results to the LLM in one message.
 
-### Pattern 3: Search → Locality Enrich (proactive)
+Pattern 2: Property/project comparison (6 parallel pre-fetches, 1 LLM call)
+────────────────────────────────────────────────────────────────────────────
+User: "Compare DLF Privana and Godrej Meridian"
+  DataFetchMiddleware parallel_group 1:
+    getPropertyDetail(project_id_A)     ─┐
+    getPropertyDetail(project_id_B)      │  ~150ms
+    getProjectPriceTrends([A, B])        │  all parallel
+    getRatingsReviews(project_id_A)      │
+    getRatingsReviews(project_id_B)     ─┘
+  LLM receives all results inline → streams comparison
+  (For locality-vs-locality comparison see Pattern 9)
 
-```
-User: "Find me something near good schools in Powai"
 
-LLM calls: searchProperties({ filters: { localities:["Powai"], ... } })
-           getLocalityDetail({ locality: "Powai" })   // parallel
+Pattern 3: Property Detail + Nearby (residual tool — only pattern where LLM calls a tool)
+──────────────────────────────────────────────────────────────────────────────────────────
+User: "Tell me about this property and what's nearby"
+  DataFetchMiddleware: getPropertyDetail (pre-fetched, inline)
+  LLM tool_definitions: [getNearbyLandmarks]  ← only residual tool
+  LLM: if user asked about "nearby", calls getNearbyLandmarks({ categories, radius_meters })
+  (location injected by orchestrator; LLM only specifies category/radius preference)
 
-Results: LLM receives both, surfaces school data from locality alongside listings
-```
 
-### Pattern 4: Project → Floor Plan → Payment Plan (drill-down)
-
-```
+Pattern 4: Project drill-down (sequential parallel_groups)
+────────────────────────────────────────────────────────────
 User: "Tell me about Lodha Palava"
+  parallel_group 1: searchProperties (project query)
+  PromptBuildMiddleware: resolves project_id from search result
+  parallel_group 2: getProjectDetail({ project_id })
+  LLM receives both inline → responds about project + layouts in one turn
 
-LLM calls: searchProperties({ query: "Lodha Palava" })
-→ gets project_id from result
 
-LLM calls: getProjectDetail({ project_id: "proj_lodha_palava" })
-→ user asks "what does the 2BHK layout look like?"
+Pattern 5: Commute time (two-group sequential, entity resolution first)
+────────────────────────────────────────────────────────────────────────
+User: "How far is this flat from Manyata Tech Park and BKC?"
+  EntityResolutionMiddleware:
+    resolveEntity("Manyata Tech Park", type="landmark") → {id, coordinates:[lat,lng]}
+    resolveEntity("BKC", type="landmark")               → {id, coordinates:[lat,lng]}
+  DataFetchMiddleware parallel_group 1:
+    getPropertyDetail({ property_id: session.active_property_id })
+    → stores coordinates: {lat, lng} in session.active_property_coordinates
+  DataFetchMiddleware parallel_group 2:
+    getTravelTime({
+      origin:       session.active_property_coordinates,
+      destinations: ctx.resolved_entities  ← Manyata + BKC with lat/lng
+    })
+  LLM receives: "Manyata Tech Park: 8.2 km, 22 min. BKC: 14 km, 38 min."
 
-LLM calls: getFloorPlans({ project_id: "proj_lodha_palava", bhk: 2 })
-→ user asks "what are the payment plans?"
 
-→ Already in tool result (getProjectDetail includes payment_plans)
-→ LLM does NOT call again — references cached result from earlier in context
+Pattern 6: Market insight (locality research — demand/supply)
+──────────────────────────────────────────────────────────────
+User: "Is Bandra a buyer's market right now?"
+  EntityResolutionMiddleware: resolveEntity("Bandra", type="locality") → polygon_uuid
+  DataFetchMiddleware parallel_group 1:
+    getDemandSupplyInsight({ polygon_uuid, service_type: "buy" })
+    → { buyer_interest: "High Interest", potential_buyer_count: 1240, ... }
+  LLM receives buyer_interest + MoM changes + BHK demand breakdown inline
+  LLM response: "Bandra is showing High Interest from buyers right now. There are
+                 1,240 active buyers, up 12% from last month. 2BHKs account for
+                 the highest demand at 38%."
+
+
+Pattern 7: Price fairness check (bucket distribution)
+───────────────────────────────────────────────────────
+User: "Is 85L fair for a 2BHK in Andheri West?"
+  DataFetchMiddleware: getPriceBuckets({ filters: session.active_filters })
+  → { price_buckets: [{range:"60L-80L",count:145},{range:"80L-1Cr",count:87},...], p90:1.1Cr }
+  LLM: "Most 2BHKs in Andheri West are priced between 60L–1Cr. At 85L, this
+        property is right in the middle of the market — 40% of listings are
+        cheaper, 60% are more expensive."
+
+
+Pattern 8: Save search alert (Tier 1, no LLM)
+───────────────────────────────────────────────
+User: "Alert me when new 3BHKs appear in Powai under 1Cr"
+  Classification: portfolio / save_alert (Tier 1)
+  RoutingMiddleware: checks auth → if missing, emits auth_required SSE event
+  RoutingMiddleware: emits confirmation card
+    "Save alert: 3BHK in Powai under ₹1Cr. You'll get daily email alerts. Confirm?"
+  On confirmation:
+    createSearchAlert({ filters: session.active_filters, mailing_option: "daily" })
+    → { success: true, message: "You will get alerts for new properties" }
+  Orchestrator emits bot_complete with success message — no LLM involved.
+
+
+Pattern 9: Locality comparison (6 parallel pre-fetches, Sonnet, markdown output)
+──────────────────────────────────────────────────────────────────────────────────
+User: "What's the difference between Sector 50 and Sector 62 in Gurgaon?"
+  EntityResolutionMiddleware:
+    resolveEntity("Sector 50", "locality") → uuid_A   ─┐ parallel
+    resolveEntity("Sector 62", "locality") → uuid_B   ─┘
+  DataFetchMiddleware parallel_group 1:
+    getDemandSupplyInsight(uuid_A)   ─┐
+    getDemandSupplyInsight(uuid_B)    │
+    getPriceTrends(uuid_A)            │  all parallel ~200ms
+    getPriceTrends(uuid_B)            │
+    getRatingsReviews(uuid_A)         │
+    getRatingsReviews(uuid_B)        ─┘
+  LLM receives all 6 results → generates structured markdown:
+
+    ## Sector 50 vs Sector 62, Gurgaon
+
+    | | Sector 50 | Sector 62 |
+    |---|---|---|
+    | Avg price/sqft | ₹X | ₹Y |
+    | Price growth (1yr) | Z% | W% |
+    | Active buyers | N | M |
+    | Overall rating | 4.1 ★ | 3.8 ★ |
+
+    ### Sector 50
+    **Pros:** [derived from ratings/demand data]
+    **Cons:** [derived from supply/trend data]
+
+    ### Sector 62
+    **Pros:** ...
+    **Cons:** ...
+
+    ### Verdict
+    [LLM synthesis — which suits what profile, e.g. budget vs premium]
+
+  LLM derives pros/cons and verdict from tool data — does not invent facts.
+  buyer_interest string from getDemandSupplyInsight is used verbatim as sentiment signal.
 ```
-
-The LLM notices `payment_plans` is already in the context from `getProjectDetail`. It references that data rather than calling a redundant tool. This is standard LLM behavior when the schema is well-named.
 
 ---
 
@@ -1140,9 +1354,13 @@ render_as present?
 
 The system prompt explicitly forbids this, but the architecture enforces it structurally:
 
-1. **Tool results are the only source** of prices, areas, locations, and amenities in the context.
-2. The LLM is instructed to always call `getPropertyDetail` before answering specific questions about a property — even if the property appeared in search results (search results are summaries, not full details).
-3. If a tool returns an error or empty result, the LLM is instructed to say so. Example system instruction: *"If searchProperties returns 0 results, tell the user honestly and suggest broadening filters. Never generate fictional listings."*
+1. **Pre-fetched data is the only source** of prices, areas, locations, and amenities in the context.
+   `DataFetchMiddleware` populates this before the LLM call; the LLM formats what it receives.
+2. `getPropertyDetail` is always pre-fetched for `property_detail/*` intents — the LLM never needs
+   to request it. The detail data is always in context before the LLM starts.
+3. If a pre-fetch returns an empty result or an error, the orchestrator injects that signal into
+   the context. Example: `{ searchProperties: { error: "no_results" } }` → LLM responds:
+   *"I couldn't find properties matching those filters. Want to try broadening them?"*
 
 ### Tool result truncation (preventing context bloat)
 
@@ -1180,14 +1398,18 @@ Cache hit rate target: >80% for locality and price trend tools. This significant
 
 ## Utility and User History Tools
 
-These tools are pure computation or user-specific DB lookups. Most route via **Tier 1** (no AI needed when triggered from structured card actions) or **Tier 2** (SLM extracts parameters from free text, orchestrator calls directly).
+Calculators and unit conversion are **orchestrator computation functions** (`llm_visible: false`).
+The SLM extracts params from free text, the orchestrator computes the result, and the LLM receives
+the result inline in its context — it only formats a response. No LLM tool calls, no round trips.
 
 ### `calculateEMI`
 
-```typescript
+> **Orchestrator Tier 2 function.** SLM extracts params → orchestrator computes → LLM formats.
+
+```json
 {
   name: "calculateEMI",
-  description: "Calculate monthly home loan EMI from a property price. Call when user asks 'what will my EMI be', 'can I afford this', or mentions a property price in a loan context. Only property_price is required — use defaults for the rest unless the user specified them.",
+  // params extracted by SLM from user message, not LLM tool call
   input_schema: {
     type: "object",
     properties: {
@@ -1209,7 +1431,7 @@ loan_amount = property_price - (down_payment ?? property_price × down_payment_p
 
 **Return schema (pure math — computed by orchestrator, no external API call):**
 
-```typescript
+```json
 {
   property_price:   number,
   loan_amount:      number,
@@ -1230,22 +1452,30 @@ loan_amount = property_price - (down_payment ?? property_price × down_payment_p
 }
 ```
 
-**Important:** `calculateEMI` is pure math — orchestrator computes it directly, no external API. Formula: `EMI = P × r × (1+r)^n / ((1+r)^n - 1)` where `P = loan_amount`, `r = annual_rate/12/100`, `n = tenure_years × 12`.
+**Pure math — no external API.** Formula: `EMI = P × r × (1+r)^n / ((1+r)^n - 1)` where
+`P = loan_amount`, `r = annual_rate/12/100`, `n = tenure_years × 12`.
 
-**SLM routing:** "What's the EMI on a 1Cr flat?" → SLM extracts `property_price: 10000000`, routes Tier 2 → orchestrator computes with defaults (20% down, 20yr, 8.5%), zero LLM needed. If user says "at 9% for 15 years", SLM extracts those too.
+**SLM routing:** "What's the EMI on a 1Cr flat?" → SLM extracts `property_price: 10000000` into
+`filter_delta` / SLM output params → Tier 2 → orchestrator computes with defaults (20% down, 20yr,
+8.5%) → result injected into LLM context → LLM formats response. Zero tool call round trips.
+If user says "at 9% for 15 years", SLM extracts those additional params too.
 
 ---
 
 ### `calculateAffordability`
 
+> **Orchestrator Tier 2 function.** SLM extracts params → orchestrator computes → LLM formats.
+> If salary is not in context, SLM routes Tier 3 so LLM can ask the user — salary cannot be
+> defaulted or guessed.
+
 Two modes depending on what the user provides:
 - **Mode A — "What can I afford?"**: User gives salary → return recommended max budget + EMI estimate
 - **Mode B — "Can I afford this?"**: User gives salary + property price → check affordability, show EMI breakdown for that price
 
-```typescript
+```json
 {
   name: "calculateAffordability",
-  description: "Calculate what property budget a user can afford (Mode A), or check if a specific price is affordable (Mode B). Requires at least one of monthly_salary or annual_salary. Never guess income — if not in context, ask before calling. Internally computes EMI using the same formula as calculateEMI.",
+  description: "Calculate what property budget a user can afford (Mode A), or check if a specific price is affordable (Mode B). Params extracted by SLM; computed by orchestrator. Salary is required — if not in context, SLM routes Tier 3 so LLM can ask.",
   input_schema: {
     type: "object",
     properties: {
@@ -1264,7 +1494,7 @@ Two modes depending on what the user provides:
 
 **Return schema:**
 
-```typescript
+```json
 {
   mode: "budget_estimate" | "affordability_check",
 
@@ -1301,19 +1531,26 @@ Two modes depending on what the user provides:
 }
 ```
 
-**Internal logic:** `calculateAffordability` calls the same EMI formula as `calculateEMI` internally — there is no separate API call. Both are orchestrator math functions.
+**Internal logic:** `calculateAffordability` calls the same EMI formula as `calculateEMI` internally — no separate API call. Both are orchestrator math functions.
 
-**After Mode A:** LLM should offer to search for properties in `recommended_budget` range (can directly pass to `searchProperties` as `price_max`).
-**After Mode B:** If `is_affordable: false`, LLM should suggest either looking at a lower price range or a longer tenure if `stretch_tenure` is reasonable.
+**After Mode A:** LLM should note the `recommended_budget` and offer to search in that range.
+The next search turn will have the budget in session filters; no tool call needed now.
+**After Mode B:** If `is_affordable: false`, LLM should suggest a lower price range or longer tenure
+based on `shortfall` and `stretch_tenure` in the result.
 
 ---
 
 ### `convertUnit`
 
-```typescript
+> **Orchestrator Tier 2 function.** SLM extracts `value`, `from`, `to` (and `state` if bigha) →
+> orchestrator looks up conversion factor → result injected into LLM context → LLM formats.
+> Exception: if `bigha` is involved and `state` is missing, SLM routes Tier 3 so the LLM can
+> ask which state (bigha size varies 10x across states).
+
+```json
 {
   name: "convertUnit",
-  description: "Convert an area value from one unit to another. Call when user asks 'how much is X sqft in square yards', 'convert this to acres' etc. Do not use for price conversion — that is calculateEMI/calculateAffordability.",
+  // params extracted by SLM from user message, not LLM tool call
   input_schema: {
     type: "object",
     properties: {
@@ -1340,7 +1577,7 @@ Two modes depending on what the user provides:
 
 **Return schema (orchestrator lookup table, zero latency):**
 
-```typescript
+```json
 {
   value:      number,   // input
   from:       string,
@@ -1365,13 +1602,15 @@ bigha → sqft   : UP=27000, Bihar=27211, Punjab/Haryana=9070, Rajasthan=1936  (
 
 All conversions go through sqft as the intermediate unit — `from → sqft → to` using the table above.
 
-**SLM routing:** "convert 1200 sqft to sq yards" → Tier 2 → SLM extracts `value:1200, from:sqft, to:sqyard` → orchestrator computes directly, zero LLM tokens. If bigha is mentioned without a state, SLM routes Tier 3 so LLM can ask which state.
+**SLM routing:** "convert 1200 sqft to sq yards" → Tier 2 → SLM extracts `value:1200, from:sqft,
+to:sqyard` → orchestrator computes → result inline in LLM context → zero LLM tool call tokens.
+Bigha without state → Tier 3 → LLM asks which state before orchestrator computes.
 
 ---
 
 ### `getRecentSearches`
 
-```typescript
+```json
 {
   name: "getRecentSearches",
   description: "Fetch the user's recent search history. Use when user says 'show my recent searches', 'what did I search for', or 'continue where I left off'.",
@@ -1388,7 +1627,7 @@ All conversions go through sqft as the intermediate unit — `from → sqft → 
 
 **Return schema:**
 
-```typescript
+```json
 {
   searches: Array<{
     search_id:       string,
@@ -1410,7 +1649,7 @@ All conversions go through sqft as the intermediate unit — `from → sqft → 
 
 ### `getViewedProperties`
 
-```typescript
+```json
 {
   name: "getViewedProperties",
   description: "Fetch properties the user has viewed (opened property detail) in recent sessions. Use when user says 'show me what I looked at', 'properties I liked', or 'my history'.",
@@ -1428,7 +1667,7 @@ All conversions go through sqft as the intermediate unit — `from → sqft → 
 
 **Return schema:**
 
-```typescript
+```json
 {
   properties: Array<{
     property_id:     string,
@@ -1459,7 +1698,7 @@ The location can be supplied as a locality UUID **or** as lat/lng coordinates. T
 3. `locality_id` (polygon UUID) from `active_locality_id` in session state
 4. `locality_id` from `resolveEntity` result (if user named a locality)
 
-```typescript
+```json
 {
   name: "getNearbyLandmarks",
   description: "Fetch nearby points of interest for a location. Use when user asks 'what's nearby', 'how far is the metro', 'are there schools close by'. Provide locality_id OR coordinates — never both, never neither. Check session state for active_locality_id or property coordinates before calling.",
@@ -1494,24 +1733,26 @@ The location can be supplied as a locality UUID **or** as lat/lng coordinates. T
 
 **Orchestrator pre-call resolution:**
 
-```typescript
-function resolveNearbyLandmarksInput(session: Session): { locality_id?: string; coordinates?: [number, number] } {
-  // 1. User shared location
-  if (session.user_coordinates) return { coordinates: session.user_coordinates };
-  // 2. Active property has coordinates
-  if (session.active_property_coordinates) return { coordinates: session.active_property_coordinates };
-  // 3. Active locality in session
-  if (session.active_locality_id) return { locality_id: session.active_locality_id };
-  // 4. Nothing resolved — return empty; LLM will see error and ask user
-  return {};
-}
+```python
+def resolve_nearby_landmarks_input(session: dict) -> dict:
+    # 1. User shared location
+    if session.get('user_coordinates'):
+        return {'coordinates': session['user_coordinates']}
+    # 2. Active property has coordinates
+    if session.get('active_property_coordinates'):
+        return {'coordinates': session['active_property_coordinates']}
+    # 3. Active locality in session
+    if session.get('active_locality_id'):
+        return {'locality_id': session['active_locality_id']}
+    # 4. Nothing resolved — return empty; LLM will see error and ask user
+    return {}
 ```
 
 If neither is available, the orchestrator returns `{ error: "no_location", message: "Ask user to share location or specify a locality." }` to the LLM before the tool is called.
 
 **Return schema:**
 
-```typescript
+```json
 {
   // Location anchor echoed back so FE can centre the map correctly
   anchor: {
@@ -1544,64 +1785,66 @@ If neither is available, the orchestrator returns `{ error: "no_location", messa
 
 ## Orchestrator: Intent Pivot & Filter State Management
 
-### `sanitizeFiltersOnPivot()`
+### `sanitize_filters_on_pivot()`
 
 Runs after SLM classification when `classification.pivot === true`. Clears filter keys that are semantically invalid after a pivot, without touching universal context.
 
-```typescript
-function sanitizeFiltersOnPivot(
-  classification: Classification,
-  session: Session,
-): void {
-  const prev = session.previous_main_intent;
-  const next = classification.main_intent;
-  const delta = classification.filter_delta;
+```python
+def sanitize_filters_on_pivot(
+    classification: dict,
+    session: dict,
+) -> None:
+    prev = session.get('previous_main_intent')
+    next_ = classification['main_intent']
+    delta = classification.get('filter_delta', {})
+    active_filters = session.setdefault('active_filters', {})
 
-  // City changed → old localities are in the wrong city
-  if (delta.city && delta.city !== session.active_city) {
-    session.active_filters.localities = null;
-    session.active_locality_id = null;
-    session.srset_id = null;
-  }
+    # City changed → old localities are in the wrong city
+    if delta.get('city') and delta['city'] != session.get('active_city'):
+        active_filters['localities'] = None
+        session['active_locality_id'] = None
+        session['srset_id'] = None
 
-  // Service changed → price sanity (inherited from intern's param extractor RULE 5)
-  const newService = delta.transaction_type ?? session.active_filters.transaction_type;
-  if (delta.transaction_type) {
-    const { price_max, price_min } = session.active_filters;
-    if (newService === 'rent') {
-      // Rent budgets above ₹5L/month are nonsensical for Indian market
-      if (price_max && price_max >= 500000) session.active_filters.price_max = null;
-      if (price_min && price_min >= 500000) session.active_filters.price_min = null;
-    }
-    if (newService === 'buy') {
-      // Buy prices below ₹5L are nonsensical
-      if (price_max && price_max < 500000) session.active_filters.price_max = null;
-      if (price_min && price_min < 500000) session.active_filters.price_min = null;
-    }
-    // search_type is only valid for buy
-    if (newService === 'rent') session.active_filters.search_type = null;
-    if (newService === 'rent') session.active_filters.construction_status = null;
-  }
+    # Service changed → price sanity (inherited from intern's param extractor RULE 5)
+    new_service = delta.get('transaction_type') or active_filters.get('transaction_type')
+    if delta.get('transaction_type'):
+        price_max = active_filters.get('price_max')
+        price_min = active_filters.get('price_min')
+        if new_service == 'rent':
+            # Rent budgets above ₹5L/month are nonsensical for Indian market
+            if price_max and price_max >= 500000:
+                active_filters['price_max'] = None
+            if price_min and price_min >= 500000:
+                active_filters['price_min'] = None
+        if new_service == 'buy':
+            # Buy prices below ₹5L are nonsensical
+            if price_max and price_max < 500000:
+                active_filters['price_max'] = None
+            if price_min and price_min < 500000:
+                active_filters['price_min'] = None
+        # search_type is only valid for buy
+        if new_service == 'rent':
+            active_filters['search_type'] = None
+        if new_service == 'rent':
+            active_filters['construction_status'] = None
 
-  // Pivoting away from property_search: BHK/price/amenities don't travel to
-  // locality_research, project_research, comparison, portfolio.
-  // BUT they remain in Redis — they are NOT deleted; buildSessionStateBlock()
-  // simply won't inject them for non-search intents.
-  // This means when the user returns to property_search, filters are still intact.
+    # Pivoting away from property_search: BHK/price/amenities don't travel to
+    # locality_research, project_research, comparison, portfolio.
+    # BUT they remain in Redis — they are NOT deleted; build_session_state_block()
+    # simply won't inject them for non-search intents.
+    # This means when the user returns to property_search, filters are still intact.
 
-  // Pivoting INTO property_search from locality/project research:
-  // Carry the researched locality forward as a search filter if it was active.
-  if (
-    next === 'property_search' &&
-    (prev === 'locality_research' || prev === 'project_research') &&
-    session.active_locality_id &&
-    !delta.localities
-  ) {
-    // Inject the researched locality as a starting point for the new search
-    // (user researched Koramangala then said "ok show me properties there")
-    session.active_filters.localities = [session.active_locality_name];
-  }
-}
+    # Pivoting INTO property_search from locality/project research:
+    # Carry the researched locality forward as a search filter if it was active.
+    if (
+        next_ == 'property_search'
+        and prev in ('locality_research', 'project_research')
+        and session.get('active_locality_id')
+        and not delta.get('localities')
+    ):
+        # Inject the researched locality as a starting point for the new search
+        # (user researched Koramangala then said "ok show me properties there")
+        active_filters['localities'] = [session.get('active_locality_name')]
 ```
 
 **Carry-over matrix** — what the orchestrator preserves vs clears on each pivot:
@@ -1620,57 +1863,56 @@ function sanitizeFiltersOnPivot(
 
 ---
 
-### `convertPricePerSqftToAbsolute()`
+### `convert_price_per_sqft_to_absolute()`
 
 Called when `filter_delta.price_per_sqft` is set. Converts a per-sqft rate to an absolute price range using area context from session state.
 
-```typescript
-// Typical built-up area range by BHK for Indian metro cities (sqft)
-const BHK_AREA_ASSUMPTIONS: Record<string, [number, number]> = {
-  '0':    [350,  500],   // Studio / 1RK
-  '1':    [500,  750],
-  '2':    [900,  1300],
-  '3':    [1300, 1800],
-  '4':    [2000, 3000],
-  '5+':   [3000, 5000],
-  'villa':[2500, 5000],  // wide variance
-};
-const DEFAULT_BHK_KEY = '2';   // assume 2BHK if no context
+```python
+from typing import Literal
 
-function convertPricePerSqftToAbsolute(
-  pricePerSqft: number,
-  bound: 'max' | 'min' | 'exact',
-  session: Session,
-): { price_min: number | null, price_max: number | null } {
-  // 1. Use explicit area range if set in session filters
-  const { area_min_sqft, area_max_sqft, bhk } = session.active_filters;
-
-  let areaMin: number, areaMax: number;
-
-  if (area_min_sqft && area_max_sqft) {
-    areaMin = area_min_sqft;
-    areaMax = area_max_sqft;
-  } else {
-    // 2. Derive from BHK context
-    const bhkKey = bhk?.length === 1
-      ? String(Math.min(bhk[0], 5))
-      : DEFAULT_BHK_KEY;
-    [areaMin, areaMax] = BHK_AREA_ASSUMPTIONS[bhkKey] ?? BHK_AREA_ASSUMPTIONS[DEFAULT_BHK_KEY];
-  }
-
-  // 3. Apply bound
-  switch (bound) {
-    case 'max':
-      return { price_min: null, price_max: Math.round(pricePerSqft * areaMax) };
-    case 'min':
-      return { price_min: Math.round(pricePerSqft * areaMin), price_max: null };
-    case 'exact':
-      return {
-        price_min: Math.round(pricePerSqft * areaMin),
-        price_max: Math.round(pricePerSqft * areaMax),
-      };
-  }
+# Typical built-up area range by BHK for Indian metro cities (sqft)
+BHK_AREA_ASSUMPTIONS: dict[str, tuple[int, int]] = {
+    '0':     (350,  500),   # Studio / 1RK
+    '1':     (500,  750),
+    '2':     (900,  1300),
+    '3':     (1300, 1800),
+    '4':     (2000, 3000),
+    '5+':    (3000, 5000),
+    'villa': (2500, 5000),  # wide variance
 }
+DEFAULT_BHK_KEY = '2'   # assume 2BHK if no context
+
+def convert_price_per_sqft_to_absolute(
+    price_per_sqft: float,
+    bound: Literal['max', 'min', 'exact'],
+    session: dict,
+) -> dict[str, int | None]:
+    # 1. Use explicit area range if set in session filters
+    active_filters = session.get('active_filters', {})
+    area_min_sqft = active_filters.get('area_min_sqft')
+    area_max_sqft = active_filters.get('area_max_sqft')
+    bhk = active_filters.get('bhk')
+
+    if area_min_sqft and area_max_sqft:
+        area_min, area_max = area_min_sqft, area_max_sqft
+    else:
+        # 2. Derive from BHK context
+        if bhk and len(bhk) == 1:
+            bhk_key = str(min(bhk[0], 5))
+        else:
+            bhk_key = DEFAULT_BHK_KEY
+        area_min, area_max = BHK_AREA_ASSUMPTIONS.get(bhk_key, BHK_AREA_ASSUMPTIONS[DEFAULT_BHK_KEY])
+
+    # 3. Apply bound
+    if bound == 'max':
+        return {'price_min': None, 'price_max': round(price_per_sqft * area_max)}
+    elif bound == 'min':
+        return {'price_min': round(price_per_sqft * area_min), 'price_max': None}
+    else:  # 'exact'
+        return {
+            'price_min': round(price_per_sqft * area_min),
+            'price_max': round(price_per_sqft * area_max),
+        }
 ```
 
 **Example:** "property under 30K/sqft" in a session with bhk:[2]:
@@ -1683,28 +1925,30 @@ function convertPricePerSqftToAbsolute(
 
 ---
 
-### `resolveLandmarkAnchor()`
+### `resolve_landmark_anchor()`
 
 Called when `filter_delta.search_anchor` is set (sub_intent: explore_nearby with named POI).
 
-```typescript
-async function resolveLandmarkAnchor(
-  anchorName: string,
-  session: Session,
-): Promise<{ lat: number; lng: number; label: string } | null> {
-  const results = await autosuggest(anchorName, 'landmark', session.service);
-  if (!results.length) return null;
+```python
+async def resolve_landmark_anchor(
+    anchor_name: str,
+    session: dict,
+) -> dict | None:
+    results = await autosuggest(anchor_name, 'landmark', session.get('service'))
+    if not results:
+        return None
 
-  // Landmarks/establishments have lon_lat in autosuggest response
-  const top = results.find(r =>
-    r.type === 'landmark' || r.type === 'establishment' || r.type === 'poi'
-  ) ?? results[0];
+    # Landmarks/establishments have lon_lat in autosuggest response
+    top = next(
+        (r for r in results if r.get('type') in ('landmark', 'establishment', 'poi')),
+        results[0],
+    )
 
-  if (!top.coordinates) return null;
-  return { lat: top.coordinates[0], lng: top.coordinates[1], label: top.display_name };
-}
-// Orchestrator then builds Khoj URL with lat, long, outer_radius (default 3000m)
-// instead of poly/city_uuid approach.
+    if not top.get('coordinates'):
+        return None
+    return {'lat': top['coordinates'][0], 'lng': top['coordinates'][1], 'label': top['display_name']}
+# Orchestrator then builds Khoj URL with lat, long, outer_radius (default 3000m)
+# instead of poly/city_uuid approach.
 ```
 
 ---
@@ -1713,19 +1957,19 @@ async function resolveLandmarkAnchor(
 
 When `classification.clarification_needed` is not null, the orchestrator emits a `nested_qna` frame instead of proceeding to LLM/tool execution.
 
-```typescript
-// WS frame — matches existing FE template contract (system-design.md)
+```json
 {
-  type: 'nested_qna',
-  payload: {
-    question: "Are you looking to rent or buy?",
-    options: [
-      { label: "Rent", intent: "set_service", value: "rent" },
-      { label: "Buy",  intent: "set_service", value: "buy" }
+  "type": "nested_qna",
+  "payload": {
+    "question": "Are you looking to rent or buy?",
+    "options": [
+      { "label": "Rent", "intent": "set_service", "value": "rent" },
+      { "label": "Buy",  "intent": "set_service", "value": "buy" }
     ]
   }
 }
 ```
+<!-- WS frame — matches existing FE template contract (system-design.md) -->
 
 | `clarification_needed.type` | Question | Options | Follow-up |
 |-----------------------------|----------|---------|-----------|
@@ -1768,18 +2012,19 @@ When `classification.clarification_needed` is not null, the orchestrator emits a
 5a. Apply filter_delta to session state
     session.active_filters = applyDelta(session.active_filters, filter_delta)
       │
-5b. If classification.pivot === true:
-    sanitizeFiltersOnPivot(classification, session)
+5b. If classification.pivot == True:
+    sanitize_filters_on_pivot(classification, session)
     — city-change clears localities, service-change applies price sanity,
       locality_research → property_search carries researched locality forward
       │
 5c. If filter_delta.price_per_sqft is set:
-    { price_min, price_max } = convertPricePerSqftToAbsolute(
+    result = convert_price_per_sqft_to_absolute(
       price_per_sqft, price_sqft_bound, session)
-    Apply to session.active_filters; flag price_derived_from_sqft: true
+    Apply result to session.active_filters; flag price_derived_from_sqft: True
       │
 5d. If filter_delta.search_anchor is set:
-    { lat, lng, label } = await resolveLandmarkAnchor(search_anchor, session)
+    anchor = await resolve_landmark_anchor(search_anchor, session)
+    # {lat, lng, label}
     Inject into session.search_anchor_coordinates for Khoj lat/long/radius search
       │
 5e. If classification.clarification_needed is not null:
@@ -1796,90 +2041,170 @@ When `classification.clarification_needed` is not null, the orchestrator emits a
    Effect: "show me brochure for DLF Privana" → project_id already in session
    when LLM is called; LLM doesn't need a resolveEntity round-trip.
       │
-7. Tier routing + model selection
-   deriveRoutingTier(classification, session) → Tier 1 / 2 / 3a / 3b
-   selectTier3Model(classification, session) → haiku | sonnet (Tier 3 only)
+7. Tier routing + auth check
+   getIntentRecord(main_intent, sub_intent) → tier, model, requires_auth
+   If requires_auth and no auth_token → emit auth_required, stop
       │
-   [Tier 1/2 — no LLM call]
-   Orchestrator executes directly → assemble bot_complete → skip to step 12
+   [Tier 1 — direct action, no LLM]
+   Execute action (shortlistProperty, contactSeller, etc.) directly
+   Assemble bot_complete → skip to step 12
       │
-8. [Tier 3] Build system prompt (sections 1–4)
-   buildSessionStateBlock(intent, session) → intent-specific state injection
+   [Tier 2 — orchestrator computes, no LLM]
+   Execute computation (calculateEMI, calculateAffordability, convertUnit)
+   Assemble bot_complete with result → skip to step 12
+      │
+8. [Tier 3] DataFetchMiddleware — pre-fetch all required data
+   getDataFetchPlan(main_intent, sub_intent) → DataRequirement[]
+   Groups by parallel_group; executes groups in order:
+     - Same parallel_group → asyncio.gather (parallel)
+     - Different groups → sequential (dependency order)
+   Results stored in ctx.pre_fetched_data keyed by tool name
+   Emits bot_fetching WS frame per tool group while fetching
+   (~150ms for comparison intents with 6 parallel fetches)
+      │
+9. [Tier 3] Build system prompt (sections 1–4)
+   build_session_state_block(intent, session) → intent-specific state injection
+   pre_fetched_data injected inline into section 3 context block
    context_turns = CONTEXT_TURNS[model]  (haiku: 3, sonnet: 10)
       │
-9. If turns > 10 and no summary: trigger async summarization job
-   (don't block; use existing turns for this request)
+10. If turns > 10 and no summary: trigger async summarization job
+    (non-blocking; use existing turns for this request)
       │
-10. Call Claude API (streaming, tool definitions scoped to sub_intent)
+11. Call Claude API (streaming)
+    tool_definitions = buildToolDefinitionsBlock(getResidualTools(main_intent, sub_intent))
+    — for 31/32 intents this is [] (LLM has no tools, one job: NLG)
+    — for property_about: [getNearbyLandmarks]
       │
-11. Stream tokens → buffer 3–5 tokens → emit bot_chunk WS frame
+    Stream tokens → buffer 3–5 tokens → emit bot_chunk WS frame
       │
-    On tool_use block detected in stream:
-    a. Emit bot_tool_event WS frame ("Searching properties...")
-    b. validateToolCall(tool, params) — check required params; return error if missing
+    On tool_use block (only possible for getNearbyLandmarks):
+    a. Emit bot_tool_event WS frame ("Finding nearby places...")
+    b. validate_residual_tool_call(tool, params) — return error if invalid
     c. Execute tool (check cache → call API if miss → cache result)
-    d. Orchestrator API translation (friendly params → wire format per Khoj/Casa/etc.)
+    d. Orchestrator injects location from session (LLM only supplied category/radius)
     e. Inject tool_result into LLM continuation
     f. Resume streaming
       │
 12. On stop_reason: "end_turn":
-    a. validateBotOutput(text) — strip URLs, phone numbers, markdown tables
-    b. Assemble bot_complete frame with cards from tool results
+    a. validate_bot_output(text) — strip URLs, phone numbers, markdown tables
+    b. Assemble bot_complete — cards built from ctx.pre_fetched_data
+       (+ residual tool_results if getNearbyLandmarks was called)
     c. Emit bot_complete WS frame
     d. Persist full message to Kafka → PostgreSQL
     e. Update Redis turn list (LPUSH + LTRIM 0 19, keeping last 10)
     f. Update session state (new srset_id, viewed properties, etc.)
 ```
 
-### Streaming + Tool Use Interleaving
+### Streaming Timeline (Pre-fetch Model)
 
 ```
 Client receives:
-  bot_tool_event:  "Searching 2BHK in Bandra..."    ← while tool runs (200ms)
-  bot_chunk:       "I found "                        ← streaming resumes
+  bot_fetching:    { tools: ["searchProperties"], status: "fetching" }  ← DataFetchMiddleware
+  bot_fetching:    { tools: ["searchProperties"], status: "done" }      ← ~100ms
+  bot_chunk:       "Found "                                              ← LLM streams immediately
   bot_chunk:       "47 properties"
   bot_chunk:       " in Bandra."
-  bot_chunk:       " Here are"
-  bot_chunk:       " the top 5:"
-  bot_complete:    { text: "...", cards: [...] }     ← final frame with cards
+  bot_chunk:       " Here are the top 5:"
+  bot_complete:    { text: "...", cards: [...] }                         ← cards from pre-fetched data
+
+
+Comparison (6 parallel fetches):
+  bot_fetching:    { tools: ["getLocalityDetail×2", "getPriceTrends×2", "getRatingsReviews×2"],
+                     status: "fetching" }                                ← all 6 parallel
+  bot_fetching:    { tools: [...], status: "done" }                     ← ~150ms total
+  bot_chunk:       "Comparing Bandra and Andheri West..."               ← LLM streams immediately
+  bot_complete:    { text: "...", cards: [...] }
+
+
+Property About with nearby (only case with residual tool call):
+  bot_fetching:    { tools: ["getPropertyDetail"], status: "fetching" } ← pre-fetch
+  bot_fetching:    { tools: ["getPropertyDetail"], status: "done" }
+  bot_chunk:       "Here's what I found about this property..."         ← LLM starts
+  bot_tool_event:  "Finding nearby places..."                           ← LLM called getNearbyLandmarks
+  bot_chunk:       " There's a metro station 400m away..."              ← LLM resumes
+  bot_complete:    { text: "...", cards: [...] }
 ```
 
-The client renders the `bot_chunk` frames as streaming text in the bubble, then replaces the bubble content with the `bot_complete` payload (which may include a different text + structured cards).
+The client renders `bot_chunk` frames as streaming text, `bot_fetching` frames as a loading
+indicator before the first chunk arrives, and replaces everything with `bot_complete` on finish.
+
+**LLM stream failure mid-response:**
+```
+  bot_fetching:    { tools: ["searchProperties"], status: "done" }
+  bot_chunk:       "Found 47 properties..."   ← partial text already sent
+  bot_error:       { code: "llm_stream_error", recoverable: true,
+                     message: "Something went wrong. Please try again." }
+```
+`bot_error` tells the client to clear the partial bubble and render the error message.
+Without this frame, a partial stream leaves the UI stuck in a loading state.
+
+**WS frame type summary:**
+
+| Frame | When |
+|---|---|
+| `bot_fetching` | DataFetchMiddleware starts/completes a tool group |
+| `bot_tool_event` | LLM calls a residual tool (getNearbyLandmarks) |
+| `bot_chunk` | Streaming LLM text token |
+| `bot_complete` | Full response assembled; replaces chunks |
+| `bot_error` | Unrecoverable error (LLM failure, all fetches failed) |
+| `auth_required` | Auth token absent for write-side or auth-gated intent |
 
 ---
 
 ## Error Handling
 
-| Error | Behavior |
-|---|---|
-| Tool timeout (>2s) | Return error result to LLM: `{ error: "timeout", message: "Service unavailable" }`. LLM acknowledges and suggests retry. |
-| Tool 404 (property not found) | Return `{ error: "not_found" }`. LLM: "I couldn't find details for that property. It may no longer be listed." |
-| Tool 429 (rate limit) | Use cached result if available. If not, return graceful error. Alert PagerDuty if rate limit hits >5% of requests. |
-| LLM API error | Retry once with exponential backoff (500ms). On second failure, emit `error` WS frame with user-facing message. |
-| LLM generates tool call for undefined tool | Should not happen (tools loaded per state). If it does: return `{ error: "tool_not_found" }` and log. |
-| Context window exceeded | This shouldn't happen with 20-turn limit + truncated tool results. If it does: drop oldest turns and retry. |
+Full retry policy and timeout budgets are specified in `solid-architecture.md` Part 8.
+This table covers the LLM-layer behaviours that follow from those failures.
+
+| Error | Detection | LLM-layer behaviour |
+|---|---|---|
+| Pre-fetch timeout | `withTimeout` rejects after `TOOL_DEFAULT_TIMEOUTS[tool]` | Tool recorded in `ctx.fetch_errors`; LLM receives `{ error: "timeout" }` stub and acknowledges partial data |
+| Pre-fetch 5xx (after 1 retry) | `CachedExecutorPort` exhausts retries | Same as timeout — `fetch_errors` stub |
+| ALL pre-fetches fail | `DataFetchMiddleware` detects `allFailed` | Short-circuits; emits `bot_error` frame; no LLM call |
+| Pre-fetch 404 (property/entity gone) | Backend returns 404 | `{ error: "not_found" }` stub injected; LLM: *"That property may no longer be listed."* |
+| Pre-fetch 429 (rate limit) | Backend returns 429 | Use cached result if available; otherwise `fetch_errors` stub; alert if >5% of requests |
+| Circuit breaker OPEN | `CircuitOpenError` from executor | Treated as fetch error — same `fetch_errors` path |
+| LLM API error (TTFT timeout or 5xx) | `withTimeout(5000)` or HTTP error | 1 retry after 300ms; on second failure emit `bot_error` frame with recoverable message |
+| LLM calls undefined tool | Tool name not in `tool_definitions` | Return `{ error: "tool_not_found" }` and log; should not happen — residual tools list is registry-derived |
+| LLM stream fails mid-response | Stream terminates before `end_turn` | Emit `bot_error` frame to clear partial bubble; log with session_id for replay |
+| Context window exceeded | Claude returns `context_length_exceeded` | Drop oldest turns (keep last 3) and retry once; if still exceeds, summarise and retry |
+| SLM classifier failure | Gemini timeout or 5xx after 1 retry | Route to `out_of_scope`; canned response; log `classifier_unavailable` metric |
 
 ---
 
 ## Token Budget
 
-Approximate per-request token usage:
+Budgets vary significantly by tier and intent class. Use these as planning numbers, not
+hard limits. The comparison tier (Sonnet + 6 pre-fetched results) is the heaviest path.
 
 ```
-System prompt (static, cached):       ~1,200 tokens    → cache hit after first request
-Session state injection (intent-specific): ~130 tokens
-Compressed history summary:            ~400 tokens (if applicable)
-Last 10 turns (Sonnet) / 3 turns (Haiku): ~1,500 / ~450 tokens
-Tool definitions (intent-specific):    ~300 tokens     → cache hit after first request
-Tool results (summarised):             ~100 tokens per tool call (vs 2,000 raw)
-                                     ─────────────────
-Typical total input:                 ~4,500–7,000 tokens per turn
+                              Tier 3a / Haiku    Tier 3b / Sonnet (comparison)
+─────────────────────────────────────────────────────────────────────────────
+System prompt (cached §1):       ~1,200 tokens         ~1,200 tokens
+Session state injection:            ~130                   ~200
+Tool definitions (§2, cached):       ~50 ([] for most)     ~50
+Conversation history:               ~450 (3 turns)       ~1,500 (10 turns)
+Compressed history summary:         ~400 (if applicable)   ~400
+Pre-fetched data (inline):
+  Tier 3a — 1 tool result:          ~150                    —
+  Tier 3b — 6 tool results:           —                  ~1,200  (6 × ~200 truncated)
+fetch_errors stubs (if any):          ~30 (per error)       ~30
+─────────────────────────────────────────────────────────────────────────────
+Typical total input:            ~2,400–2,800 tokens    ~4,600–5,000 tokens
 
 Output:
-Bot response text:                     ~100–200 tokens
-Tool calls (JSON):                     ~50–150 tokens each
-                                     ─────────────────
-Typical total output:                  ~200–500 tokens per turn
+Bot response text:                ~100–200 tokens        ~300–600 tokens
+Residual tool call (JSON):         ~100 (if any)           —
+─────────────────────────────────────────────────────────────────────────────
+Typical total output:             ~200–400 tokens        ~400–700 tokens
 ```
 
-With prompt caching on sections 1 and 2, the effective cache savings per request: ~2,000 tokens read as cache tokens. At Claude's pricing, cache read tokens cost 10% of full input tokens — meaningful savings at housing.com scale.
+**Key observations:**
+- Tier 3a Haiku is ~2,500 tokens input — well below the old 4,500–7,000 estimate, because
+  tool definitions (previously ~1,500–3,000 tokens) are now `[]` for most intents.
+- Tier 3b Sonnet comparison is heavier (~5,000) but 6 parallel pre-fetches replace 6 sequential
+  tool-call round trips — total latency is lower even though the prompt is larger.
+- `fetch_errors` stubs add ~30 tokens per failed pre-fetch; negligible.
+
+With prompt caching on §1 and §2, effective cache savings per request: ~1,250 tokens
+(Haiku) to ~1,250 tokens (Sonnet). Cache read tokens cost 10% of full input tokens.

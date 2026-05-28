@@ -6,17 +6,18 @@ The SLM classifier is the **second stop** in the request pipeline (after Tier 0 
 
 1. **Tier routing** — Tier 1 (no AI), Tier 2 (orchestrator direct), Tier 3a/3b (Haiku/Sonnet)
 2. **Model selection** — `entities_mentioned` feeds `getModelForIntent()` (derived from `INTENT_REGISTRY`) to choose Haiku vs Sonnet
-3. **Tool set selection** — `main_intent` + `sub_intent` maps to `getToolsForIntent()` (derived from `INTENT_REGISTRY`)
+3. **Tool set selection** — `main_intent` + `sub_intent` maps to `getResidualTools()` (derived from `INTENT_REGISTRY`; `getToolsForIntent` is a kept alias)
 4. **Filter delta** — `filter_delta` tells the orchestrator what changed vs what to preserve
 
 **Model:** `gemini-2.0-flash` (Google) — ~10× cheaper than Haiku for classification
 **Latency budget:** ≤ 150ms (classification only, no tool calls)
-**Prompt cache:** Sections 1–4 are static — prime cache on cold start
+**Prompt cache:** Sections 1–4 are static per registry version — prime cache on cold start. Cache key includes `registry_hash` (SHA256 of INTENT_REGISTRY + FILTER_REGISTRY JSON); cache is invalidated and re-primed automatically on registry change.
 
 > **Architecture note:** The intent taxonomy injected into this prompt (Section 2) is generated
 > from `INTENT_REGISTRY` at startup. The filter delta rules (Section 3) are generated from
 > `FILTER_REGISTRY`. Do not edit these sections directly — edit the registries.
-> See [solid-architecture.md](./solid-architecture.md) for the full registry definitions.
+> See [solid-architecture.md](./solid-architecture.md) for the full registry definitions and the
+> `registry_hash` cache-key rule (Part 4 — Template Rendering Rules).
 
 ---
 
@@ -311,17 +312,78 @@ User wants data or information about a specific housing project (new launch).
     Examples: "Top projects launching in Noida?", "Trending new launches in Mumbai"
 
 ──────────────────────────────────────────
+main_intent: locality_research (continued — market & commute extensions)
+──────────────────────────────────────────
+
+  sub_intent: market_insight
+    User asks about market demand, buyer/seller balance, or supply levels in a locality.
+    NOT a price trend question — this is about activity levels, not price direction.
+    Examples: "Is this a buyer's market?", "How much demand is there in Bandra?",
+              "Are there more buyers or sellers in Noida Expressway?"
+
+  sub_intent: commute_time
+    User wants to know travel time or distance from the active property to a named destination.
+    Requires an active property in session (property_context is always true).
+    Examples: "How far is this from BKC?", "Commute time to Whitefield?",
+              "How long to Cyber City from here?"
+
+  sub_intent: price_fairness
+    User wants to know if a specific price is fair relative to the local market.
+    Examples: "Is 80L reasonable for a 2BHK in Andheri?", "What do most 3BHKs cost here?"
+
+  sub_intent: filter_suggestions
+    User asks what others search for in an area, or wants help deciding filters.
+    Examples: "What do most people search for in Koramangala?",
+              "What's a common budget for rent here?"
+
+  sub_intent: top_societies
+    User asks about specific residential complexes or buildings in an area.
+    Examples: "Best societies in Powai?", "Top residential complexes near BKC?"
+
+  sub_intent: city_orientation
+    User is new to a city and wants to understand key areas, hubs, or landmarks.
+    Examples: "I'm moving to Bangalore — what are the key areas?",
+              "Major landmarks in Hyderabad for property search?"
+
+  sub_intent: locality_comparison
+    User wants to compare EXACTLY TWO named localities side-by-side.
+    Requires 2 entities_mentioned (both localities). NOT the same as compare_localities —
+    this is a locality_research intent comparing two areas; compare_localities is the
+    top-level comparison intent.
+    Examples: "Compare Sector 50 and Sector 62 in Gurgaon",
+              "Should I look in Andheri or Bandra for rent?"
+
+──────────────────────────────────────────
 main_intent: comparison
 ──────────────────────────────────────────
-User wants to compare two entities side-by-side.
+User wants to compare two entities side-by-side. Both entities must be resolvable.
 
   sub_intent: compare_localities
-    Comparing exactly two named localities.
-    Examples: "Compare Dwarka and Shalimar Bagh", "Bandra vs Andheri — which is better?"
+    Comparing exactly two named localities (general comparison, not tied to search context).
+    Examples: "Compare Dwarka and Shalimar Bagh", "Bandra vs Andheri — which is better for families?"
 
   sub_intent: compare_projects
     Comparing exactly two named projects.
     Examples: "Compare M3M Escala and Prestige Falcon", "Lodha vs Godrej in Thane"
+
+──────────────────────────────────────────
+main_intent: property_search (continued)
+──────────────────────────────────────────
+
+  sub_intent: discovery_collections
+    User expresses a lifestyle preference that maps to a curated collection, not raw filters.
+    Examples: "Show me ready-to-move properties", "Family-friendly flats",
+              "New launches in Mumbai", "Verified only", "Properties with video tours"
+
+──────────────────────────────────────────
+main_intent: project_research (continued)
+──────────────────────────────────────────
+
+  sub_intent: project_price_trends
+    Price appreciation or investment trajectory for a SPECIFIC named project.
+    Different from locality_research/price_trends which gives locality-level aggregates.
+    Examples: "Has Lodha Palava appreciated?", "Price trend for Prestige Shantiniketan",
+              "How much has M3M Escala grown in value?"
 
 ──────────────────────────────────────────
 main_intent: portfolio
@@ -333,7 +395,7 @@ User wants to view their own activity or get personalized recommendations.
     Examples: "Show my saved properties", "Meri favourites dikhao"
 
   sub_intent: viewed_properties
-    User wants to see properties they've previously opened or viewed.
+    User wants to see properties they've previously opened or viewed in this session.
     Examples: "Show what I was looking at", "My property history", "Properties I've seen"
 
   sub_intent: recent_searches
@@ -346,19 +408,31 @@ User wants to view their own activity or get personalized recommendations.
     Examples: "Recommend properties for me", "What would you suggest?",
               "Based on my searches, what should I look at?"
 
+  sub_intent: recently_viewed_cross_session
+    User asks to see properties they viewed across PREVIOUS sessions (not just current session).
+    Examples: "Show me what I was looking at yesterday",
+              "Properties I viewed last week", "My viewing history"
+
+  sub_intent: save_alert
+    User wants to save the current search and receive email/push alerts for new matches.
+    Examples: "Alert me when new 3BHKs appear in Powai under 1Cr",
+              "Save this search", "Notify me of new matches"
+
 ──────────────────────────────────────────
 main_intent: calculator
 ──────────────────────────────────────────
 Standalone computation — NOT tied to a specific property currently in context.
-(If tied to the current property, use property_detail/calculate_emi instead.)
+If tied to the current property, use property_detail/calculate_emi instead.
+For complex financial reasoning (salary % EMI, multi-factor affordability) → calculator,
+not property_detail, since the LLM needs financial context not property data.
 
   sub_intent: calculate_emi
     EMI computation from an explicit property price the user states.
     Examples: "What's the EMI on a 1 crore flat?", "EMI for 80 lakhs at 8.5%",
-              "Home loan EMI for 15 years"
+              "Home loan EMI for 15 years", "My salary is 5L, 40% EMI on a 1.2Cr flat"
 
   sub_intent: calculate_affordability
-    User gives their salary and wants to know budget or check if they can afford a price.
+    User gives their salary and wants to know their property budget.
     Examples: "My salary is 1.5L, what can I afford?",
               "Can I afford a 90 lakh flat on 2L monthly salary?"
 
@@ -397,7 +471,7 @@ Before producing output, silently work through:
   Step 6 — Inheritance check: Does Rule 5 apply?
   Step 7 — Property detail follow-up check: Does Rule 6 apply?
   Step 8 — Default: Apply Rule 7 using Section 2 taxonomy.
-  Step 9 — Extract entities_mentioned from the message.
+  Step 9 — Extract entities_mentioned from the message, with inferred_type for each.
   Step 10 — Extract filter_delta if main_intent is property_search or property_detail.
 
 ════════════════════════════════════════════
@@ -410,7 +484,10 @@ Standard (single intent):
 {
   "main_intent": "<main_intent>",
   "sub_intent": "<sub_intent>",
-  "entities_mentioned": ["<entity1>", "<entity2>"],
+  "entities_mentioned": [
+    { "name": "<entity1>", "inferred_type": "<locality|project|developer|landmark|building|city>" },
+    { "name": "<entity2>", "inferred_type": "<type>" }
+  ],
   "multi_intent": false,
   "pivot": false,
   "filter_delta": { "<key>": "<value>" },
@@ -426,7 +503,7 @@ Multi-intent:
     { "main_intent": "<main_intent>", "sub_intent": "<sub_intent>" },
     { "main_intent": "<main_intent>", "sub_intent": "<sub_intent>" }
   ],
-  "entities_mentioned": ["<entity1>"],
+  "entities_mentioned": [{ "name": "<entity1>", "inferred_type": "<type>" }],
   "multi_intent": true,
   "pivot": false,
   "filter_delta": {},
@@ -438,7 +515,7 @@ Field rules:
 
   pivot
     true when main_intent changed from the previous turn's main_intent.
-    Signals the orchestrator to run sanitizeFiltersOnPivot() — which clears
+    Signals the orchestrator to run sanitize_filters_on_pivot() — which clears
     filters that are irrelevant to the new intent (e.g., BHK/price filters are
     irrelevant when pivoting to locality_research) while preserving universal
     context (city, service, active entities).
@@ -470,16 +547,32 @@ Field rules:
     parameters without which execution cannot proceed.
 
   entities_mentioned
-    List of named localities, projects, or developers mentioned in the message.
-    Examples: ["Bandra West", "Andheri"], ["DLF Privana"], []
+    Array of typed entity objects for each named place, project, developer, or
+    landmark mentioned in the message.
+
+    Shape: { name: string, inferred_type: "locality"|"project"|"developer"|"landmark"|"building"|"city" }
+
+    Examples:
+      "show me properties from DLF"          → [{ name:"DLF", inferred_type:"developer" }]
+      "show me flats in DLF Phase 1"         → [{ name:"DLF Phase 1", inferred_type:"locality" }]
+      "brochure for DLF Privana"             → [{ name:"DLF Privana", inferred_type:"project" }]
+      "near Manyata Tech Park"               → [{ name:"Manyata Tech Park", inferred_type:"landmark" }]
+      "compare Lodha Palava and Prestige"    → [{ name:"Lodha Palava", inferred_type:"project" }, { name:"Prestige", inferred_type:"project" }]
+
+    inferred_type is derived from LINGUISTIC CONTEXT in the message, not from the
+    entity name alone. "from DLF" → developer. "in DLF Phase 1" → locality.
+    "DLF Privana" (project-name pattern) → project. The SLM uses prepositions,
+    possessives, and name structure to infer type. This is the only component that
+    can do this — code cannot determine entity type from a name string alone.
+
+    inferred_type is a HINT for the autosuggest call. If autosuggest finds no
+    match for the hinted type, the orchestrator falls back to an untyped call and
+    takes the top result across all types.
 
     Serves two purposes:
-    1. Model selection — 0 or 1 known entity → Haiku eligible;
-       2+ entities or named comparison → Sonnet required.
-    2. Pre-resolution trigger — orchestrator resolves each named entity via
-       autosuggest BEFORE the LLM call, so the LLM already has the UUID/project_id
-       in session state. This enables "show me brochure for DLF Privana" to work
-       without the user having first clicked on a property card in the UI.
+    1. Model selection — 0 or 1 entity → Haiku eligible; 2+ or named comparison → Sonnet.
+    2. Pre-resolution trigger — orchestrator resolves each entity via autosuggest
+       BEFORE the LLM call, injecting UUID/project_id into session state.
        (See Orchestrator: Entity Pre-Resolution below.)
 
   filter_delta
@@ -541,7 +634,7 @@ Field rules:
     ── CRITICAL RULE — price per sqft ───────────────────────────
     If the user states a price per sqft ("30K/sqft", "4500 per sq ft", "₹6k/sqft"):
       output { "price_per_sqft": <value>, "price_sqft_bound": "max"|"min"|"exact" }
-      NOT price_max/price_min — orchestrator calls convertPricePerSqftToAbsolute().
+      NOT price_max/price_min — orchestrator calls convert_price_per_sqft_to_absolute().
       This is ALWAYS a buy-context filter regardless of magnitude.
       "30K per sqft" in a buy session → price_per_sqft: 30000 ← NEVER a rent switch.
 
@@ -647,34 +740,76 @@ The SLM classifies **semantics**. The orchestrator handles **deterministic parsi
 
 ### Orchestrator does BEFORE calling the SLM
 
-| Task | Example | Why in code |
-|------|---------|-------------|
-| BHK extraction | "2BHK", "2 bhk", "2 bedroom" → `{ bhk: [2] }` | Regex. No ambiguity. |
-| Price normalisation | "30K" → 30000, "1.5Cr" → 15000000, "80L" → 8000000 | Deterministic suffix table. |
-| Per-sqft detection | "30K/sqft", "₹4500 per sq.ft" → flag `price_per_sqft` | Regex. Prevents the rent-switch bug. |
-| Unit detection | message contains "bigha", "guntha", "marla" → flag for `convert_unit` | Regex. Removes ambiguity before SLM. |
+Nothing numeric. The raw message is passed to the SLM as-is.
 
-These are pre-processed and injected into the SLM's input context so the SLM receives already-normalised values and only has to classify intent.
+Pre-regex normalization of numbers is explicitly excluded. The risk is false matches on non-price strings: "Block 5K", "Sector 30K Extension", "Property ID 2L4" — a suffix table can't distinguish these from prices. The SLM has context; regex does not.
+
+The SLM's weakness is arithmetic (it may drop or add a zero converting "2cr" to an integer). Its strength is semantic disambiguation (it knows "Block 5K" is a locality, not ₹5,000). Design to that strength: let the SLM output amounts as **tagged strings**, and let the orchestrator do the final integer conversion with zero risk of error.
+
+The SLM receives the raw message and session context. No pre-processing of numbers.
 
 ### Orchestrator does AFTER receiving SLM output
 
+**Amount parsing (always first):**
+
+SLM and LLM output monetary amounts as tagged strings — never as raw integers. The orchestrator converts them with 100% accuracy before any other translation.
+
+```
+"2cr"    → 20000000      "80L"    → 8000000       "25K"     → 25000
+"1.5cr"  → 15000000      "2.5L"   → 250000         "4500/sqft" → { amount: 4500, unit: "per_sqft" }
+"paanch lakh" → 500000   "teen hajar" → 30000      "do karod" → 20000000
+```
+
+`parseAmount(str): number` — handles English suffixes (K/L/cr), Hindi words (hajar/lakh/karod), decimals, and the per-sqft pattern. This is the only place in the system that does Indian number parsing.
+
+**Semantic → wire translation (after amounts are resolved):**
+
 | Task | Mapping | Why in code |
 |------|---------|-------------|
-| `bhk` → `apartment_type_id` | [2,3] → "2,3" | Khoj ID lookup table. |
-| `furnishing` → `furnish_type_id` | "furnished"=1, "semi-furnished"=2, "unfurnished"=3 | Lookup table. |
-| `property_type` → `property_type_id` | "apartment"=1, "villa"=2, "builder_floor"=3, "plot"=4 | Lookup table. |
-| `listed_by` → `contact_person_id` | "owner"=4, "broker"=1, "builder"=3 | Lookup table. |
-| `price_per_sqft` → `price_max/min` | rate × area_range → absolute range | `convertPricePerSqftToAbsolute()` |
+| Amount strings → integers | `parseAmount("2cr")` → 20000000 | Suffix table. Accurate. SLM never outputs raw integers for amounts. |
+| `bhk` → `apartment_type_id` | 1→2, 2→3, 3→4, 4→71, 5→72, 5+→7 | Khoj ID lookup table. |
+| `furnishing` → `furnish_type_id` | fully_furnished=1, semi_furnished=2, unfurnished=3 | Lookup table. |
+| `property_type` → `property_type_id` | apartment=1, independent_house=2, villa=38, independent_floor=6, plot=15 | Lookup table. |
+| `listed_by` → `contact_person_id` | agent=1, owner=2, developer=3 | Lookup table. |
+| `property_age` → `min_age`/`max_age` | less_than_5_years → min_age=-5; more_than_5_years → max_age=-5 | Lookup table. |
+| `amenities[]` → `outside_amenities` booleans | swimming_pool → has_swimming_pool=true, gym → has_gym=true | Lookup table. |
+| `price_per_sqft` → `price_max/min` | rate × area_range → absolute range | `convert_price_per_sqft_to_absolute()` |
 | Price sanity check | Is 80K sensible for buy in this city? | `checkPriceSanity()` — catch remaining ambiguity after SLM |
 
 ### What the SLM ONLY does
 
 - Classifies intent (`main_intent`, `sub_intent`)
-- Extracts named entities (`entities_mentioned`)
-- Outputs semantic filter signals in friendly values (`bhk: [2]`, `price_max: 7000000`)
-- Outputs `transaction_type` **only on explicit user signal** (not inferred from numbers)
+- Extracts named entities as typed objects (`entities_mentioned: [{ name, inferred_type }]`) — the SLM infers entity type from linguistic context (prepositions, possessives, name patterns). Code cannot do this from a name string alone.
+- Outputs semantic filter signals:
+  - Monetary amounts as **tagged strings**: `price_max: "2cr"`, `price_min: "80L"`, `price_per_sqft: "4500"` — never as raw integers
+  - BHK as integers (safe; small numbers): `bhk: [2]`
+  - Enum filters as semantic strings: `property_type: ["villa"]`, `property_age: "less_than_5_years"`
+- Outputs `transaction_type` **only on explicit user signal** (not inferred from price magnitude)
+- Does **not** convert amounts to integers — that is the orchestrator's job, done after SLM returns
 
-**Consequence for prompt design:** The SLM prompt must include the normalised, pre-parsed values (not raw user text) so it never has to do number parsing. Example input to SLM: `"user said: 3BHK [parsed: bhk=[3]], 30K per sqft [parsed: price_per_sqft=30000], buy session"`.
+**Consequence for prompt design:** The SLM receives the raw user message. Its prompt must instruct it to output monetary amounts as tagged strings (`"2cr"`, `"80L"`, `"30K"`) and not as raw integers, so the orchestrator can do the final conversion accurately. Example SLM output: `{ price_max: "2cr", price_per_sqft: "4500", bhk: [2] }` — not `{ price_max: 20000000 }`.
+
+### What the LLM does (budget derivation)
+
+All financial reasoning — including simple percentage calculations — belongs to the LLM, not the orchestrator. The orchestrator normalises number *format* ("5L" → 500000). It never interprets number *meaning*.
+
+The same number takes different roles depending on phrasing:
+- "5L salary" → salary context
+- "5L budget" → direct price_max
+- "5L take-home, but 1.5L goes to current rent" → net disposable is different
+- "wife and I together earn 5L" → combined income, not individual
+
+Attempting to detect these roles with regex produces a system that works for the exact tested phrases and breaks on minor variations. The LLM handles all of it.
+
+| Scenario | Who resolves |
+|---|---|
+| "40% of my 5L salary as max EMI" → `price_max` | **LLM** |
+| standard EMI formula → `price_max` | **LLM** |
+| "sold property for 4cr, 50L debt, taking 1.5cr loan, stamp duty needs to be covered" | **LLM** |
+| "my in-laws are contributing 20L, rest from savings and loan" | **LLM** |
+| "expecting a hike to 7L in 6 months, plan accordingly" | **LLM** |
+
+The LLM outputs `price_max: <number>` as a semantic filter — the same key the SLM would output for straightforward cases. The orchestrator translates it to the wire param regardless of which component produced it. The LLM knows filter names (semantic). It never needs to know wire param names.
 
 ---
 
@@ -684,48 +819,67 @@ The intern's implementation only activates property-detail sub-intents (brochure
 
 Our design separates this into a pre-resolution step: after SLM classification, before the LLM call, the orchestrator resolves any `entities_mentioned` that are NOT already in session state.
 
-```typescript
-async function preResolveEntities(
-  classification: Classification,
-  session: Session,
-): Promise<Session> {
-  const { entities_mentioned, main_intent, sub_intent } = classification;
-  if (!entities_mentioned.length) return session;
+```python
+async def pre_resolve_entities(
+    classification: dict,
+    session: dict,
+) -> dict:
+    entities_mentioned = classification.get('entities_mentioned', [])
+    if not entities_mentioned:
+        return session
 
-  for (const name of entities_mentioned) {
-    // Already resolved? Skip.
-    if (isEntityInSession(name, session)) continue;
+    for entity in entities_mentioned:
+        name = entity['name']
+        inferred_type = entity['inferred_type']
 
-    const entity_type = inferEntityType(main_intent, sub_intent, name);
-    const result = await autosuggest(name, entity_type, session.service);
+        # Already resolved? Skip.
+        if is_entity_in_session(name, session):
+            continue
 
-    if (!result.length) continue;
+        # Try hinted type first. SLM inferred this from linguistic context —
+        # "from DLF" → developer, "in DLF Phase 1" → locality, "DLF Privana" → project.
+        # Code cannot make this determination from the name string alone.
+        result = await autosuggest(name, inferred_type, session.get('service'))
 
-    if (result.length === 1 || result[0].score > CONFIDENCE_THRESHOLD) {
-      // High confidence single match — inject into session for this turn
-      const top = result[0];
-      if (top.type === 'project')  session.active_project_id = top.id;
-      if (top.type === 'locality') session.active_locality_id = top.uuid;
-      if (top.type === 'developer') session.active_developer_id = top.id;
-      session.active_city_uuid = top.city_uuid || session.active_city_uuid;
-    } else {
-      // Ambiguous — inject disambiguation candidates into session
-      // LLM will present options; do NOT pick silently
-      session.pending_disambiguation = { name, candidates: result.slice(0, 3) };
-    }
-  }
-  return session;
-}
+        # If hinted type yields no match, fall back to untyped — take top result
+        # across all entity types. This handles cases where the SLM's type hint
+        # was wrong or the entity is known under a different type.
+        if not result:
+            result = await autosuggest(name, None, session.get('service'))
+
+        if not result:
+            continue
+
+        if len(result) == 1 or result[0].get('score', 0) > CONFIDENCE_THRESHOLD:
+            # High confidence — inject into session for this turn
+            top = result[0]
+            if top.get('type') == 'project':
+                session['active_project_id'] = top['id']
+            if top.get('type') == 'locality':
+                session['active_locality_id'] = top['uuid']
+            if top.get('type') == 'developer':
+                session['active_developer_id'] = top['id']
+            if top.get('type') == 'building':
+                session['active_building_id'] = top['id']
+            session['active_city_uuid'] = top.get('city_uuid') or session.get('active_city_uuid')
+        else:
+            # Ambiguous — surface candidates; LLM presents disambiguation
+            # Do NOT pick silently
+            session['pending_disambiguation'] = {'name': name, 'candidates': result[:3]}
+
+    return session
 ```
 
 **Effect on example queries:**
 
-| User message | entities_mentioned | Pre-resolution result |
-|---|---|---|
-| "show me brochure for DLF Privana" | ["DLF Privana"] | active_project_id=proj_xxx injected; LLM can call getFloorPlans directly |
-| "what are price trends in Koramangala" | ["Koramangala"] | active_locality_id=uuid_yyy injected; LLM has UUID for Gandalf call |
-| "compare Lodha Palava and Prestige City" | ["Lodha Palava", "Prestige City"] | Both project_ids injected; forces Sonnet via entities_mentioned count |
-| "3BHK in Gurgaon under 80L" | ["Gurgaon"] | city_uuid injected; LLM gets resolved city in session state |
+| User message | entities_mentioned | inferred_type signal | Pre-resolution result |
+|---|---|---|---|
+| "show me brochure for DLF Privana" | `[{name:"DLF Privana"}]` | project (named project pattern) | active_project_id injected |
+| "show me properties from DLF" | `[{name:"DLF"}]` | developer ("from" preposition) | active_developer_id injected |
+| "flats in DLF Phase 1" | `[{name:"DLF Phase 1"}]` | locality ("in" + "Phase N" pattern) | active_locality_id injected |
+| "price trends in Koramangala" | `[{name:"Koramangala"}]` | locality (neighbourhood name) | active_locality_id injected |
+| "compare Lodha Palava and Prestige City" | `[{name:"Lodha Palava"},{name:"Prestige City"}]` | project, project | Both project_ids injected; forces Sonnet |
+| "3BHK in Gurgaon under 80L" | `[{name:"Gurgaon"}]` | city | city_uuid injected |
 
 This means `property_context: always true` in the system prompt is always valid — not because the user clicked a card, but because the orchestrator guarantees entity context before the LLM is called.
 
@@ -737,7 +891,7 @@ This means `property_context: always true` in the system prompt is always valid 
 |--------|--------------|-------------|
 | Taxonomy names | `theme` / `sub_theme` (PROPERTY_DISCOVERY, etc.) | `main_intent` / `sub_intent` (property_search, etc.) — maps directly to `TOOLS_BY_INTENT` keys |
 | Multi-intent format | Separate theme `MULTI_INTENT/MORE_THAN_ONE` | Boolean `multi_intent: true` + `intents[]` array — preserves each intent's routing data |
-| Model selection signal | Not present | `entities_mentioned[]` — enables `selectTier3Model()` without a second LLM call |
+| Model selection signal | Not present | `entities_mentioned[]` — enables `select_tier3_model()` without a second LLM call |
 | Search filter changes | Not captured | `filter_delta` — orchestrator uses this to decide `applyFilter` vs fresh `searchProperties` |
 | MISSING_CONTEXT sub-theme | Present (blocks property questions without selected property) | Removed — `property_context` is always true |
 | Calculator intent | Not present | `calculator/calculate_emi`, `calculate_affordability`, `convert_unit` |
@@ -749,23 +903,27 @@ This means `property_context: always true` in the system prompt is always valid 
 
 The orchestrator derives the tier from `main_intent` + `sub_intent` without any additional LLM call:
 
-```typescript
-function deriveRoutingTier(classification: Classification, session: Session): RoutingTier {
-  const { main_intent, sub_intent } = classification;
+```python
+def derive_routing_tier(classification: dict, session: dict) -> str:
+    main_intent = classification['main_intent']
+    sub_intent = classification['sub_intent']
 
-  // Tier 1: action is a direct card tap with all params available
-  if (DIRECT_INTENT_MAP[sub_intent] && allParamsResolved(sub_intent, session)) return 'tier1';
+    # Tier 1: action is a direct card tap with all params available
+    if DIRECT_INTENT_MAP.get(sub_intent) and all_params_resolved(sub_intent, session):
+        return 'tier1'
 
-  // Tier 1: pure math with all inputs present
-  if (main_intent === 'calculator' && allCalculatorInputsPresent(classification.filter_delta, session)) return 'tier1';
+    # Tier 1: pure math with all inputs present
+    if main_intent == 'calculator' and all_calculator_inputs_present(classification.get('filter_delta', {}), session):
+        return 'tier1'
 
-  // Tier 2: SLM classification + orchestrator direct call (no LLM tool use)
-  if (main_intent === 'out_of_scope') return 'tier2_deflect';
-  if (main_intent === 'calculator') return 'tier2'; // needs to ask for missing input
+    # Tier 2: SLM classification + orchestrator direct call (no LLM tool use)
+    if main_intent == 'out_of_scope':
+        return 'tier2_deflect'
+    if main_intent == 'calculator':
+        return 'tier2'  # needs to ask for missing input
 
-  // Tier 3: LLM needed
-  return 'tier3';
-}
+    # Tier 3: LLM needed
+    return 'tier3'
 ```
 
-`selectTier3Model()` then uses `entities_mentioned` from the classification output — already documented in `cost-and-performance-optimisation.md`.
+`select_tier3_model()` then uses `entities_mentioned` from the classification output — already documented in `cost-and-performance-optimisation.md`.
