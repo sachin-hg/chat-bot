@@ -39,6 +39,10 @@ On app load, call `GET /api/v1/chat/get-conversation-id` to get or create a `con
 - [ ] `conversationId` returned on first load
 - [ ] Same `conversationId` returned on refresh (via `tokenId` cookie)
 - [ ] `login-auth-token` header sent when user is logged in
+- [ ] On first GET /get-conversation-id response: read tokenId from response body, store in houzy_token cookie (HttpOnly, SameSite=Lax, 1-year expiry)
+- [ ] houzy_token sent as X-Token-ID header on ALL subsequent requests (A2, A3, A4, A5)
+- [ ] Return visit: houzy_token cookie present → same conversationId returned (isNew: false)
+- [ ] Logout: delete both houzy_token and login-auth-token cookies → next request creates fresh session
 
 ---
 
@@ -120,6 +124,7 @@ User actions submitted via `POST /api/v1/chat/send-message` with `responseRequir
 - `location_shared` — user grants location → sends coordinates → next turn uses location for explore_nearby
 - `nested_qna_selection` — user taps a chip → correct `filter_delta` applied in next turn
 - Quick filter chip tap → sends `nested_qna_selection` user_action with the filter value (e.g. furnishing: 'furnished') — NOT a separate applyFilter action. Validate this sends the correct action type.
+- `shortlist_property` (save property) — tapping Save on a property card → fires A4 non-streaming endpoint with responseRequired: false → no SSE response expected → property appears in saved list on next portfolio load
 
 **For each:**
 - [ ] Correct `ChatEventFromUser` shape sent
@@ -162,6 +167,28 @@ Validate that error states render correctly in chat-demo.
 - `rate_limited` — user sending too fast → show "High demand, try again" with auto-retry UI
 - `llm_timeout` — after 8s wait → show recoverable error
 - `auth_expired` — session token expires mid-session → show re-auth prompt
+
+---
+
+## CHAT-D-010: Post-login migrate-chat flow
+**Sprint:** 3 | **SP:** 2 | **Status:** ⬜
+
+When user logs in mid-conversation, FE must call migrate-chat to claim the anonymous session.
+
+Flow:
+1. User logs in → login service returns login-auth-token
+2. FE calls POST /api/v1/chat/migrate-chat?currentConversationId={current}
+3. Response: { "data": { "new_conversation_id": "uuid" } }
+4. FE updates active conversationId in state
+5. FE reloads conversation history from new conversationId
+6. Prior filters, city, transaction_type preserved in session
+
+Acceptance Criteria:
+- [ ] migrate-chat called immediately after successful login
+- [ ] conversationId in state updated to new_conversation_id
+- [ ] History reloaded from new ID
+- [ ] Previous session context (city, filters visible in UI) preserved
+- [ ] If migrate-chat fails (network error) → keep anonymous session, log warning
 
 ---
 

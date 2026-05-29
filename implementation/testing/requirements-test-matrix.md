@@ -207,9 +207,15 @@ Status: ✅ Implemented | 🔧 Ticket exists | ⬜ Not yet ticketed
 
 ## Ticket Backlog for Unimplemented Tests
 
-All tests marked ⬜ need tickets. @rahul to create these in Sprint 1-2. Priority order:
-1. All REQ-CLS-* (classification is the foundation)
-2. All REQ-PROC-* (processing nodes run on every turn)
-3. All REQ-RESP-* (SSE correctness is user-visible)
-4. REQ-SLM-* (accuracy — model eval cases)
-5. REQ-API-* and REQ-DB-* (infrastructure correctness)
+All tests marked ⬜ need tickets. Priority order for @rahul:
+
+**Sprint 1-2 (immediate):**
+- CHAT-Q-DRY-005/006: Moved to Sprint 2 (nodes don't exist in Sprint 1)
+- CHAT-Q-LLM-001 (new): Author llm_tier3a/cases.jsonl — 80 cases, ≥20 is_followup_true, ≥15 Hindi response expected. Wire the LLM rubric eval runner from testing-guide.md.
+
+**Sprint 2-3:**
+- CHAT-Q-DB-001 (new): REQ-DB-001 through REQ-DB-006 — partition exists, index scan, trigger increment, JSONB schema, Kafka dedup, batch size. Layer 0 integration tests requiring real Postgres.
+- CHAT-Q-SEC-001 (new): REQ-SEC-001 through REQ-SEC-004 — key not in logs, message not in logs, injection blocked, session ownership. Unit tests with log capture fixture.
+
+**Sprint 3-4:**
+- All remaining REQ-LLM-*, REQ-SESS-*, REQ-API-* gaps

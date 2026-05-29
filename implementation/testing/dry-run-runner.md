@@ -12,6 +12,32 @@ Every dry run test uses this function. It abstracts the graph construction and r
 # tests/dry_run/runner.py
 
 @dataclass
+class SSEEvent:
+    """One SSE event captured from the pipeline during a dry run."""
+    event_type:           str                  # 'chat_event', 'message_delta', 'error', etc.
+    sequence_number:      Optional[int] = None
+    message_type:         Optional[str] = None  # 'text', 'markdown', 'template', 'user_action'
+    source_message_state: Optional[str] = None  # 'IN_PROGRESS', 'COMPLETED'
+    template_id:          Optional[str] = None
+    message_id:           Optional[str] = None
+    content:              Optional[dict] = None
+    data:                 Optional[dict] = None  # raw event data dict
+    
+    @classmethod
+    def from_dict(cls, event_type: str, data: dict) -> 'SSEEvent':
+        return cls(
+            event_type           = event_type,
+            sequence_number      = data.get('sequenceNumber'),
+            message_type         = data.get('messageType'),
+            source_message_state = data.get('sourceMessageState'),
+            template_id          = data.get('content', {}).get('templateId') if isinstance(data.get('content'), dict) else None,
+            message_id           = data.get('messageId'),
+            content              = data.get('content'),
+            data                 = data,
+        )
+
+
+@dataclass
 class DryRunResult:
     """Everything a test needs to assert on after running the pipeline."""
     
@@ -98,7 +124,7 @@ async def run_dry_pipeline(
     sse_events: list[SSEEvent] = []
     
     def capture_emit(event_type: str, data: dict):
-        sse_events.append(SSEEvent(event_type=event_type, **data))
+        sse_events.append(SSEEvent.from_dict(event_type, data))
     
     state = make_base_state(
         raw_message=message,
