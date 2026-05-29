@@ -1,59 +1,47 @@
 # Bot Conversation Design — Use Cases, Tools, and Response Architecture
 
-## Response Structure (Every Reply)
+## SSE Response Model (Every Turn)
 
-Every bot reply has up to three parts, emitted in order:
+Every bot turn is delivered as Server-Sent Events over the pipeline. For template intents there are three sequential phases; for text-only intents there is one.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Part 1: Fast Summary  (first streaming tokens)     │
-│  "Looking for 2BHK for rent near Sector 32..."      │
-│  Appears immediately. LLM streams this first.       │
-├─────────────────────────────────────────────────────┤
-│  Part 2: Tool event  (while tools execute)          │
-│  [spinner] "Searching properties..."                │
-│  Emitted as bot_tool_event frame                    │
-├─────────────────────────────────────────────────────┤
-│  Part 3: Actual Response  (bot_complete frame)      │
-│  text | template JSON | markdown                    │
-│  + followup chips                                   │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 1 — summary  (summary_node)                              │
+│  Deterministic pre-fetch acknowledgment                         │
+│  e.g. "I see you're looking for 2BHK rentals in Andheri"        │
+│  • Fires BEFORE data fetch — user sees acknowledgment in ~300ms │
+│  • Template intents only. Skipped if any entity confidence <0.70│
+│  • Sets BotState.summary_emitted = True                         │
+├─────────────────────────────────────────────────────────────────┤
+│  Phase 2 — templates  (respond_node)                            │
+│  Structured card events after fetch_data completes              │
+│  Each emitted as a chat_event with a templateId                 │
+│  (property_carousel, locality_carousel, etc.)                   │
+│  • Sets BotState.template_count                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  Phase 3 — followup  (followup_node)                            │
+│  LLM-generated text commentary after templates                  │
+│  • Streamed as message_delta chunks                             │
+│  • Ends with chat_event { sourceMessageState: COMPLETED }       │
+│  • LLMContext.is_followup = True when summary was already emitted│
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Why summary-first
+For **text-only intents** (no template), only Phase 3 fires, with `sequenceNumber: 0`.
 
-3–4s latency is acceptable for the full result but not for *feeling responsive*. The LLM is instructed to emit a one-line summary as the first thing it streams — this appears in the bubble while tools run. The user sees acknowledgement within ~300ms of sending their message.
+### Why this model
 
-**System prompt instruction:**
-```
-Begin EVERY response with exactly one line starting with a verb that summarises what you understood:
-"Looking for...", "Fetching...", "Comparing...", "Showing...", "Switching to..."
-Then proceed with tool calls. Then give your actual response.
-Never skip the summary line.
-```
+3–4 s latency is acceptable for the full result but not for feeling responsive. Phase 1 (`summary_node`) emits a deterministic acknowledgment from structured state — it does not require the LLM and appears before any data fetch. This gives the user visual confirmation within ~300 ms.
 
-### bot_complete frame shape
+The LLM (Phase 3, `followup_node`) produces conversational commentary on data that has already been fetched and rendered. It should **not** repeat the Phase 1 acknowledgment. `LLMContext.is_followup` is `True` when `summary_emitted` is set, signalling the LLM that the opening acknowledgment has already been shown.
 
-```typescript
-interface BotCompletePayload {
-  summary: string;           // the first-line summary, echoed for client logging
-  content_type: 'text' | 'template' | 'markdown' | 'mixed';
-  text?: string;             // for content_type: text or mixed
-  markdown?: string;         // for content_type: markdown or mixed
-  template?: {
-    template_id: TemplateId;
-    data: unknown;           // template-specific payload
-  };
-  followups: Followup[];     // suggestion chips below response
-}
+### Prompt guidance for the followup LLM
 
-interface Followup {
-  label: string;
-  intent?: string;           // structured intent for card actions
-  filter_delta?: Partial<SearchFilters>;  // for filter chips
-  display_text?: string;     // what to show in chat if user taps (optional)
-}
-```
+The LLM in Phase 3 receives `is_followup: True` when a summary was already emitted. In this case:
+- Do **not** open with a restatement of what the user asked.
+- Do **not** begin with "Looking for...", "I see you're...", or any re-acknowledgment.
+- Start directly with commentary, insight, or the next question.
+- Be concise. Templates carry the data; the text adds context, nuance, or a follow-up question.
 
 ---
 
@@ -95,7 +83,7 @@ All template IDs and their payloads:
 | `location_denied` | user_action (sender: system) | — | true | User explicitly denied location |
 | `location_not_available` | user_action (sender: system) | — | true | Permission may be granted but no position fix |
 
-**Feedback row (👍 👎 share):** Rendered by FE below every bot message. Feedback events are pushed to Google Analytics by FE. BE only needs to provide `message_id` (already present on every `bot_complete` frame) so FE can tag GA events. No additional WS frame or BE endpoint needed.
+**Feedback row (👍 👎 share):** Rendered by FE below every bot message. Feedback events are pushed to Google Analytics by FE. BE only needs to provide `message_id` (already present on every completed turn) so FE can tag GA events. No additional SSE event or BE endpoint needed.
 
 ---
 
@@ -138,79 +126,18 @@ CURRENT SESSION CONTEXT:
 
 The search API does not accept names — it takes system entity IDs. Names must be resolved to entities first.
 
-### `resolveEntity` tool
+> **Note:** `resolveEntity` is `llm_visible: false`. The LLM cannot call it. Entity resolution runs in `resolve_entities_node` BEFORE the LLM is called. The LLM receives pre-resolved entity names and IDs in the `[SESSION]` block (section 3 of the system prompt) and should use those IDs directly — it never calls `resolveEntity`. Full tool schemas are defined in `solid-architecture.md` (TOOL_REGISTRY).
 
-```typescript
-{
-  name: "resolveEntity",
-  description: "Map a user-entered name to one or more system entities. Call before any search when the user has specified a locality name, landmark, builder name, or project name. Do NOT call for cities — cities are resolved separately. Call once per distinct name in the user's message.",
-  input_schema: {
-    type: "object",
-    properties: {
-      raw_name: {
-        type: "string",
-        description: "Exact text the user entered, e.g. 'DLF Privana', 'Sector 32', 'Huda City Centre'"
-      },
-      entity_type: {
-        type: "string",
-        enum: ["locality", "landmark", "builder", "project"],
-        description: "locality: neighbourhood/sector. landmark: metro station, hospital, etc. builder: developer company. project: specific housing project."
-      },
-      city: { type: "string", description: "City hint to narrow results" }
-    },
-    required: ["raw_name", "entity_type"]
-  }
-}
-```
+### Entity resolution outcome in LLM context
 
-**Return:**
-```typescript
-{
-  raw_name: string,
-  matches: Array<{
-    entity_id: string,
-    entity_type: "locality" | "landmark" | "builder" | "project",
-    canonical_name: string,
-    subtitle: string,              // "Sector 77, Gurgaon" or "3-4 BHK, ₹3.5–5Cr"
-    confidence: number,            // 0.0 – 1.0
-    additional_info?: Record<string, string>
-  }>
-}
-```
-
-### LLM Decision Logic (in system prompt)
-
-```
-After calling resolveEntity, decide:
-1. If 0 matches → tell user no match found, ask them to rephrase or try a different name.
-   Use plain text. Do not use nested_qna.
-
-2. If 1 match and confidence >= 0.85 → auto-select, proceed.
-   Mention selection in summary: "Found DLF Privana South in Sector 77".
-
-3. If 1 match and confidence < 0.85 → confirm with plain text:
-   "Did you mean [canonical_name] in [city]?" User can reply yes/no.
-
-4. If 2 matches close in confidence AND they can be described clearly in text →
-   ask as plain text: "Did you mean Sector 32 in Gurgaon or Faridabad?"
-   User can type the distinguishing word ("Gurgaon") to answer.
-
-5. If multiple matches and top confidence >= 0.90 AND gap to second > 0.15 → auto-select top.
-
-6. If multiple matches close in confidence AND options need metadata to distinguish
-   (3+ options, similar names, user can't type an unambiguous answer) →
-   send template: nested_qna. Do NOT proceed with search.
-
-7. If resolveEntity was called for multiple raw_names in one turn AND multiple are ambiguous →
-   send nested_qna covering all ambiguous names in a single template (one selection per name).
-   Never send multiple separate nested_qna templates for the same turn.
-
-8. Never call resolveEntity more than once for the same raw_name in the same turn.
-```
+When `resolve_entities_node` completes before the LLM turn, the resolved data is available in the `[SESSION]` block:
+- Unambiguous resolutions: entity ID and canonical name are set in `conv:state` and visible to the LLM.
+- Ambiguous entities that required user selection via `nested_qna`: resolved IDs are stored after the user responds; the LLM sees the final resolved state.
+- Unresolvable entities: the session entry is absent; the LLM should ask the user conversationally ("I couldn't find a locality called X — could you check the spelling or try a nearby landmark?").
 
 ### `nested_qna` template
 
-Used for disambiguating one or more ambiguous entity names in a single turn. Each ambiguous name becomes one question in `selections[]`. FE hides the text composer while this template is the latest message.
+Emitted by `clarify_node` (when the SLM signals `clarification_needed`) or `resolve_entities_node` (when disambiguation is required) — never by the LLM. If the LLM receives context where an entity is ambiguous, it should ask conversationally in plain text rather than sending a template. Each ambiguous name becomes one question in `selections[]`. FE hides the text composer while this template is the latest message.
 
 ```json
 {
@@ -286,6 +213,19 @@ If the reference is ambiguous and session state doesn't have enough context → 
 
 ---
 
+## Tool Inventory Reference
+
+The LLM can only call the four tools listed below. All other tools (`searchProperties`, `getPropertyDetail`, `getFloorPlans`, `getRatingsReviews`, etc.) are `llm_visible: false` — they are called by `fetch_data_node` before the LLM runs, and their results are delivered to the LLM as inline template data in context, not as tool call results. The full registry (including all pre-fetch tools) is in `solid-architecture.md` (TOOL_REGISTRY).
+
+| Tool | Tier | When used |
+|---|---|---|
+| `getNearbyLandmarks` | Residual | `property_detail` / `property_about` intents only — surfaces points of interest near the active property |
+| `calculateEMI` | B | Available for non-calculator Tier 3 intents (e.g. user asks about EMI mid-conversation) |
+| `calculateAffordability` | B | Available for non-calculator Tier 3 intents |
+| `convertUnit` | B | Unit conversion (area, currency per sqft → absolute) when needed in the LLM turn |
+
+---
+
 ## Use Case 1: Property Search
 
 ### Inputs accepted (any combination)
@@ -306,7 +246,7 @@ If the reference is ambiguous and session state doesn't have enough context → 
 |---|---|---|
 | `apartment_type` | string[] | "1bhk", "2bhk", "3bhk", "4bhk", "5bhk+", "studio" |
 | `property_type` | string[] | "apartment", "villa", "independent_house", "plot", "duplex", "penthouse", "pg" |
-| `price_min` / `price_max` | number | Absolute INR. See price conversion tool below. |
+| `price_min` / `price_max` | number | Absolute INR. See price conversion tool. |
 | `area_min_sqft` / `area_max_sqft` | number | Always in sqft. See unit conversion tool. |
 | `listed_by` | string[] | "owner", "broker", "builder" |
 | `sale_type` | string[] | "resale", "new_booking" — buy only |
@@ -319,204 +259,30 @@ If the reference is ambiguous and session state doesn't have enough context → 
 | `facing` | string[] | "north", "south", "east", "west", "north_east", "north_west", "south_east", "south_west" |
 | `furnishing` | string[] | "furnished", "semi_furnished", "unfurnished" — rent primarily |
 
-### `searchProperties` tool (revised full schema)
+### Phase flow for property search
 
-```typescript
-{
-  name: "searchProperties",
-  description: "Search for properties. Requires city + at least one of: locality_ids, landmark_id, builder_id, project_id, lat_lng. Resolve names to entity IDs first using resolveEntity. Do not pass raw names to this tool.",
-  input_schema: {
-    type: "object",
-    properties: {
-      city:             { type: "string" },
-      transaction_type: { type: "string", enum: ["rent", "buy"] },
-      locality_ids:     { type: "array", items: { type: "string" } },
-      landmark_id:      { type: "string" },
-      builder_id:       { type: "string" },
-      project_id:       { type: "string" },
-      lat_lng:          { type: "object", properties: { lat: { type: "number" }, lng: { type: "number" } } },
-      radius_km:        { type: "number", description: "Used with lat_lng. Default 3km." },
-      filters: {
-        type: "object",
-        properties: {
-          apartment_type:         { type: "array", items: { type: "string" } },
-          property_type:          { type: "array", items: { type: "string" } },
-          price_min:              { type: "number" },
-          price_max:              { type: "number" },
-          area_min_sqft:          { type: "number" },
-          area_max_sqft:          { type: "number" },
-          listed_by:              { type: "array", items: { type: "string" } },
-          sale_type:              { type: "array", items: { type: "string" } },
-          is_project:             { type: "boolean" },
-          construction_status:    { type: "array", items: { type: "string" } },
-          age_of_property_max:    { type: "number" },
-          is_verified:            { type: "boolean" },
-          is_rera_compliant:      { type: "boolean" },
-          amenities:              { type: "array", items: { type: "string" } },
-          facing:                 { type: "array", items: { type: "string" } },
-          furnishing:             { type: "array", items: { type: "string" } }
-        }
-      },
-      sort_by:    { type: "string", enum: ["relevance", "price_asc", "price_desc", "newest", "area_desc"] },
-      page:       { type: "integer", default: 1 },
-      page_size:  { type: "integer", default: 10, maximum: 10 }
-    },
-    required: ["city", "transaction_type"]
-  }
-}
+This is a **Tier 3a** intent. The pipeline runs:
+1. `summary_node` emits: "I see you're looking for [BHK] [transaction_type] in [locality/city]" — before fetch.
+2. `fetch_data` calls `searchProperties` with resolved entity IDs.
+3. `respond_node` emits `property_carousel` template event(s).
+4. `followup_node` (LLM) adds commentary: highlights, filter tips, follow-up suggestions.
+
+The followup LLM receives `is_followup: True`. It should start with commentary on the results, not re-acknowledge what the user asked.
+
+**Example — good followup text (Phase 3):**
+```
+Found 47 properties. Furnished options are popular in this area — 
+you might want to filter to furnished only to narrow these down.
 ```
 
-**Return → `property_carousel` template:**
-```json
-{
-  "template_id": "property_carousel",
-  "data": {
-    "srset_id": "srset_abc123",
-    "total_count": 47,
-    "page": 1,
-    "page_size": 10,
-    "properties": [
-      {
-        "property_id": "prop_123",
-        "title": "3BHK in DLF Privana South",
-        "locality": "Sector 77",
-        "city": "Gurgaon",
-        "apartment_type": "3bhk",
-        "property_type": "apartment",
-        "area_sqft": 1850,
-        "price": 55000,
-        "price_display": "₹55,000/month",
-        "thumbnail_url": "...",
-        "highlights": ["Verified", "Furnished", "Metro 800m"],
-        "is_verified": true,
-        "listed_by": "owner",
-        "posted_days_ago": 3,
-        "quick_actions": [
-          { "label": "Details", "intent": "property_detail", "property_id": "prop_123" },
-          { "label": "Similar", "intent": "similar_properties", "property_id": "prop_123" },
-          { "label": "Contact", "intent": "contact_seller", "property_id": "prop_123" },
-          { "label": "Save", "intent": "shortlist", "property_id": "prop_123" }
-        ]
-      }
-    ]
-  },
-  "followups": [
-    { "label": "Show more", "intent": "paginate", "srset_id": "srset_abc123", "page": 2 },
-    { "label": "Furnished only", "filter_delta": { "furnishing": ["furnished"] } },
-    { "label": "Owner listings", "filter_delta": { "listed_by": ["owner"] } },
-    { "label": "Sort by price", "intent": "sort", "sort_by": "price_asc" }
-  ]
-}
+**Example — bad followup text (Phase 3, duplicates Phase 1):**
+```
+Looking for 3BHK rentals in Andheri... I found 47 properties for you.
 ```
 
-After returning this, Bot Orchestrator writes to Redis:
-```
-conv:state last_carousel_ids     = ["prop_123", "prop_234", ...]
-conv:state last_carousel_srset_id = "srset_abc123"
-conv:state last_carousel_page    = 1
-```
+### Zero results
 
----
-
-### Supporting Conversion Tools
-
-#### `convertAreaUnit`
-
-```typescript
-{
-  name: "convertAreaUnit",
-  description: "Convert area from any unit to square feet. Call when user enters area in sq yards, sq meters, acres, or guntha.",
-  input_schema: {
-    type: "object",
-    properties: {
-      value:     { type: "number" },
-      from_unit: { type: "string", enum: ["sq_yard", "sq_meter", "acre", "guntha", "sq_feet"] },
-      to_unit:   { type: "string", enum: ["sq_feet"], default: "sq_feet" }
-    },
-    required: ["value", "from_unit"]
-  }
-}
-// Return: { result_sqft: number }
-```
-
-#### `convertPricePerSqftToAbsolute`
-
-```typescript
-{
-  name: "convertPricePerSqftToAbsolute",
-  description: "Convert a per-sqft price to an absolute price range. Use when user says something like '12,000 per sqft'. Returns a min/max range based on typical BHK sizes.",
-  input_schema: {
-    type: "object",
-    properties: {
-      price_per_sqft: { type: "number" },
-      apartment_type: { type: "string", description: "e.g. '2bhk'. Helps infer area range." },
-      city:           { type: "string" },
-      area_min_sqft:  { type: "number", description: "If user also specified area range" },
-      area_max_sqft:  { type: "number" }
-    },
-    required: ["price_per_sqft"]
-  }
-}
-// Return: { price_min: number, price_max: number, assumed_area_range: { min: number, max: number }, note: string }
-// note: "Based on typical 2BHK size of 800–1,200 sqft in Gurgaon"
-```
-
-#### `reverseGeocode`
-
-```typescript
-{
-  name: "reverseGeocode",
-  description: "Convert a lat/lng coordinate to city and locality system entities. Always call this before passing coordinates to any tool that requires city_id or locality_id (e.g. getTrendingLocalities, getInvestmentHotspots, getSimilarLocalities). Not needed for searchProperties or getNearbyLocalities — those accept lat/lng directly.",
-  input_schema: {
-    type: "object",
-    properties: {
-      lat: { type: "number" },
-      lng: { type: "number" }
-    },
-    required: ["lat", "lng"]
-  }
-}
-// Return:
-// {
-//   city_id:       "city_gurgaon",
-//   city_name:     "Gurgaon",
-//   locality_id:   "loc_sector47",   // null if coords fall outside a known locality boundary
-//   locality_name: "Sector 47",      // null if locality_id is null
-//   area_label:    "Sector 47, Gurgaon"  // always present, used for bot summary line
-// }
-```
-
-`area_label` is what the bot uses in its fast summary: "Showing trending localities near Sector 47, Gurgaon...". If `locality_id` is null, city-level tools still work. If `locality_id` is present, both city-level and locality-level tools can proceed without a second call.
-
-#### `getPropertyCountByRelaxingFilters`
-
-```typescript
-{
-  name: "getPropertyCountByRelaxingFilters",
-  description: "When search returns 0 or very few results, call this to find out how many properties exist if specific filters are relaxed. Shows user which filter to drop to get more results. Call with the original search params and a list of filter keys to relax.",
-  input_schema: {
-    type: "object",
-    properties: {
-      base_search_params: { type: "object", description: "Same params as searchProperties" },
-      relax_combinations: {
-        type: "array",
-        description: "Each item is a list of filter keys to drop in that combination",
-        items: {
-          type: "array",
-          items: { type: "string" }
-        }
-      }
-    },
-    required: ["base_search_params", "relax_combinations"]
-  }
-}
-// Return:
-// [
-//   { relaxed_filters: ["furnishing"], count: 12, label: "Remove furnished filter → 12 properties" },
-//   { relaxed_filters: ["price_max"], count: 34, label: "Remove price limit → 34 properties" },
-//   { relaxed_filters: ["furnishing", "price_max"], count: 67, label: "Remove both → 67 properties" }
-// ]
-```
+When `searchProperties` returns 0: immediately call `getPropertyCountByRelaxingFilters` with 3–4 combinations. Present relaxation options as followup chips. Do not make up reasons why there are no results.
 
 Bot uses this to say: "No results with your filters. Removing the furnished requirement gives 12 options, or removing the price limit gives 34." Followup chips: `[Remove furnished | Relax budget | Show all 67]`.
 
@@ -533,7 +299,7 @@ User: "show me more about DLF Privana"
       "I want details on prop in Sector 77"
 ```
 
-LLM resolves reference → calls `getPropertyDetail(property_id)` → emits `property_detail` card → Bot Orchestrator sets `active_property_id` in Redis.
+Bot Orchestrator resolves the reference → `fetch_data_node` calls `getPropertyDetail(property_id)` → `respond_node` emits `property_detail` card → Bot Orchestrator sets `active_property_id` in Redis. The LLM sees the property data inline in context and adds followup commentary.
 
 ### Entry B: Card quick action (structured message)
 ```json
@@ -546,10 +312,10 @@ LLM resolves reference → calls `getPropertyDetail(property_id)` → emits `pro
   }
 }
 ```
-No entity resolution needed. Bot Orchestrator sets `active_property_id` directly. LLM calls `getPropertyDetail`.
+No entity resolution needed. Bot Orchestrator sets `active_property_id` directly. `fetch_data_node` calls `getPropertyDetail` — the LLM sees the result in context, not as a tool call.
 
 ### Entry C: Opened chat from property detail page
-The web/app sends a pre-seeded session frame on WS connect:
+The web/app sends a pre-seeded session frame on chat session init:
 ```json
 {
   "type": "session_seed",
@@ -567,9 +333,9 @@ Bot Orchestrator writes these to `conv:state` before the user says anything. Bot
 
 ## Use Case 3: Property Detail Actions
 
-Once `active_property_id` is set, these intents are available:
+Once `active_property_id` is set, these intents are available. All data-fetching tools are called by `fetch_data_node` before the LLM — the LLM sees results inline in context:
 
-| User intent | Tool called | Response template |
+| User intent | Pre-fetch tool (fetch_data_node) | Response template |
 |---|---|---|
 | "show floor plans" | `getFloorPlans(property_id)` | `floor_plans` |
 | "show images / photos" | `getPropertyImages(property_id)` | `image_gallery` |
@@ -580,52 +346,7 @@ Once `active_property_id` is set, these intents are available:
 | "show similar properties" | `getSimilarProperties(property_id)` | `property_carousel` |
 | "show nearby properties" | `searchProperties(lat_lng from property)` | `property_carousel` |
 
-### Tool: `getPropertyImages`
-
-```typescript
-{
-  name: "getPropertyImages",
-  description: "Fetch all images for a property, categorized by type.",
-  input_schema: {
-    type: "object",
-    properties: {
-      property_id: { type: "string" }
-    },
-    required: ["property_id"]
-  }
-}
-// Return → template: image_gallery
-// {
-//   categories: [
-//     { label: "Living Room", images: [{ url: "...", caption: "..." }] },
-//     { label: "Bedroom", images: [...] },
-//     { label: "Kitchen", images: [...] },
-//     { label: "Building", images: [...] }
-//   ]
-// }
-```
-
-### Tool: `shortlistProperty`
-
-```typescript
-{
-  name: "shortlistProperty",
-  description: "Shortlist/save a property for the logged-in user. If user is not logged in, return login_required.",
-  input_schema: {
-    type: "object",
-    properties: {
-      property_id: { type: "string" },
-      user_id:     { type: "string", description: "From session. If null, user is not logged in." }
-    },
-    required: ["property_id"]
-  }
-}
-// Return:
-//   { status: "shortlisted" }                              → already logged in (FE shows toast directly)
-//   { status: "login_required", template: "login" }        → not logged in
-```
-
-When `login_required`, bot sends `login` template. FE shows auth sheet. On login success, FE sends:
+When `shortlistProperty` returns `login_required`, bot sends `login` template. FE shows auth sheet. On login success, FE sends:
 ```json
 { "type": "user_message", "payload": { "intent": "auth_complete", "user_id": "usr_abc" } }
 ```
@@ -636,74 +357,25 @@ Bot Orchestrator updates session with `user_id`, retries the shortlist tool call
 ## Use Case 4: Reviews
 
 User can ask for reviews of:
-- "this locality" → `active_locality_id`
-- "Sector 32 Gurgaon" → resolveEntity → locality_id
-- "this project" → `active_project_id`
-- "DLF Privana" → resolveEntity → project_id
+- "this locality" → `active_locality_id` (from session context)
+- "Sector 32 Gurgaon" → resolved to locality_id by `resolve_entities_node` before the LLM
+- "this project" → `active_project_id` (from session context)
+- "DLF Privana" → resolved to project_id by `resolve_entities_node` before the LLM
 - "the locality of this project" → derive locality_id from active_project_id
 
-### `getLocalityReviews` tool
-
-```typescript
-{
-  name: "getLocalityReviews",
-  description: "Fetch resident reviews for a locality.",
-  input_schema: {
-    type: "object",
-    properties: {
-      locality_id: { type: "string" },
-      limit:       { type: "integer", default: 5 },
-      sort_by:     { type: "string", enum: ["recent", "highest_rated", "most_helpful"], default: "most_helpful" }
-    },
-    required: ["locality_id"]
-  }
-}
-// Return → template: reviews
-// {
-//   entity_name: "Sector 32, Gurgaon",
-//   overall_rating: 4.2,
-//   total_reviews: 234,
-//   rating_breakdown: { connectivity: 4.5, safety: 4.0, lifestyle: 4.3, value: 3.9 },
-//   reviews: [
-//     { text: "...", rating: 5, author_tenure: "3 years", date: "2024-12", helpful_count: 42 }
-//   ]
-// }
-```
-
-### `getProjectReviews` tool — same shape, `project_id` input.
-
-**LLM flow for "show me reviews of this locality":**
+**Pipeline flow for "show me reviews of this locality":**
 ```
 1. Check active_locality_id in session context → loc_789 (Sector 32, Gurgaon)
-2. Summary: "Fetching reviews for Sector 32, Gurgaon..."
-3. Call: getLocalityReviews({ locality_id: "loc_789" })
-4. Respond with template: reviews + text summarizing key themes
-5. Followups: ["See project reviews", "Compare with nearby locality", "Price trends here"]
+2. Phase 1 summary_node emits: "Looking at reviews for Sector 32, Gurgaon"
+3. fetch_data_node: getRatingsReviews({ locality_id: "loc_789" })
+4. respond_node emits: template reviews
+5. followup_node LLM adds: text summarising key themes (data already in context)
+6. Followup chips: ["See project reviews", "Compare with nearby locality", "Price trends here"]
 ```
 
 ---
 
 ## Use Case 5: Locality Comparison, Nearby, Price Trends, Transactions
-
-### `compareLocalities`
-
-```typescript
-{
-  name: "compareLocalities",
-  description: "Compare two localities across connectivity, amenities, pricing, and ratings.",
-  input_schema: {
-    type: "object",
-    properties: {
-      locality_id_a: { type: "string" },
-      locality_id_b: { type: "string" },
-      transaction_type: { type: "string", enum: ["rent", "buy"] }
-    },
-    required: ["locality_id_a", "locality_id_b", "transaction_type"]
-  }
-}
-// Return → content_type: markdown
-// Markdown comparison table with sections: Overview, Pricing, Connectivity, Amenities, Verdict
-```
 
 When user says "compare this locality to nearby localities":
 1. Resolve "this locality" → `active_locality_id`
@@ -711,50 +383,9 @@ When user says "compare this locality to nearby localities":
 3. Ask user: "Would you like to compare Sector 32 with Sector 50 or Sector 56?"
 4. User picks → `compareLocalities`
 
-### `getNearbyLocalities`
+`compareLocalities` returns markdown: a comparison table with sections for Overview, Pricing, Connectivity, Amenities, and Verdict.
 
-```typescript
-{
-  name: "getNearbyLocalities",
-  description: "Get localities within a radius of a given locality or coordinate. Accepts either locality_id (when user references a known locality) OR lat/lng (for near-me queries). Do NOT call reverseGeocode before this — pass lat/lng directly.",
-  input_schema: {
-    type: "object",
-    properties: {
-      locality_id:      { type: "string", description: "Use when locality is known" },
-      lat:              { type: "number", description: "Use for near-me queries instead of locality_id" },
-      lng:              { type: "number" },
-      radius_km:        { type: "number", default: 5 },
-      transaction_type: { type: "string", enum: ["rent", "buy"] },
-      limit:            { type: "integer", default: 6 }
-    }
-    // One of locality_id or (lat + lng) is required
-  }
-}
-// Return → template: locality_carousel
-```
-
-### `getLocalityPriceTrends` — same as in llm-tool-design.md but takes `locality_id` (not name).
-
-### `getLocalityTransactions`
-
-```typescript
-{
-  name: "getLocalityTransactions",
-  description: "Fetch recent registered sale/rental transactions in a locality.",
-  input_schema: {
-    type: "object",
-    properties: {
-      locality_id:      { type: "string" },
-      transaction_type: { type: "string", enum: ["rent", "buy"] },
-      apartment_type:   { type: "string" },
-      limit:            { type: "integer", default: 10 }
-    },
-    required: ["locality_id", "transaction_type"]
-  }
-}
-// Return → template: transaction_history
-// { transactions: [{ date, price, area_sqft, price_per_sqft, apartment_type, verified }] }
-```
+`getNearbyLocalities` accepts either `locality_id` (when locality is known) OR `lat/lng` (for near-me queries). Do not call `reverseGeocode` before `getNearbyLocalities` — pass lat/lng directly.
 
 ---
 
@@ -773,32 +404,6 @@ getTrendingLocalities({ city, transaction_type, ranked_by?: "search_volume"|"app
 getInvestmentHotspots({ city, budget_max?: number })
 ```
 
-**locality_carousel template:**
-```json
-{
-  "template_id": "locality_carousel",
-  "data": {
-    "localities": [
-      {
-        "locality_id": "loc_890",
-        "name": "Sector 50",
-        "city": "Gurgaon",
-        "avg_rent_2bhk": 42000,
-        "avg_price_2bhk": 8500000,
-        "overall_rating": 4.1,
-        "highlights": ["Metro access", "Schools nearby", "8% YoY appreciation"],
-        "thumbnail_url": "...",
-        "quick_actions": [
-          { "label": "Search here", "intent": "search_in_locality", "locality_id": "loc_890" },
-          { "label": "Reviews", "intent": "locality_reviews", "locality_id": "loc_890" },
-          { "label": "Price trends", "intent": "price_trends", "locality_id": "loc_890" }
-        ]
-      }
-    ]
-  }
-}
-```
-
 ---
 
 ## Use Case 7: Shortlist and Contact Seller
@@ -806,29 +411,10 @@ getInvestmentHotspots({ city, budget_max?: number })
 Both are auth-gated and trigger session state transitions.
 
 ### Shortlist
-→ Covered in Use Case 3. Template: `shortlist_property`. Login gate if unauthenticated.
+Covered in Use Case 3. Template: `shortlist_property`. Login gate if unauthenticated.
 
 ### Contact Seller
-→ Triggers `CONTACT_SELLER` session state transition (see redis-state-machine.md).
-
-```typescript
-{
-  name: "initiateContact",
-  description: "Initiate contact between buyer and seller. Triggers P2P session. Only call after explicit user confirmation ('yes, connect me', 'contact seller', tapping Contact button). Never call proactively.",
-  input_schema: {
-    type: "object",
-    properties: {
-      property_id:    { type: "string" },
-      seller_id:      { type: "string" },
-      opening_message: { type: "string", description: "Optional first message from buyer to seller" }
-    },
-    required: ["property_id", "seller_id"]
-  }
-}
-// Return → template: contact_seller
-// { seller_name, seller_type, response_rate, avg_response_hours, property_title }
-// Side effect: session_state → CONTACT_SELLER → P2P_ACTIVE flow begins
-```
+Triggers a `contact_seller` handoff signal to the unified gateway (see `solid-architecture.md` Part 11 — Integration Contracts). Only call `initiateContact` after explicit user confirmation ("yes, connect me", "contact seller", tapping Contact button). Never call proactively.
 
 ---
 
@@ -891,29 +477,23 @@ Price signal "under 25K" in rent context:
 
 Do not fire a search, do not change conv:state until the user confirms.
 
-### Text clarification vs nested_qna — when to use which
+### Text clarification — when to ask vs when the pipeline handles it
 
-Clarifications should be as lightweight as possible. Default to plain text. Only use `nested_qna` when the options are entities/items the user needs to **see** to recognise.
+Disambiguation and clarification by `nested_qna` template are handled by the pipeline (`resolve_entities_node` / `clarify_node`) before the LLM runs. The LLM never sends a `nested_qna` template. If the LLM receives an ambiguous turn (e.g. entity was not resolved upstream), it should ask conversationally in plain text.
+
+Clarifications from the LLM should be as lightweight as possible. Default to plain text.
 
 **Use plain text when:**
 - The question has 2–3 options that can be described in a short label
 - The user can answer with a word or short phrase ("rent", "per sqft", "yes", "no", "buy")
 - The bot can unambiguously parse the user's typed answer
-- Examples: price ambiguity, transaction type clarification, "did you mean X or Y?"
-
-**Use `nested_qna` when:**
-- Options are entities the user needs to see to identify (locality names, project names that sound similar)
-- Each option requires metadata to distinguish (city, type, price range, area)
-- Multiple independent disambiguation questions need answering at once
-- The user cannot reasonably type the answer — they need to pick from a displayed list
-- Examples: "Sector 32" matching both Gurgaon and Faridabad; "DLF Privana" matching South and West variants
+- Examples: price ambiguity, transaction type clarification, "did you mean X or Y?", unresolved entity
 
 ```
 "did you mean rent or ₹30K/sqft?"            → plain text  (2 options, word answer)
 "which city?"                                 → plain text  (open, user types city name)
-"which Sector 32 — Gurgaon or Faridabad?"    → can be plain text (2 short options)
-"which Sector 32?" [3+ cities with metadata] → nested_qna  (user needs to see options)
-"sector 32 AND sector 21 are both ambiguous" → nested_qna  (multiple questions at once)
+"which Sector 32 — Gurgaon or Faridabad?"    → plain text  (2 short options, user types distinguishing word)
+"I couldn't find Sector 21 — did you mean Sector 22 in Gurgaon?"  → plain text
 ```
 
 ### Filter carry-forward rules
@@ -970,22 +550,22 @@ Examples:
   "show me 3BHK"             → apartment_type_id: [3]     (replace, bare)
 ```
 
-**System prompt instruction:**
+**Prompt guidance for intent switching:**
 ```
 When you detect an intent switch, always:
-1. Acknowledge the switch in the summary line: "Switching to rental search in Gurgaon..."
-2. Explicitly state what you're carrying forward and what you're dropping.
-3. Ask for any required information that doesn't carry (usually budget).
-4. Do NOT automatically carry price filters across transaction types — always ask.
-5. Do NOT fire a search if the price signal is impossible or ambiguous in the current context — ask first.
-6. For BHK changes: check for additive keywords before deciding replace vs append.
+1. Phase 1 (summary_node) will have already emitted the acknowledgment.
+   In Phase 3 (followup), explicitly state what you're carrying forward and what you're dropping.
+2. Ask for any required information that doesn't carry (usually budget).
+3. Do NOT automatically carry price filters across transaction types — always ask.
+4. Do NOT fire a search if the price signal is impossible or ambiguous in the current context — ask first.
+5. For BHK changes: check for additive keywords before deciding replace vs append.
 ```
 
-**Example — explicit switch:**
+**Example — good followup (Phase 3) after a transaction type switch:**
 ```
 Switching to rental search in Gurgaon.
 
-I'll keep your 3BHK preference and the gym + parking requirements.
+Keeping your 3BHK preference and gym + parking requirements.
 Since rental and sale prices work differently, what's your monthly rental budget?
 ```
 
@@ -1007,23 +587,7 @@ Widening to 2BHK and 3BHK. Keeping all your other filters — here's the combine
 
 User says "show more", "next page", "see more properties".
 
-```typescript
-{
-  name: "paginateSearch",
-  description: "Load the next page of an existing search result set. Use when user asks for more properties after a carousel. Do NOT call searchProperties again — use the existing srset_id.",
-  input_schema: {
-    type: "object",
-    properties: {
-      srset_id: { type: "string" },
-      page:     { type: "integer" }
-    },
-    required: ["srset_id", "page"]
-  }
-}
-// Return → template: property_carousel (next 10)
-```
-
-LLM reads `last_carousel_srset_id` and `last_carousel_page` from session context. Calls `paginateSearch({ srset_id: "srset_abc123", page: 2 })`.
+`fetch_data_node` reads `last_carousel_srset_id` and `last_carousel_page` from session context and calls `paginateSearch({ srset_id: "srset_abc123", page: 2 })`. The LLM sees the new results inline in context.
 
 Bot Orchestrator updates `last_carousel_page` to 2. Appends new `property_ids` to `last_carousel_ids` (positions 11–20 now accessible by reference "11th property" etc.).
 
@@ -1045,24 +609,7 @@ User says:
 5. Render as markdown comparison
 ```
 
-### `compareProjects` tool
-
-```typescript
-{
-  name: "compareProjects",
-  description: "Compare two projects. If given property_ids instead of project_ids, derive the project from each property. Returns a structured comparison for markdown rendering.",
-  input_schema: {
-    type: "object",
-    properties: {
-      project_id_a:  { type: "string" },
-      project_id_b:  { type: "string" },
-      property_id_a: { type: "string", description: "Alternative to project_id_a — derive project from property" },
-      property_id_b: { type: "string", description: "Alternative to project_id_b" }
-    }
-  }
-}
-// Return → content_type: markdown
-```
+`compareProjects` returns `content_type: markdown`. If given `property_ids` instead of `project_ids`, it derives the project from each property.
 
 **Markdown comparison structure:**
 ```markdown
@@ -1098,15 +645,6 @@ Godrej Interio is ready-to-move and more affordable for the 2BHK segment.
 
 Bot sends template `share_location` with empty data and waits. Does NOT call any tool yet.
 
-```json
-{
-  "templateId": "share_location",
-  "data": {}
-}
-```
-
-FE handles all 3 button states (initial / retry / OS-blocked) internally — no state field from BE needed.
-
 If location permission was already granted in the browser, FE auto-sends `location_shared` without even rendering the template card.
 
 ### Step 2a: Permission granted
@@ -1128,23 +666,9 @@ FE sends a `user_action` with `sender.type: "system"`:
 Bot Orchestrator extracts `[lat, lng]` from `coordinates`, stores in `conv:state`. Bot proceeds with the tool chain for the specific query type (see below).
 
 ### Step 2b: Permission explicitly denied
-```json
-{
-  "messageType": "user_action",
-  "responseRequired": true,
-  "content": { "data": { "action": "location_denied" } }
-}
-```
 Bot: "No problem. Which area or locality are you looking in?" — falls back to text locality input.
 
-### Step 2c: Location not available (permission may be granted but no fix)
-```json
-{
-  "messageType": "user_action",
-  "responseRequired": true,
-  "content": { "data": { "action": "location_not_available" } }
-}
-```
+### Step 2c: Location not available
 Same bot response as `location_denied` — ask for area by text.
 
 ### Step 2d: User ignores
@@ -1185,7 +709,7 @@ User query                         Tool chain
 
 "reviews near me"                  lat/lng ──► reverseGeocode(lat, lng)
                                              → locality_id
-                                             ──► getLocalityReviews(locality_id)
+                                             ──► getRatingsReviews(locality_id)
 ```
 
 **Rule:** `reverseGeocode` is called **only** when the next tool needs `city_id` or `locality_id`. Tools that accept lat/lng directly (`searchProperties`, `getNearbyLocalities`) skip it entirely — one fewer round-trip.
@@ -1195,27 +719,17 @@ User query                         Tool chain
 - Locality-level tools fall back to `getNearbyLocalities(lat, lng)` as a proxy for "what's nearby."
 - Bot acknowledges: "I couldn't pinpoint your exact locality, but here are options in [city_name] near you."
 
-**System prompt instruction for near-me:**
-```
-NEAR-ME RESOLUTION:
-- searchProperties and getNearbyLocalities accept lat/lng directly. Never call reverseGeocode before these.
-- getTrendingLocalities and getInvestmentHotspots require city_id. Always call reverseGeocode first.
-- All other locality-level tools require locality_id. Call reverseGeocode first; if locality_id is null,
-  fall back to getNearbyLocalities(lat, lng) and tell the user why.
-- After reverseGeocode, use area_label in your summary line: "Showing trending localities near [area_label]..."
-- Store lat/lng from location_granted in session — don't request location again in the same session.
-```
-
 ---
 
-## System Prompt Additions (Covering All Use Cases)
+## System Prompt Rules Summary (All Use Cases)
 
 ```
 ENTITY RESOLUTION RULES:
-- Never pass raw names to searchProperties. Always call resolveEntity first for locality, landmark, builder, or project names.
-- "this", "here", "the project" → resolve from session context (provided above), do not call resolveEntity.
+- Entity resolution (resolveEntity) runs in resolve_entities_node BEFORE the LLM. The LLM sees resolved IDs
+  in the [SESSION] block and uses them directly — it never calls resolveEntity.
+- "this", "here", "the project" → resolve from session context (provided above).
 - Carousel positions ("first", "second", "3rd") → resolve from last_carousel_ids in session context.
-- If session context lacks required entity → ask user.
+- If session context lacks required entity → ask the user conversationally in plain text.
 
 PRICE SANITY THRESHOLDS (India real estate):
 - Valid buy total price:    ₹10L – ₹50Cr+
@@ -1231,91 +745,85 @@ BHK FILTER SEMANTICS:
 - Additive keywords (as well, also, too, and X, include X): APPEND to apartment_type_id array.
 - Replacement keywords (instead, only, just, switch to): REPLACE apartment_type_id.
 - Bare "show me 3BHK" with no qualifier: REPLACE.
-- On APPEND: run one combined search with the full array, carry all other filters unchanged.
+- On APPEND: one combined search is run by the pipeline with the full array, carry all other filters unchanged.
 
 FILTER MANAGEMENT:
 - Track filters across turns. Filters persist unless user explicitly changes them or intent switches.
 - On transaction_type switch: always drop price filters, ask for new budget. Drop construction_status, sale_type, age for rent. Drop "plot" type for rent, "pg" type for buy.
 - On city change: drop price range (city prices differ), drop locality/landmark entities. Keep BHK, property_type, amenities, area range.
 - On locality change within city: replace locality_ids only, carry all other filters.
-- When applying any filter change, call applyFilter (not searchProperties) to preserve the result set ID.
+- Filter changes (applyFilter, paginateSearch, searchProperties) are executed by the pipeline — signal the intent clearly in your response text so the orchestrator can dispatch correctly.
 
 PAGINATION:
-- "show more", "next", "more properties" → call paginateSearch with existing srset_id, not searchProperties.
-- Increment page by 1 from last_carousel_page in session context.
+- "show more", "next", "more properties" → pipeline calls paginateSearch with existing srset_id.
+- Current page is tracked in last_carousel_page in session context — reference it to tell the user what page they're on.
 
 ZERO RESULTS:
-- When searchProperties returns 0: immediately call getPropertyCountByRelaxingFilters with 3-4 combinations.
-- Present relaxation options as followup chips. Do NOT make up reasons why there are no results.
-
-TOOL CALL LIMITS PER TURN:
-- resolveEntity: max once per distinct name, never for cities.
-- reverseGeocode: max once per session after location_granted. Result is stored in conv:state — do not call again.
-- searchProperties: max once per turn. Collect all signals first.
-- compareLocalities / compareProjects: requires both entity IDs resolved before calling.
+- When search returns 0 results (visible in context): pipeline has already called getPropertyCountByRelaxingFilters.
+  Present the relaxation options as followup chips. Do NOT make up reasons why there are no results.
 
 NEAR-ME RESOLUTION:
-- searchProperties and getNearbyLocalities accept lat/lng directly. Never call reverseGeocode before these.
-- getTrendingLocalities and getInvestmentHotspots require city_id. Always call reverseGeocode first.
-- All other locality-level tools require locality_id. Call reverseGeocode first; if locality_id is null,
-  fall back to getNearbyLocalities(lat, lng) and tell the user why.
-- After reverseGeocode, use area_label in your summary line: "Showing trending localities near [area_label]..."
+- searchProperties and getNearbyLocalities accept lat/lng directly (no geocode step needed).
+- getTrendingLocalities and getInvestmentHotspots require city_id — pipeline calls reverseGeocode first.
+- All other locality-level tools require locality_id — pipeline calls reverseGeocode first.
 - lat/lng is stored in session after location_shared — do not send share_location template again in the same session.
 
-CLARIFICATION STYLE — TEXT vs NESTED_QNA:
-- Default to plain text for clarifications. Only use nested_qna when the user needs to see a list.
-- Plain text: price ambiguity, transaction type, binary choices, single-entity confirmation ("did you mean X?").
-  User answers with a word or short phrase. You parse the response.
-- nested_qna: entity disambiguation with 3+ options, options with metadata (city/type/price),
-  multiple ambiguous names in one turn, or cases where the user cannot type an unambiguous answer.
-- Never ask a nested_qna for something the user could answer with one word.
+FOLLOWUP PHASE (Phase 3) TONE:
+- is_followup is True when summary_node already emitted the acknowledgment.
+  Do NOT restate what the user asked. Start with commentary, insight, or a follow-up question.
+- Be concise. Templates carry the data; the text adds context or a next step.
+- Use markdown for: comparisons, price trends, reviews summaries, transaction data.
+- Use text for: conversational commentary, clarifications, error messages.
+
+CLARIFICATION STYLE:
+- Always use plain text for clarifications. The LLM never sends nested_qna — that is handled by the pipeline.
+- Plain text: price ambiguity, transaction type, binary choices, single-entity confirmation ("did you mean X?"),
+  unresolved entities. User answers with a word or short phrase. You parse the response.
 
 TEMPLATES vs TEXT:
-- Always use templates for: property results, locality results, images, floor plans, payment plans, reviews, brochures.
+- Templates are emitted by respond_node, not by the LLM. The LLM adds text commentary (Phase 3).
 - Use markdown for: comparisons, price trends, reviews summaries, transaction data.
 - Use text for: conversational answers, clarifications, error messages.
 - A reply can mix text + template (text before the template, followup chips after).
-- Template IDs: property_carousel, locality_carousel, image_gallery, floor_plans, payment_plan, amenities, download_brochure, shortlist_property, contact_seller, login, share_location, nested_qna, price_trends, transaction_history, reviews.
 ```
 
 ---
 
-## Complete Tool Inventory
+## Conversational Tone Guidelines
 
+### What makes a good bot response
+
+- **Specific, not generic.** "Found 12 furnished 2BHKs in Powai under ₹60k" is better than "Here are some results for you."
+- **Acknowledge context changes.** When the user changes a filter, city, or intent, the followup text should note what changed and what carried over.
+- **One follow-up question at a time.** Don't end messages with 3 questions. Pick the most useful one.
+- **Chips are for the obvious next steps.** Don't put rare actions in chips; put the 2–4 things the user is most likely to want next.
+- **Short on mobile.** Followup text should be 1–3 sentences for most search intents. Longer for comparisons and analysis.
+
+### What makes a bad bot response
+
+- Repeating the Phase 1 acknowledgment in Phase 3 text.
+- Making up reasons for zero results ("There might not be properties with these criteria because...").
+- Asking for clarification when the intent is unambiguous.
+- Applying a filter change without stating what changed.
+
+### Handling edge cases
+
+**Out-of-scope queries** (cricket scores, recipes, general knowledge):
 ```
-resolveEntity                      Entity name → system ID
-reverseGeocode                     lat/lng → city_id + locality_id (for near-me chains)
-searchProperties                   Core property search (accepts lat/lng directly)
-paginateSearch                     Next page of existing results
-getPropertyCountByRelaxingFilters  Zero-result recovery
-convertAreaUnit                    sq yard → sqft etc.
-convertPricePerSqftToAbsolute      ₹/sqft → absolute range
-
-getPropertyDetail                  Full property detail
-getPropertyImages                  Image gallery
-getFloorPlans                      Floor plan images
-getPropertyAmenities               Amenities list
-getPaymentPlan                     Builder payment schedule
-getSimilarProperties               Similar listings
-initiateContact                    Trigger P2P / contact_seller
-shortlistProperty                  Save property (auth-gated)
-
-getLocalityDetail                  Locality overview
-getLocalityReviews                 Resident reviews
-getProjectReviews                  Project-level reviews
-getLocalityPriceTrends             Price trend data
-getLocalityTransactions            Registered transactions
-getNearbyLocalities                Localities within radius (accepts lat/lng directly)
-getSimilarLocalities               Comparable localities
-getTrendingLocalities              Trending in city
-getInvestmentHotspots              Investment picks in city
-compareLocalities                  Side-by-side locality compare
-
-getProjectDetail                   Builder, RERA, construction
-compareProjects                    Side-by-side project compare
-
-getUserSavedProperties             Saved listings (auth-gated)
-getUserContactedProperties         Contacted listings (auth-gated)
-
-applyFilter                        Modify active search filters
+"I'm focused on helping with property search and research on Housing.com. 
+For [topic], you'd be better served by a general search. 
+Is there anything about properties I can help with?"
 ```
+
+**Multi-intent messages** ("show 2BHK AND compare Sector 32 with Sector 50"):
+- Execute the primary intent first (whichever is most actionable with available context).
+- Acknowledge the secondary intent: "I'll show you the 2BHK results — tap 'Compare localities' below to compare Sector 32 and Sector 50 next."
+- Do not attempt both in a single response if it would produce an overloaded UI.
+
+**Ambiguous intent** ("show me properties" with no location or filters):
+- Check session context first. If `active_locality_id` is set, use it.
+- If nothing is set: ask for the minimum required — city and transaction type.
+- Keep it to one question: "Which city are you looking in, and is it for rent or purchase?"
+
+**Stale session** (user returns after a long gap, context may be outdated):
+- If last activity was > 1 hour ago, acknowledge the gap gently: "Welcome back! You were looking at 3BHK rentals in Gurgaon last time — shall I continue from there or start fresh?"

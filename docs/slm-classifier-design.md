@@ -9,15 +9,91 @@ The SLM classifier is the **second stop** in the request pipeline (after Tier 0 
 3. **Tool set selection** — `main_intent` + `sub_intent` maps to `getResidualTools()` (derived from `INTENT_REGISTRY`; `getToolsForIntent` is a kept alias)
 4. **Filter delta** — `filter_delta` tells the orchestrator what changed vs what to preserve
 
-**Model:** `gemini-2.0-flash` (Google) — ~10× cheaper than Haiku for classification
+**Model:** `claude-haiku-4-5-20251001 (current; Gemini Flash as benchmark candidate)`
 **Latency budget:** ≤ 150ms (classification only, no tool calls)
 **Prompt cache:** Sections 1–4 are static per registry version — prime cache on cold start. Cache key includes `registry_hash` (SHA256 of INTENT_REGISTRY + FILTER_REGISTRY JSON); cache is invalidated and re-primed automatically on registry change.
+
+The pipeline calls the classifier through `ClassifierPort` (see `solid-architecture.md` — Adapter Interfaces). Swapping the underlying model (Haiku → Gemini Flash) requires only a new adapter implementing this protocol — no pipeline node changes.
 
 > **Architecture note:** The intent taxonomy injected into this prompt (Section 2) is generated
 > from `INTENT_REGISTRY` at startup. The filter delta rules (Section 3) are generated from
 > `FILTER_REGISTRY`. Do not edit these sections directly — edit the registries.
 > See [solid-architecture.md](./solid-architecture.md) for the full registry definitions and the
-> `registry_hash` cache-key rule (Part 4 — Template Rendering Rules).
+> `registry_hash` cache-key rule (Part 5 — Middleware Pipeline, Template Rendering Rules section).
+
+---
+
+## Model & Cost Profile
+
+**Current model:** `claude-haiku-4-5-20251001`
+**Benchmark candidate:** Gemini Flash (~5–10× cheaper at $0.075/1M input vs $0.80/1M). Switch only after passing the accuracy evaluation suite on the full domain test set.
+
+**Token budget per classification call:**
+- Static system prompt (Sections 1–4, cached): ~2,500 tokens
+- Per-request input (session context + user message): ~200 tokens
+- Output (JSON + reasoning): ~150 tokens average
+- Estimated cost: ~$0.40 per 1,000 classifications (Haiku, mostly uncached input + output)
+- Gemini Flash equivalent: ~$0.04 per 1,000. Switch only after accuracy validation.
+
+Note: The `reasoning` field adds ~40 output tokens per call. At 100k daily classifications this is ~4M extra output tokens/day (~$1.20/day on Haiku). Cap reasoning strings at 50 words.
+
+---
+
+## Resilience
+
+`classify_node` wraps the SLM call with `asyncio.wait_for(timeout=2.0)`. On timeout or 5xx after 2 retries (tenacity exponential backoff, max 2 attempts), the pipeline short-circuits with `main_intent: 'out_of_scope', sub_intent: 'out_of_scope_query'` — serving a "I'm having trouble understanding that right now" response rather than hanging the user. The timeout event is logged as `slm_classification_timeout` and counted toward the alert threshold.
+
+The SLM HTTP client is shared across requests via a connection pool (not re-instantiated per turn).
+
+---
+
+## Logging Spec
+
+Per classification call, emit:
+
+```json
+{
+  "event":                 "slm_classification",
+  "request_id":            "string",
+  "main_intent":           "string",
+  "sub_intent":            "string",
+  "entity_count":          "integer",
+  "filter_keys_count":     "integer",
+  "clarification_needed":  "boolean",
+  "pivot":                 "boolean",
+  "latency_ms":            "integer",
+  "model":                 "string",
+  "registry_hash":         "string"
+}
+```
+
+---
+
+## Evaluation Framework
+
+Maintain a ground-truth test set of ≥500 labeled examples: `(message, session_context, expected_main_intent, expected_sub_intent)`. Run after every INTENT_REGISTRY change or prompt edit.
+
+**Targets:** ≥95% exact match on `main_intent`, ≥90% on `sub_intent`.
+
+Track per-intent recall to catch per-class regressions. A drop in `locality_research` recall while overall accuracy holds often means the new intent is cannibalizing it.
+
+**Alert thresholds** (production monitoring, rolling 10-minute window):
+- `out_of_scope` rate > 5%: may indicate regression or prompt injection campaign
+- `clarification_needed` rate > 10%: SLM is being too conservative
+- `unknown_intent` log events > 0: SLM hallucinated an intent not in registry
+- SLM p95 latency > 200ms: approaching latency budget
+
+---
+
+## Taxonomy Update Checklist
+
+When adding a new intent:
+1. Add `IntentRecord` to `INTENT_REGISTRY` in `solid-architecture.md`
+2. Add `ToolRecord`(s) to `TOOL_REGISTRY` if the intent requires new API calls
+3. Add examples to `slm/examples/<intent>.md` (positive AND negative)
+4. Re-run the evaluation suite (target ≥95% main_intent, ≥90% sub_intent)
+5. Re-prime the prompt cache (the taxonomy block regenerates automatically from the registry)
+6. Update `FOLLOWUP_PROMPT_BLOCKS` and `SUMMARY_BUILDERS` in `solid-architecture.md`
 
 ---
 
@@ -179,6 +255,8 @@ sub_intent from Section 2 definitions below.
 SECTION 2 — INTENT TAXONOMY
 ════════════════════════════════════════════
 
+**This section is auto-generated from INTENT_REGISTRY at startup via `build_intent_taxonomy_block()`. Do not edit directly — edit the registry instead. See solid-architecture.md Part 4.**
+
 ──────────────────────────────────────────
 main_intent: property_search
 ──────────────────────────────────────────
@@ -299,9 +377,11 @@ User wants data or information about a specific housing project (new launch).
     General info, specs, or opinion about a SPECIFIC named project.
     Examples: "Is M3M Escala a good project?", "Tell me about Lodha Palava"
 
-  sub_intent: price_trends
-    Price movement within a specific project.
-    Examples: "Price appreciation in Godrej The Trees?"
+  sub_intent: project_price_trends
+    Price appreciation or investment trajectory for a SPECIFIC named project.
+    Different from locality_research/price_trends which gives locality-level aggregates.
+    Examples: "Price appreciation in Godrej The Trees?", "Has Lodha Palava appreciated?",
+              "Price trend for Prestige Shantiniketan"
 
   sub_intent: ratings_reviews
     Reviews or ratings for a specific project or builder.
@@ -376,16 +456,6 @@ main_intent: property_search (continued)
               "New launches in Mumbai", "Verified only", "Properties with video tours"
 
 ──────────────────────────────────────────
-main_intent: project_research (continued)
-──────────────────────────────────────────
-
-  sub_intent: project_price_trends
-    Price appreciation or investment trajectory for a SPECIFIC named project.
-    Different from locality_research/price_trends which gives locality-level aggregates.
-    Examples: "Has Lodha Palava appreciated?", "Price trend for Prestige Shantiniketan",
-              "How much has M3M Escala grown in value?"
-
-──────────────────────────────────────────
 main_intent: portfolio
 ──────────────────────────────────────────
 User wants to view their own activity or get personalized recommendations.
@@ -425,6 +495,11 @@ Standalone computation — NOT tied to a specific property currently in context.
 If tied to the current property, use property_detail/calculate_emi instead.
 For complex financial reasoning (salary % EMI, multi-factor affordability) → calculator,
 not property_detail, since the LLM needs financial context not property data.
+
+NOTE: `calculator` intents do NOT get Tier B tools (calculateEMI, calculateAffordability,
+convertUnit) injected into the LLM tool_definitions. They ARE the Tier B tool intents —
+injecting them would be circular. `calculator` routes to Tier 1 (direct computation) when
+all required inputs are present, or Tier 2 (ask for missing input) when they are not.
 
   sub_intent: calculate_emi
     EMI computation from an explicit property price the user states.
@@ -523,15 +598,18 @@ Field rules:
 
   clarification_needed
     null when the message is unambiguous and can be fully resolved.
-    Object when the bot must ask before proceeding:
-    {
-      "type": "disambiguation" | "missing_required" | "confirm_inferred",
-      "question": "<question text for the user>",
-      "options": [                    // for nested_qna chips; omit for open text
-        { "label": "<label>", "value": "<value>", "param": "<param_key>" }
-      ]
-    }
-    Trigger cases (in priority order):
+    String (the question text to ask the user) when the bot must ask before proceeding.
+    Examples: "Which city are you looking in?", "Rent or buy?", "Did you mean Andheri or Andhra?"
+
+    NOTE: this is a plain string, NOT an object. The orchestrator's validate_slm_node
+    normalises it and separately populates clarification_data (object with type/options).
+
+  clarification_data
+    OMIT from SLM output. This field is populated by validate_slm_node, not by the SLM.
+    (Shown here for reference only: { "question_id": "q1", "type": "disambiguation"|"missing_required"|
+    "confirm_inferred", "options": [{ "label": "...", "value": "...", "param": "..." }] })
+
+    Trigger cases for non-null clarification_needed (in priority order):
     1. disambiguation: entity pre-resolution returned 2–3 candidates with similar scores
        → "Did you mean [A], [B], or [C]?"
     2. missing_required: city = null AND no entity in message implies a city
@@ -576,6 +654,8 @@ Field rules:
        (See Orchestrator: Entity Pre-Resolution below.)
 
   filter_delta
+    **This section is auto-generated from FILTER_REGISTRY at startup via `build_filter_delta_block()`. Do not edit directly — edit the registry instead.**
+
     Only present when main_intent is property_search or property_detail.
     Captures the complete new value for every key that changed this turn.
     Keys not present in filter_delta are assumed UNCHANGED.
@@ -921,6 +1001,13 @@ def derive_routing_tier(classification: dict, session: dict) -> str:
         return 'tier2_deflect'
     if main_intent == 'calculator':
         return 'tier2'  # needs to ask for missing input
+
+    # Portfolio: simple data fetches are tier2; personalised recommendations need LLM (tier3)
+    if main_intent == 'portfolio':
+        if sub_intent in ('saved_properties', 'viewed_properties', 'recent_searches', 'recently_viewed_cross_session'):
+            return 'tier2'
+        if sub_intent == 'recommendations':
+            return 'tier3'
 
     # Tier 3: LLM needed
     return 'tier3'

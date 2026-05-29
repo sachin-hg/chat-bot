@@ -45,11 +45,11 @@ These are the failure modes the system is explicitly designed to prevent. Every 
 | Express strong buy/sell investment recommendations | Regulatory risk; out of scope | System prompt: explicitly forbidden |
 | Generate URLs or deep links | No valid URL patterns are known to the LLM | System prompt: "never generate URLs. The FE constructs all links." |
 | Output markdown tables (`\|---|---|`) | FE renders structured cards, not markdown tables | System prompt + output validator |
-| Include image URLs in text response | Images are in template payloads, not prose | Architectural: images go to `bot_complete.template`, not text |
+| Include image URLs in text response | Images are in template payloads, not prose | Architectural: images go in `chat_event` template data, not in LLM text output |
 | Generate numbered lists longer than 5 items in text | Cards handle bulk display; prose lists are hard to scan | System prompt: max 3 items in inline list, use carousel for more |
 | Mention properties not fetched in the current session | Confusion with real session state | System prompt: reference only `active_property_id` or current search result IDs |
 | Repeat the full address in text when a property card is already showing | Redundant verbosity | System prompt: "if a card is rendering this property, don't re-state its full details in text" |
-| Skip the summary line at the start of a response | User sees blank bubble during tool execution | System prompt: hard rule, first line must be verb-prefixed summary |
+| Emit a Phase-1-style summary for `is_followup: True` turns | summary_node (Phase 1) has already acknowledged the request; repeating it creates a duplicate bubble | System prompt: for `is_followup: True`, begin with commentary on the results shown — do NOT open with a summary of what the user asked |
 | Generate followup chips referencing intents not in the current tool set | Chip taps will fail | Orchestrator validates followup intents against `DIRECT_INTENT_MAP` before sending |
 | Switch `service` (buy/rent) mid-response without explicit instruction | Wrong context for entire search | System prompt: "never change transaction type without the user explicitly saying so" |
 
@@ -66,7 +66,7 @@ The following are **orchestrator responsibilities**, not LLM responsibilities. T
 - City-change locality clearing (new city → old localities invalid) — orchestrator
 - Auth state validation — orchestrator checks before routing tool calls
 - Prompt cache management — handled at API call construction time
-- Template rendering — FE renders `bot_complete.template.data`, LLM does not design UI
+- Template rendering — FE renders `chat_event.data` from respond_node; LLM does not design UI
 - BHK → apartment_type_id, furnishing → furnish_type_id, listed_by → contact_person_id — orchestrator lookup tables, never LLM work
 
 ---
@@ -158,7 +158,7 @@ Do not escalate, do not repeat the language, do not lecture further.
 
 ### Output Validator (Post-LLM)
 
-Runs on `bot_complete.text` before sending to client:
+Runs on `validated_text` (from `validate_output_node`) before the final `chat_event` is sent to client:
 
 ```python
 from dataclasses import dataclass, field
@@ -170,9 +170,10 @@ class BotOutputValidation:
 
 @dataclass
 class OutputRule:
-    violation_key: str       # tag added to violations list on match
-    pattern:       re.Pattern
-    action:        Literal['block', 'strip', 'log']
+    violation_key:    str         # tag added to violations list on match
+    pattern:          re.Pattern
+    action:           Literal['block', 'strip', 'log']
+    intent_allowlist: list[str] | None = None  # if set, rule is SKIPPED for these intents
     # block: remove the match from text + log violation
     # strip: same as block but does not count toward valid=False
     # log:   only log; do not modify text
@@ -182,20 +183,27 @@ OUTPUT_RULES: list[OutputRule] = [
     OutputRule('url_in_text',          re.compile(r'https?://\S+'),                                            action='block'),
     OutputRule('phone_number_in_text', re.compile(r'[6-9]\d{9}'),                                              action='block'),
     OutputRule('email_in_text',        re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),         action='block'),
-    OutputRule('markdown_table',       re.compile(r'\|[-:]+\|'),                                                action='block'),
+    # markdown_table is blocked by default — LLM should not invent tabular data.
+    # EXCEPTION: comparison intents intentionally produce markdown comparison tables via Sonnet.
+    OutputRule('markdown_table',       re.compile(r'\|[-:]+\|'),                                                action='block',
+               intent_allowlist=['comparison/compare_localities', 'comparison/compare_projects',
+                                  'locality_research/locality_comparison']),
     # Soft: log only — hard to distinguish tool-grounded prices from hallucinated ones
     OutputRule('bare_price_claim',     re.compile(r'(?<!\{)₹\s*\d[\d,.]+\s*(lakh|crore|L|Cr)', re.IGNORECASE), action='log'),
 ]
 
-def validate_bot_output(text: str) -> tuple[str, BotOutputValidation]:
+def validate_bot_output(text: str, current_intent: str = '') -> tuple[str, BotOutputValidation]:
     """Returns (cleaned_text, validation_result).
-    'block' rules: strip the matched substring from the text.
-    'log' rules: leave the text unchanged; violation is recorded but valid remains True.
+    'block' rules: strip the matched substring from text + mark invalid (unless intent in allowlist).
+    'log' rules: leave text unchanged; violation recorded but valid stays True.
+    current_intent: 'main_intent/sub_intent' string — used to skip allowlisted rules.
     """
     violations: list[str] = []
     cleaned = text
 
     for rule in OUTPUT_RULES:
+        if rule.intent_allowlist and current_intent in rule.intent_allowlist:
+            continue  # this rule does not apply for this intent
         if rule.pattern.search(cleaned):
             violations.append(rule.violation_key)
             if rule.action == 'block':
@@ -207,8 +215,10 @@ def validate_bot_output(text: str) -> tuple[str, BotOutputValidation]:
     return cleaned, BotOutputValidation(valid=valid, violations=violations)
 
 # validate_output_node calls this and uses the returned cleaned text, not the original:
-#   cleaned_text, validation = validate_bot_output(llm_resp['text'])
+#   intent_key = f"{c['main_intent']}/{c['sub_intent']}"
+#   cleaned_text, validation = validate_bot_output(llm_resp['text'], current_intent=intent_key)
 #   return {'validated_text': cleaned_text}   # cleaned_text is what the user sees
+# current_intent must be passed so intent_allowlist rules (e.g. markdown_table for comparison) fire correctly.
 ```
 
 ---
@@ -221,11 +231,16 @@ The LLM's text output must follow a consistent format. This is enforced via syst
 
 ```
 ANSWER FORMAT (mandatory):
-1. First line: One sentence starting with an action verb that summarises what you understood or are doing.
+1. When `is_followup: False` (standalone turn, no Phase 1 has run): First line must be one sentence
+   starting with an action verb summarising what you understood or are doing.
    Examples: "Looking for 3BHK...", "Comparing Bandra and Andheri...", "Fetching floor plans..."
-   This line appears immediately while tools run. Never skip it.
 
-2. After tools complete: Write your response in plain, conversational sentences.
+2. When `is_followup: True` (Phase 1 summary_node has already acknowledged the request): Do NOT
+   open with a summary of what the user asked. Phase 1 already did this. Begin directly with
+   commentary on the results shown.
+
+3. After Phase 1 (or for standalone turns, after the verb-prefixed line): Write your response in
+   plain, conversational sentences.
 
 FORMATTING RULES:
 - No markdown tables. Use cards for structured data.
@@ -289,7 +304,11 @@ The system prompt has four sections, assembled per request:
 [4] COMPRESSED HISTORY SUMMARY    (dynamic, if session > 20 turns)
 ```
 
-Sections 1 and 2 are identical across all users in the same session state — they are perfect candidates for prompt caching. Claude's prompt cache TTL is 5 minutes, so for a high-traffic system, these sections hit cache on nearly every request.
+Section 1 is identical across all users — a perfect candidate for prompt caching. Section 2 has
+two stable variants: (a) empty `[]` for all intents except `property_about`, (b)
+`[getNearbyLandmarks + Tier B × 3]` for `property_about`. Each variant is cached separately.
+Token cost: ~0 for variant (a), ~400–500 for variant (b). Claude's prompt cache TTL is 5 minutes,
+so for a high-traffic system, both sections hit cache on nearly every request.
 
 ### Section 1: Identity + Constraints
 
@@ -313,9 +332,11 @@ CRITICAL RULES — TOOL USE:
   Do not call it otherwise.
 
 CRITICAL RULES — OUTPUT:
-- Begin EVERY response with exactly one sentence starting with a verb that summarises what you understood.
-  "Looking for...", "Fetching...", "Comparing...", "Showing...", "Calculating..."
-  Never skip this line. It appears while tools run.
+- When `is_followup: True`, Phase 1 has already acknowledged the request via summary_node.
+  Do NOT open with a Phase-1-style summary ("Looking for...", "Fetching...", etc.).
+  Begin with commentary on the results shown.
+- When `is_followup: False`, begin with exactly one sentence starting with a verb that summarises
+  what you understood. "Looking for...", "Fetching...", "Comparing...", "Showing...", "Calculating..."
 - No markdown tables. No numbered lists longer than 5 items. No URLs. No bold/italic.
 - Keep responses to 1–4 sentences for standard turns. Only longer for comparison/analysis.
 - Prices in your text must always come from tool results. Never state a price from memory.
@@ -811,7 +832,7 @@ Has asked about metro connectivity twice — prioritize this in recommendations.
 ```python
 # After getFloorPlans tool call:
 # 1. Full result (images + dimensions) → NOT sent to LLM as-is (too many tokens)
-# 2. Template payload (images only, no dimension data) → FE via bot_complete
+# 2. Template payload (images only, no dimension data) → FE via chat_event (templateId: "floor_plan_carousel")
 # 3. Dimension summary → LLM context for generating text analysis
 
 def summarise_floor_plans(result: dict) -> str:
@@ -826,7 +847,7 @@ def summarise_floor_plans(result: dict) -> str:
     return '\n'.join(lines)
 ```
 
-LLM receives the summary and generates the markdown analysis (entry, kitchen, bedrooms, bathrooms, balconies, layout feel sections visible in the design screens). FE receives the image carousel template separately via the `template` field in `bot_complete`.
+LLM receives the summary and generates the markdown analysis (entry, kitchen, bedrooms, bathrooms, balconies, layout feel sections visible in the design screens). FE receives the image carousel template separately as a Phase 2 `chat_event` (templateId: `"floor_plan_carousel"`) from `respond_node`.
 ```
 
 ---
@@ -961,10 +982,10 @@ LLM receives the summary and generates the markdown analysis (entry, kitchen, be
 When `contact_seller` intent is classified:
 
 1. Orchestrator confirms `active_property_id` and `seller_id` are in session state
-2. If auth is missing → emit `auth_required` frame, stop
+2. FE template handles login if needed — `contact_seller` FE template has its own login flow
 3. If not yet confirmed by user → emit a confirmation card ("Contact this seller?"), stop
 4. On confirmation → call `contactSeller` API directly, publish `session_state_change` event to Kafka
-5. Kafka → Redis → client receives `session_state_change` WS frame → routing gateway switches to `user_seller_chat` service
+5. Kafka event → gateway detects `session_state_change` → issues new `RouteResponse` pointing to `user_seller_chat` WebSocket endpoint
 
 ```json
 {
@@ -1141,8 +1162,9 @@ Tools are split into two categories. The LLM only ever sees `llm_visible: true` 
 
 | Category | Tools | Who calls them |
 |---|---|---|
-| **LLM-visible** | `getNearbyLandmarks` | LLM (residual, property_about only) |
-| **Orchestrator-only** | `searchProperties`, `resolveEntity`, `getPropertyDetail`, `getFloorPlans`, `getBrochure`, `getSimilarProperties`, `getLocalityDetail`, `getPriceTrends`, `getProjectPriceTrends`, `getTransactionHistory`, `getRatingsReviews`, `getTrendingLocalities`, `getTrendingProjects`, `getProjectDetail`, `getDemandSupplyInsight`, `getTravelTime`, `getPriceBuckets`, `getFilterSuggestions`, `getCollections`, `getPopularCityLandmarks`, `getTopSocieties`, `calculateEMI`, `calculateAffordability`, `convertUnit`, `shortlistProperty`, `removeFromShortlist`, `contactSeller`, `getSavedProperties`, `getViewedProperties`, `getRecentlyViewed`, `getRecommendations`, `createSearchAlert` | DataFetchMiddleware, RoutingMiddleware |
+| **LLM-visible — Residual** | `getNearbyLandmarks` | LLM (intent-specific, property_about only) |
+| **LLM-visible — Tier B** | `calculateEMI`, `calculateAffordability`, `convertUnit` | LLM (always injected for all Tier 3 intents except `calculator/*`; LLM calls when user states all required inputs mid-session) |
+| **Orchestrator-only** | `searchProperties`, `resolveEntity`, `getPropertyDetail`, `getFloorPlans`, `getBrochure`, `getSimilarProperties`, `getLocalityDetail`, `getPriceTrends`, `getProjectPriceTrends`, `getTransactionHistory`, `getRatingsReviews`, `getTrendingLocalities`, `getTrendingProjects`, `getProjectDetail`, `getDemandSupplyInsight`, `getTravelTime`, `getPriceBuckets`, `getFilterSuggestions`, `getCollections`, `getPopularCityLandmarks`, `getTopSocieties`, `shortlistProperty`, `removeFromShortlist`, `contactSeller`, `getSavedProperties`, `getViewedProperties`, `getRecentlyViewed`, `getRecommendations`, `createSearchAlert` | DataFetchMiddleware, RoutingMiddleware |
 
 The LLM's job is **NLG** (natural language generation) over data that arrives pre-loaded in its context. It does not discover, fetch, or choose which APIs to call — the orchestrator does that based on `data_requirements` in `INTENT_REGISTRY`.
 
@@ -1177,13 +1199,19 @@ User: "Compare DLF Privana and Godrej Meridian"
   (For locality-vs-locality comparison see Pattern 9)
 
 
-Pattern 3: Property Detail + Nearby (residual tool — only pattern where LLM calls a tool)
-──────────────────────────────────────────────────────────────────────────────────────────
+Pattern 3: Property Detail + Nearby (residual tool — only pattern where LLM calls a non-Tier-B tool)
+─────────────────────────────────────────────────────────────────────────────────────────────────────
 User: "Tell me about this property and what's nearby"
   DataFetchMiddleware: getPropertyDetail (pre-fetched, inline)
   LLM tool_definitions: [getNearbyLandmarks]  ← only residual tool
   LLM: if user asked about "nearby", calls getNearbyLandmarks({ categories, radius_meters })
   (location injected by orchestrator; LLM only specifies category/radius preference)
+
+**Residual Tool Call Timeout:** The orchestrator applies a 2000ms timeout to residual tool calls
+(getNearbyLandmarks). On timeout, inject `{ error: 'timeout', message: 'Unable to fetch nearby
+landmarks right now.' }` and resume the LLM stream without landmark data. Log
+`residual_tool_timeout` metric. getNearbyLandmarks results have a 24h cache TTL — cache hits avoid
+this risk entirely for repeat property views.
 
 
 Pattern 4: Project drill-down (sequential parallel_groups)
@@ -1239,13 +1267,13 @@ Pattern 8: Save search alert (Tier 1, no LLM)
 ───────────────────────────────────────────────
 User: "Alert me when new 3BHKs appear in Powai under 1Cr"
   Classification: portfolio / save_alert (Tier 1)
-  RoutingMiddleware: checks auth → if missing, emits auth_required SSE event
+  RoutingMiddleware: save_alert has requires_auth=True; if auth_token absent → emits chat_event { templateId: "login" } with text "Log in to save this search and get alerts."
   RoutingMiddleware: emits confirmation card
     "Save alert: 3BHK in Powai under ₹1Cr. You'll get daily email alerts. Confirm?"
   On confirmation:
     createSearchAlert({ filters: session.active_filters, mailing_option: "daily" })
     → { success: true, message: "You will get alerts for new properties" }
-  Orchestrator emits bot_complete with success message — no LLM involved.
+  Orchestrator sets `bot_response` with success message — no LLM involved. `emit_final_state` sends the SSE `chat_event`.
 
 
 Pattern 9: Locality comparison (6 parallel pre-fetches, Sonnet, markdown output)
@@ -1291,32 +1319,32 @@ User: "What's the difference between Sector 50 and Sector 62 in Gurgaon?"
 
 ## Tool Result Rendering Pipeline
 
-Tool results carry a `render_as` field. The Bot Orchestrator uses this to determine how to package the `bot_complete` frame:
+Pre-fetched tool results feed into two separate paths — the **template path** (Phase 2) and the **LLM context path** (Phase 3):
 
 ```
-Tool result arrives
+Tool result arrives from DataFetchMiddleware
        │
        ▼
-render_as present?
-  ├── "property_card"         → package into cards[] array in bot_complete
-  ├── "property_detail_card"  → package as single card with expanded fields
-  ├── "locality_card"         → render locality summary card
-  ├── "price_trend_chart"     → package as chart_data in bot_complete
-  ├── "project_card"          → package as project card
-  └── null / absent           → include as structured data in metadata,
-                                 LLM prose is the primary output
+   Template intent?
+  ├── Yes → build_template_events() maps result to templateId + data
+  │          respond_node emits chat_event (messageType: "template") — Phase 2
+  │          Truncated summary also injected into LLM context for Phase 3 commentary
+  └── No  → Result injected directly into LLM context
+             LLM generates full prose response — Phase 3 only
 ```
 
-**bot_complete frame example (search result):**
+**Phase 2 chat_event example (property_search result):**
 
 ```json
 {
-  "type": "bot_complete",
-  "payload": {
-    "text": "Found 5 properties in Bandra under ₹80k. Here are the top matches:",
-    "cards": [
+  "messageId": "B",
+  "sequenceNumber": 1,
+  "messageType": "template",
+  "templateId": "property_carousel",
+  "sourceMessageState": "IN_PROGRESS",
+  "data": {
+    "properties": [
       {
-        "render_as": "property_card",
         "property_id": "prop_341",
         "title": "2BHK in Bandra West",
         "price_display": "₹72,000/month",
@@ -1324,22 +1352,19 @@ render_as present?
         "highlights": ["Metro 400m", "Furnished", "Verified"],
         "thumbnail_url": "https://cdn.housing.com/...",
         "quick_actions": [
-          { "label": "Details", "intent": "get_property_detail", "property_id": "prop_341" },
-          { "label": "Similar", "intent": "get_similar", "property_id": "prop_341" },
-          { "label": "Contact Seller", "intent": "contact_seller", "property_id": "prop_341", "seller_id": "sel_892" }
+          { "label": "Details",        "intent": "get_property_detail", "property_id": "prop_341" },
+          { "label": "Similar",        "intent": "get_similar",         "property_id": "prop_341" },
+          { "label": "Contact Seller", "intent": "contact_seller",      "property_id": "prop_341", "seller_id": "sel_892" }
         ]
       }
     ],
-    "metadata": {
-      "search_result_set_id": "srset_abc123",
-      "total_count": 47,
-      "shown": 5,
-      "quick_filters": [
-        { "label": "Furnished only", "filter_delta": { "furnishing": "furnished" } },
-        { "label": "Under ₹65k", "filter_delta": { "price_max": 65000 } },
-        { "label": "Metro nearby", "filter_delta": { "amenities": ["metro_nearby"] } }
-      ]
-    }
+    "property_count": 47,
+    "pagination": { "is_last_page": false },
+    "quick_filters": [
+      { "label": "Furnished only", "filter_delta": { "furnishing": "furnished" } },
+      { "label": "Under ₹65k",     "filter_delta": { "price_max": 65000 } },
+      { "label": "Metro nearby",   "filter_delta": { "amenities": ["metro_nearby"] } }
+    ]
   }
 }
 ```
@@ -1372,6 +1397,7 @@ Large tool results are truncated before being added to LLM context:
 | `getPropertyDetail` | All fields except images array | images[] (URLs stored in card, not in LLM context) |
 | `getLocalityDetail` | Overview, ratings, pros/cons, top 3 schools/hospitals | Full amenity lists, all resident reviews |
 | `getPriceTrends` | Last 12 data points, insight string | Full 60-month history |
+| `getNearbyLandmarks` | Top 3 landmarks per category, `commute_summary`; max 15 total items (top 3 × 5 most relevant categories) | Raw rating data, full address strings, secondary photos |
 
 The full data is stored in the card payload (sent directly to client), but the LLM only sees a truncated version. This reduces per-turn token cost significantly.
 
@@ -1398,13 +1424,26 @@ Cache hit rate target: >80% for locality and price trend tools. This significant
 
 ## Utility and User History Tools
 
-Calculators and unit conversion are **orchestrator computation functions** (`llm_visible: false`).
-The SLM extracts params from free text, the orchestrator computes the result, and the LLM receives
-the result inline in its context — it only formats a response. No LLM tool calls, no round trips.
+Calculators and unit conversion have **two distinct execution paths** depending on intent:
+
+**Path 1 — `calculator/*` intents (Tier 2, no LLM call):** The SLM classifies the turn as a
+calculator intent. The orchestrator computes the result directly from SLM-extracted params and
+assembles the response directly and sets `bot_response`. The LLM is not called at all for these turns.
+
+**Path 2 — Non-calculator Tier 3 intents (LLM-visible, `tier_b: true`):** For all Tier 3 intents
+except `calculator/*`, `calculateEMI`, `calculateAffordability`, and `convertUnit` are injected
+into the LLM's tool definitions (`llm_visible: true`). The LLM may call them mid-session when the
+user states all required inputs explicitly (e.g. "what's the EMI on this?" while viewing a property
+detail — price is in context, LLM calls `calculateEMI` with it). These are pure local computation
+(no API calls, sub-50ms) — the LLM receives the result and formats a response.
+
+**Constraint for Path 2:** The LLM must only call Tier B tools when all required inputs are
+explicitly available. It cannot invent a property price, salary, or unit value.
 
 ### `calculateEMI`
 
-> **Orchestrator Tier 2 function.** SLM extracts params → orchestrator computes → LLM formats.
+> **Two paths:** Tier 2 (orchestrator-computed, no LLM) for `calculator/*` intents; Tier B
+> (LLM-visible tool, `llm_visible: true`) for all other Tier 3 intents.
 
 ```json
 {
@@ -1455,18 +1494,23 @@ loan_amount = property_price - (down_payment ?? property_price × down_payment_p
 **Pure math — no external API.** Formula: `EMI = P × r × (1+r)^n / ((1+r)^n - 1)` where
 `P = loan_amount`, `r = annual_rate/12/100`, `n = tenure_years × 12`.
 
-**SLM routing:** "What's the EMI on a 1Cr flat?" → SLM extracts `property_price: 10000000` into
-`filter_delta` / SLM output params → Tier 2 → orchestrator computes with defaults (20% down, 20yr,
-8.5%) → result injected into LLM context → LLM formats response. Zero tool call round trips.
-If user says "at 9% for 15 years", SLM extracts those additional params too.
+**Tier 2 path (calculator intent):** "What's the EMI on a 1Cr flat?" → SLM classifies as
+`calculator/emi` → SLM extracts `property_price: 10000000` → Tier 2 → orchestrator computes with
+defaults (20% down, 20yr, 8.5%) → result injected into LLM context → LLM formats response.
+Zero LLM tool call round trips. If user says "at 9% for 15 years", SLM extracts those params too.
+
+**Tier B path (non-calculator intent):** User is mid-session on a `property_about` turn and asks
+"what would my EMI be?" — LLM has property price in context → calls `calculateEMI` with it as
+a Tier B tool call → orchestrator computes → LLM formats response.
 
 ---
 
 ### `calculateAffordability`
 
-> **Orchestrator Tier 2 function.** SLM extracts params → orchestrator computes → LLM formats.
-> If salary is not in context, SLM routes Tier 3 so LLM can ask the user — salary cannot be
-> defaulted or guessed.
+> **Two paths:** Tier 2 (orchestrator-computed, no LLM) for `calculator/*` intents; Tier B
+> (LLM-visible tool, `llm_visible: true`) for all other Tier 3 intents.
+> If salary is not in context when called as a Tier B tool, the LLM must ask the user —
+> salary cannot be defaulted or guessed.
 
 Two modes depending on what the user provides:
 - **Mode A — "What can I afford?"**: User gives salary → return recommended max budget + EMI estimate
@@ -1542,10 +1586,13 @@ based on `shortfall` and `stretch_tenure` in the result.
 
 ### `convertUnit`
 
-> **Orchestrator Tier 2 function.** SLM extracts `value`, `from`, `to` (and `state` if bigha) →
-> orchestrator looks up conversion factor → result injected into LLM context → LLM formats.
-> Exception: if `bigha` is involved and `state` is missing, SLM routes Tier 3 so the LLM can
-> ask which state (bigha size varies 10x across states).
+> **Two paths:** Tier 2 (orchestrator-computed, no LLM) for `calculator/*` intents; Tier B
+> (LLM-visible tool, `llm_visible: true`) for all other Tier 3 intents.
+> SLM extracts `value`, `from`, `to` (and `state` if bigha). For Tier 2 path: orchestrator
+> computes inline, result injected into LLM context. For Tier B path: LLM calls the tool when
+> the user provides all required inputs mid-session.
+> Exception: if `bigha` is involved and `state` is missing, the LLM must ask which state
+> before calling (bigha size varies 10x across states).
 
 ```json
 {
@@ -1602,48 +1649,22 @@ bigha → sqft   : UP=27000, Bihar=27211, Punjab/Haryana=9070, Rajasthan=1936  (
 
 All conversions go through sqft as the intermediate unit — `from → sqft → to` using the table above.
 
-**SLM routing:** "convert 1200 sqft to sq yards" → Tier 2 → SLM extracts `value:1200, from:sqft,
-to:sqyard` → orchestrator computes → result inline in LLM context → zero LLM tool call tokens.
-Bigha without state → Tier 3 → LLM asks which state before orchestrator computes.
+**Tier 2 path (calculator intent):** "convert 1200 sqft to sq yards" → SLM classifies as
+`calculator/convert_unit` → SLM extracts `value:1200, from:sqft, to:sqyard` → orchestrator
+computes → result inline in LLM context → zero LLM tool call tokens.
+
+**Tier B path (non-calculator intent):** User is mid-session and mentions a unit conversion
+need → LLM calls `convertUnit` as a Tier B tool with user-stated values → orchestrator computes.
+
+Bigha without state (either path) → LLM must ask which state before computing.
 
 ---
 
 ### `getRecentSearches`
 
-```json
-{
-  name: "getRecentSearches",
-  description: "Fetch the user's recent search history. Use when user says 'show my recent searches', 'what did I search for', or 'continue where I left off'.",
-  input_schema: {
-    type: "object",
-    properties: {
-      user_id: { type: "string" },
-      limit:   { type: "integer", default: 5, maximum: 10 }
-    },
-    required: ["user_id"]
-  }
-}
-```
-
-**Return schema:**
-
-```json
-{
-  searches: Array<{
-    search_id:       string,
-    timestamp:       string,
-    transaction_type: "rent" | "buy",
-    city:            string,
-    locality?:       string,
-    filters_summary: string,    // "2BHK, ₹40–60k/month, furnished"
-    result_count:    number,
-    deep_link:       string     // SRP URL to resume this search
-  }>,
-  render_as: "recent_searches"
-}
-```
-
-**Tier 1 routing:** Triggered from profile/history card tap → `DIRECT_INTENT_MAP.view_recent_searches`. LLM only involved if user asks in free text ("what were my last searches?").
+> **Note:** `recent_searches` is served from session state (`session.search_history`) directly — no
+> API call. The SLM routes to `portfolio/recent_searches` (Tier 2); the orchestrator formats
+> `session.search_history` into the response without calling any external API.
 
 ---
 
@@ -1652,15 +1673,14 @@ Bigha without state → Tier 3 → LLM asks which state before orchestrator comp
 ```json
 {
   name: "getViewedProperties",
-  description: "Fetch properties the user has viewed (opened property detail) in recent sessions. Use when user says 'show me what I looked at', 'properties I liked', or 'my history'.",
+  description: "Fetch properties the user has viewed (opened property detail) in recent sessions. Use when user says 'show me what I looked at', 'properties I liked', or 'my history'. User identity is resolved from session context — no external param required.",
   input_schema: {
     type: "object",
     properties: {
-      user_id:          { type: "string" },
       limit:            { type: "integer", default: 6, maximum: 20 },
       transaction_type: { type: "string", enum: ["rent", "buy"] }
     },
-    required: ["user_id"]
+    required: []
   }
 }
 ```
@@ -1959,17 +1979,27 @@ When `classification.clarification_needed` is not null, the orchestrator emits a
 
 ```json
 {
-  "type": "nested_qna",
-  "payload": {
-    "question": "Are you looking to rent or buy?",
-    "options": [
-      { "label": "Rent", "intent": "set_service", "value": "rent" },
-      { "label": "Buy",  "intent": "set_service", "value": "buy" }
+  "messageId": "...",
+  "sequenceNumber": 0,
+  "messageType": "template",
+  "templateId": "nested_qna",
+  "sourceMessageState": "COMPLETED",
+  "data": {
+    "selections": [
+      {
+        "questionId": "q1",
+        "title": "Are you looking to rent or buy?",
+        "type": "single_select",
+        "options": [
+          { "id": "rent", "title": "Rent" },
+          { "id": "buy",  "title": "Buy"  }
+        ]
+      }
     ]
   }
 }
 ```
-<!-- WS frame — matches existing FE template contract (system-design.md) -->
+<!-- SSE chat_event — canonical ChatEventToUser envelope; data shape per api-contract.md Part D5 -->
 
 | `clarification_needed.type` | Question | Options | Follow-up |
 |-----------------------------|----------|---------|-----------|
@@ -2003,7 +2033,7 @@ When `classification.clarification_needed` is not null, the orchestrator emits a
       These normalised values are injected into the SLM prompt so it never
       has to do number parsing — it only classifies intent and extracts semantics.
       │
-5. [SLM] Intent classification (Gemini Flash)
+5. [SLM] Intent classification (Claude Haiku — current; Gemini Flash is benchmark candidate)
    Input: user message + normalised values + last 3 turns + previous intent
           + compact active_filters (for ADD/REPLACE semantics)
    Output: { main_intent, sub_intent, entities_mentioned, filter_delta,
@@ -2028,7 +2058,7 @@ When `classification.clarification_needed` is not null, the orchestrator emits a
     Inject into session.search_anchor_coordinates for Khoj lat/long/radius search
       │
 5e. If classification.clarification_needed is not null:
-    Emit nested_qna WS frame with question + option chips → stop here
+    Emit nested_qna SSE chat_event (templateId: "nested_qna") → stop here
     (no entity resolution, no LLM call, no tool execution for this turn)
       │
 6. Entity pre-resolution (orchestrator, sync, ~50ms)
@@ -2043,15 +2073,15 @@ When `classification.clarification_needed` is not null, the orchestrator emits a
       │
 7. Tier routing + auth check
    getIntentRecord(main_intent, sub_intent) → tier, model, requires_auth
-   If requires_auth and no auth_token → emit auth_required, stop
+   If requires_auth and no auth_token → set bot_response to login template response; emit_final_state sends text + templateId:"login"
       │
    [Tier 1 — direct action, no LLM]
    Execute action (shortlistProperty, contactSeller, etc.) directly
-   Assemble bot_complete → skip to step 12
+   Set bot_response → short-circuits graph; emit_final_state sends chat_event
       │
    [Tier 2 — orchestrator computes, no LLM]
    Execute computation (calculateEMI, calculateAffordability, convertUnit)
-   Assemble bot_complete with result → skip to step 12
+   Set bot_response with result → short-circuits graph; emit_final_state sends chat_event
       │
 8. [Tier 3] DataFetchMiddleware — pre-fetch all required data
    getDataFetchPlan(main_intent, sub_intent) → DataRequirement[]
@@ -2059,7 +2089,7 @@ When `classification.clarification_needed` is not null, the orchestrator emits a
      - Same parallel_group → asyncio.gather (parallel)
      - Different groups → sequential (dependency order)
    Results stored in ctx.pre_fetched_data keyed by tool name
-   Emits bot_fetching WS frame per tool group while fetching
+   Pre-fetch runs before SSE stream opens — no "fetching" SSE event is emitted to the client
    (~150ms for comparison intents with 6 parallel fetches)
       │
 9. [Tier 3] Build system prompt (sections 1–4)
@@ -2075,21 +2105,20 @@ When `classification.clarification_needed` is not null, the orchestrator emits a
     — for 31/32 intents this is [] (LLM has no tools, one job: NLG)
     — for property_about: [getNearbyLandmarks]
       │
-    Stream tokens → buffer 3–5 tokens → emit bot_chunk WS frame
+    Stream tokens → buffer 3–5 tokens → emit message_delta SSE event
       │
     On tool_use block (only possible for getNearbyLandmarks):
-    a. Emit bot_tool_event WS frame ("Finding nearby places...")
-    b. validate_residual_tool_call(tool, params) — return error if invalid
-    c. Execute tool (check cache → call API if miss → cache result)
-    d. Orchestrator injects location from session (LLM only supplied category/radius)
-    e. Inject tool_result into LLM continuation
-    f. Resume streaming
+    a. validate_residual_tool_call(tool, params) — return error if invalid
+    b. Execute tool (check cache → call API if miss → cache result)
+    c. Orchestrator injects location from session (LLM only supplied category/radius)
+    d. Inject tool_result into LLM continuation
+    e. Resume streaming (progress is visible to the user via the ongoing message_delta stream)
       │
 12. On stop_reason: "end_turn":
     a. validate_bot_output(text) — strip URLs, phone numbers, markdown tables
-    b. Assemble bot_complete — cards built from ctx.pre_fetched_data
+    b. Assemble response — cards built from ctx.pre_fetched_data
        (+ residual tool_results if getNearbyLandmarks was called)
-    c. Emit bot_complete WS frame
+    c. Emit chat_event SSE event with sourceMessageState: "COMPLETED"
     d. Persist full message to Kafka → PostgreSQL
     e. Update Redis turn list (LPUSH + LTRIM 0 19, keeping last 10)
     f. Update session state (new srset_id, viewed properties, etc.)
@@ -2097,57 +2126,74 @@ When `classification.clarification_needed` is not null, the orchestrator emits a
 
 ### Streaming Timeline (Pre-fetch Model)
 
+The SSE contract uses three event types from the server: `connection_ack` (stream open),
+`message_delta` (streaming text chunks), `chat_event` (structured events including completion),
+and `error`. DataFetchMiddleware runs silently before the SSE stream opens — there is no
+"fetching" SSE event; pre-fetch completes before the first `message_delta` is emitted.
+
 ```
-Client receives:
-  bot_fetching:    { tools: ["searchProperties"], status: "fetching" }  ← DataFetchMiddleware
-  bot_fetching:    { tools: ["searchProperties"], status: "done" }      ← ~100ms
-  bot_chunk:       "Found "                                              ← LLM streams immediately
-  bot_chunk:       "47 properties"
-  bot_chunk:       " in Bandra."
-  bot_chunk:       " Here are the top 5:"
-  bot_complete:    { text: "...", cards: [...] }                         ← cards from pre-fetched data
+Property search / filter_search turn (template intent — full 3-phase sequence):
+  connection_ack
+
+  # Phase 1 — summary_node (fires BEFORE data fetch)
+  message_delta  { messageId: "A", sequenceNumber: 0, chunkIndex: 0, content.text: "I see you're looking for 2BHK rentals in Andheri..." }
+  chat_event     { messageId: "A", sequenceNumber: 0, messageType: "text", sourceMessageState: "IN_PROGRESS" }
+
+  # Phase 2 — respond_node (fires AFTER data fetch)
+  chat_event     { messageId: "B", sequenceNumber: 1, messageType: "template", templateId: "property_carousel",
+                   sourceMessageState: "IN_PROGRESS", data: { properties: [...], property_count: 47 } }
+
+  # Phase 3 — followup_node (fires AFTER LLM)
+  message_delta  { messageId: "C", sequenceNumber: 2, chunkIndex: 0, content.text: "Here are some great options in Andheri West..." }
+  message_delta  { messageId: "C", sequenceNumber: 2, chunkIndex: 1, content.text: " The first one is close to the metro..." }
+  chat_event     { messageId: "C", sequenceNumber: 2, messageType: "text", sourceMessageState: "COMPLETED" }
+  # HTTP response closes — FE detects COMPLETED on the chat_event above and re-enables input
 
 
-Comparison (6 parallel fetches):
-  bot_fetching:    { tools: ["getLocalityDetail×2", "getPriceTrends×2", "getRatingsReviews×2"],
-                     status: "fetching" }                                ← all 6 parallel
-  bot_fetching:    { tools: [...], status: "done" }                     ← ~150ms total
-  bot_chunk:       "Comparing Bandra and Andheri West..."               ← LLM streams immediately
-  bot_complete:    { text: "...", cards: [...] }
+Comparison turn (6 parallel pre-fetches, Sonnet):
+  connection_ack
+  # DataFetchMiddleware ran 6 parallel fetches silently before SSE opened (~150ms)
+  message_delta  { sequenceNumber: 0, chunkIndex: 0, content.text: "Comparing Bandra and Andheri West..." }
+  message_delta  { sequenceNumber: 0, chunkIndex: 1, content.text: " Here's how they compare..." }
+  chat_event     { sequenceNumber: 0, sourceMessageState: "COMPLETED", messageType: "text" }
+  # (HTTP response closes naturally after COMPLETED)
 
 
-Property About with nearby (only case with residual tool call):
-  bot_fetching:    { tools: ["getPropertyDetail"], status: "fetching" } ← pre-fetch
-  bot_fetching:    { tools: ["getPropertyDetail"], status: "done" }
-  bot_chunk:       "Here's what I found about this property..."         ← LLM starts
-  bot_tool_event:  "Finding nearby places..."                           ← LLM called getNearbyLandmarks
-  bot_chunk:       " There's a metro station 400m away..."              ← LLM resumes
-  bot_complete:    { text: "...", cards: [...] }
+property_about + nearby (only case with residual tool — getNearbyLandmarks):
+  connection_ack
+  # Phase 3 — LLM streams response (Haiku, property_about is text-only so no Phase 1 or 2)
+  message_delta  { sequenceNumber: 0, chunkIndex: 0, content.text: "Silver Heights is a..." }
+  message_delta  { sequenceNumber: 0, chunkIndex: 1, content.text: " premium 42-floor..." }
+  # LLM calls getNearbyLandmarks mid-stream (residual tool)
+  message_delta  { sequenceNumber: 0, chunkIndex: N, content.text: " Looking up what's nearby..." }
+  # Tool result injected back to LLM context; streaming resumes
+  message_delta  { sequenceNumber: 0, chunkIndex: N+1, content.text: " Within 1km: Phoenix Mall..." }
+  chat_event     { sequenceNumber: 0, sourceMessageState: "COMPLETED", messageType: "text" }
+  # (HTTP response closes naturally after COMPLETED)
 ```
 
-The client renders `bot_chunk` frames as streaming text, `bot_fetching` frames as a loading
-indicator before the first chunk arrives, and replaces everything with `bot_complete` on finish.
+The client renders `message_delta` events as streaming text and replaces the accumulated text
+with the final assembled response on `chat_event` with `sourceMessageState: "COMPLETED"`.
 
 **LLM stream failure mid-response:**
 ```
-  bot_fetching:    { tools: ["searchProperties"], status: "done" }
-  bot_chunk:       "Found 47 properties..."   ← partial text already sent
-  bot_error:       { code: "llm_stream_error", recoverable: true,
-                     message: "Something went wrong. Please try again." }
+  connection_ack
+  message_delta  { sequenceNumber: 0, chunkIndex: 0, content.text: "Found 47 properties..." }
+  error          { code: "llm_stream_error", recoverable: true,
+                   message: "Something went wrong. Please try again." }
 ```
-`bot_error` tells the client to clear the partial bubble and render the error message.
-Without this frame, a partial stream leaves the UI stuck in a loading state.
+The `error` event tells the client to clear the partial bubble and render the error message.
+Without this event, a partial stream leaves the UI stuck in a loading state.
 
-**WS frame type summary:**
+**SSE event type summary:**
 
-| Frame | When |
+| Event | When |
 |---|---|
-| `bot_fetching` | DataFetchMiddleware starts/completes a tool group |
-| `bot_tool_event` | LLM calls a residual tool (getNearbyLandmarks) |
-| `bot_chunk` | Streaming LLM text token |
-| `bot_complete` | Full response assembled; replaces chunks |
-| `bot_error` | Unrecoverable error (LLM failure, all fetches failed) |
-| `auth_required` | Auth token absent for write-side or auth-gated intent |
+| `connection_ack` | SSE stream opened; pre-fetch has already completed silently |
+| `message_delta` | Streaming LLM text chunk (includes progress text during residual tool calls) |
+| `chat_event` | Structured signal; `sourceMessageState: "COMPLETED"` marks end of turn's LLM output |
+| `error` | Unrecoverable error (LLM failure, all pre-fetches failed) |
+| `chat_event { templateId: "login" }` | Auth-gated BE-data intent (portfolio, save_alert) with no auth_token; FE-side templates (shortlist, contact_seller) handle their own login |
 
 ---
 
@@ -2160,15 +2206,26 @@ This table covers the LLM-layer behaviours that follow from those failures.
 |---|---|---|
 | Pre-fetch timeout | `withTimeout` rejects after `TOOL_DEFAULT_TIMEOUTS[tool]` | Tool recorded in `ctx.fetch_errors`; LLM receives `{ error: "timeout" }` stub and acknowledges partial data |
 | Pre-fetch 5xx (after 1 retry) | `CachedExecutorPort` exhausts retries | Same as timeout — `fetch_errors` stub |
-| ALL pre-fetches fail | `DataFetchMiddleware` detects `allFailed` | Short-circuits; emits `bot_error` frame; no LLM call |
+| ALL pre-fetches fail | `DataFetchMiddleware` detects `allFailed` | Short-circuits; emits `error` SSE event; no LLM call |
 | Pre-fetch 404 (property/entity gone) | Backend returns 404 | `{ error: "not_found" }` stub injected; LLM: *"That property may no longer be listed."* |
 | Pre-fetch 429 (rate limit) | Backend returns 429 | Use cached result if available; otherwise `fetch_errors` stub; alert if >5% of requests |
 | Circuit breaker OPEN | `CircuitOpenError` from executor | Treated as fetch error — same `fetch_errors` path |
-| LLM API error (TTFT timeout or 5xx) | `withTimeout(5000)` or HTTP error | 1 retry after 300ms; on second failure emit `bot_error` frame with recoverable message |
+| LLM API error (TTFT timeout or 5xx) | `withTimeout(5000)` or HTTP error | 1 retry after 300ms; on second failure emit `error` SSE event with recoverable message |
 | LLM calls undefined tool | Tool name not in `tool_definitions` | Return `{ error: "tool_not_found" }` and log; should not happen — residual tools list is registry-derived |
-| LLM stream fails mid-response | Stream terminates before `end_turn` | Emit `bot_error` frame to clear partial bubble; log with session_id for replay |
+| LLM stream fails mid-response | Stream terminates before `end_turn` | Emit `error` SSE event to clear partial bubble; log with session_id for replay |
 | Context window exceeded | Claude returns `context_length_exceeded` | Drop oldest turns (keep last 3) and retry once; if still exceeds, summarise and retry |
-| SLM classifier failure | Gemini timeout or 5xx after 1 retry | Route to `out_of_scope`; canned response; log `classifier_unavailable` metric |
+| SLM classifier failure | SLM timeout or 5xx after 1 retry | Route to `out_of_scope`; canned response; log `classifier_unavailable` metric |
+
+### LLM Retry Policy
+
+| Dimension | Value |
+|---|---|
+| **Retryable errors** | 503, 529 (overloaded), timeout |
+| **Non-retryable errors** | 400 (invalid request), 401 (auth), 422 (validation error), `context_length_exceeded` |
+| **Max retries** | 1 |
+| **Backoff** | 300ms fixed |
+| **On final failure** | Emit `error` SSE event with `{ recoverable: true, message: "I'm having trouble right now. Please try again." }` |
+| **`context_length_exceeded` handling** | Drop oldest turns (not the compressed summary) until the prompt fits within the context window, then retry once |
 
 ---
 
@@ -2205,6 +2262,37 @@ Typical total output:             ~200–400 tokens        ~400–700 tokens
 - Tier 3b Sonnet comparison is heavier (~5,000) but 6 parallel pre-fetches replace 6 sequential
   tool-call round trips — total latency is lower even though the prompt is larger.
 - `fetch_errors` stubs add ~30 tokens per failed pre-fetch; negligible.
+- The LLM context is smaller than in designs where the LLM receives raw API responses. Tier A
+  results (property search, property detail, etc.) become `pre_fetched_data` — `respond_node`
+  builds template cards from them and sends them directly to the FE. The LLM only sees a compact
+  summary (e.g. "Found 47 properties in Bandra. Sample: ..."), not the full property JSON. This
+  accounts for the ~95% tool result token reduction shown in the pre-fetched data rows above.
 
 With prompt caching on §1 and §2, effective cache savings per request: ~1,250 tokens
 (Haiku) to ~1,250 tokens (Sonnet). Cache read tokens cost 10% of full input tokens.
+
+### LLM Call Logging Contract
+
+Every LLM call emits a structured log entry with the following shape:
+
+```json
+{
+  "event":                    "llm_call",
+  "request_id":               "string",
+  "session_id":               "string",
+  "model":                    "string",
+  "input_tokens":             "integer",
+  "output_tokens":            "integer",
+  "cache_read_input_tokens":  "integer",
+  "latency_ms":               "integer",
+  "stop_reason":              "end_turn | tool_use | max_tokens",
+  "tool_calls":               "[{ tool_name, latency_ms, cache_hit }]",
+  "validation_violations":    "[string]",
+  "experiment_id":            "string | null",
+  "experiment_variant":       "string | null"
+}
+```
+
+**Output validation metric:** `output_validation_violation_rate` — counter per `violation_key`
+(e.g. `url_in_text`, `phone_number_in_text`). Alert if `url_in_text` or `phone_number_in_text`
+exceeds 0.1% of turns.

@@ -1,26 +1,40 @@
-# SSE vs WebSocket — Why We Chose WebSocket for All Modes
+# SSE vs WebSocket: Protocol Selection
+
+## The Decision
+
+Housing.com uses a **hybrid protocol architecture**, not a single transport for everything.
+
+| Service | Protocol | Reason |
+|---|---|---|
+| Search & Discovery Bot | SSE | AI streaming, stateless turns |
+| Seller Property Management Bot | SSE | AI streaming, stateless turns |
+| Support Agent Bot | SSE | AI streaming, stateless turns |
+| User-Seller Chat | WebSocket | Genuine bidirectionality required |
+| Support Human Chat | WebSocket | Agent push, presence, read receipts |
+
+This is the right split. The previous design that put everything on WebSocket was replaced when the AI bots were implemented with LangGraph + FastAPI, which uses SSE natively and matches the industry pattern for LLM streaming.
+
+---
 
 ## What is SSE?
 
-Server-Sent Events (SSE) is an HTTP/1.1 and HTTP/2 standard where the server holds open a response and pushes `text/event-stream` data to the client over time. The client uses the browser-native `EventSource` API. The connection is **unidirectional: server → client only**.
+Server-Sent Events (SSE) is an HTTP standard where the server holds open a response and pushes `text/event-stream` data to the client. The client uses the browser-native `EventSource` API. The connection is **server → client only** for streaming; the client sends messages via a separate HTTP POST.
 
 ```
 Client                        Server
-  │──── GET /stream ──────────►│
-  │◄─── data: chunk 1 ─────────│
-  │◄─── data: chunk 2 ─────────│
-  │◄─── data: chunk 3 ─────────│
-  │                            │  (connection stays open)
-  │──── POST /message ────────►│  (separate HTTP request to send)
+  │──── POST /chat/message ──►│
+  │                           │  (LangGraph pipeline runs)
+  │──── GET /chat/stream ─────►│
+  │◄─── data: message_delta ───│
+  │◄─── data: chat_event ──────│
+  │◄─── data: chat_event ──────│  (sourceMessageState: COMPLETED)
 ```
-
-Sending a message requires a **separate HTTP POST** — the SSE channel is receive-only.
 
 ---
 
 ## What is WebSocket?
 
-WebSocket is a protocol upgrade over HTTP that creates a persistent, **bidirectional** TCP connection. Either side can send at any time.
+WebSocket is a persistent, **bidirectional** TCP connection established via an HTTP upgrade. Either side can send at any time.
 
 ```
 Client                        Server
@@ -29,171 +43,124 @@ Client                        Server
   │                            │
   │──── frame (any time) ─────►│
   │◄─── frame (any time) ───────│
-  │◄─── frame (any time) ───────│
 ```
 
 ---
 
-## Why Not SSE for This System
+## Why SSE for AI Bots
 
-### Problem 1: Mode Switching Requires Reconnection
+### 1. LLM output is inherently server-to-client
 
-The housing.com flow transitions through three modes in one session:
+A bot turn is: user sends one message, server streams back tokens. The user does not send anything while the answer is arriving. This is a one-way push — exactly what SSE is designed for.
 
-```
-BOT_ACTIVE → P2P_ACTIVE → (optionally) SUPPORT
-```
+The pattern is: `POST /chat/message` to submit, `GET /chat/stream` to receive. This matches every major LLM product in production (OpenAI, Anthropic, Gemini APIs all stream over SSE/HTTP).
 
-With SSE + POST for bot chat, switching to P2P requires:
-1. Closing the SSE connection
-2. Opening a WebSocket connection
-3. Re-establishing auth and session state
-4. The user perceives a loading pause or blank state
+### 2. Stateless turns work cleanly over HTTP
 
-With a single WebSocket, the mode switch is a server-side routing change. The client sends the same message frames; only the server's handling changes. No reconnect, no UI flicker.
+Each bot turn is stateless at the transport layer. The client opens a **new SSE connection per turn** — one `POST /chat/message` to submit, one `GET /chat/stream` to receive the response. The stream closes naturally after the final `chat_event { sourceMessageState: "COMPLETED" }`. Conversation state lives in Redis and PostgreSQL, not on the connection itself, so any backend node can handle any turn with no sticky sessions required.
 
-### Problem 2: SSE is Receive-Only — P2P Cannot Work Over It
+This means any backend node can handle any turn. No sticky sessions required for correctness.
 
-P2P chat is bidirectional. Both buyer and seller send and receive. SSE fundamentally cannot handle this — you would need SSE (receive) + HTTP POST (send) for each participant.
+### 3. SSE works through CDN and proxies
 
-Under this model, a P2P conversation involves:
-- Buyer SSE connection (receive)
-- Seller SSE connection (receive)
-- Buyer HTTP POST per message (send)
-- Seller HTTP POST per message (send)
+SSE is plain HTTP. It passes through CDN layers, corporate proxies, and mobile network gateways without special handling. WebSocket requires an HTTP upgrade that some proxies reject or that some CDN configurations do not support for long-lived connections.
 
-Each POST creates a new TCP connection (or reuses HTTP/2 streams), goes through auth middleware, gets routed to a service, and returns a response. Under P2P's near-zero latency requirement, this overhead is unacceptable. WebSocket keeps the connection open; the marginal cost of sending one more message is one TCP write.
+### 4. FastAPI + LangGraph emit SSE natively
 
-### Problem 3: Typing Indicators and Presence Cannot Be Sent Over SSE
+The bot pipeline is a LangGraph `StateGraph` running under FastAPI, which uses `StreamingResponse` for SSE. There is no impedance mismatch: LangGraph yields events, FastAPI streams them. Adapting this to WebSocket would require a translation layer with no benefit.
 
-`p2p_typing` and `presence_update` are user-originated events. The user's client needs to push these to the server in real time (on every keystroke for typing). Over SSE, each keypress would be a separate HTTP POST. Over WebSocket, it is a single small frame on an open socket.
+### 5. Simpler backend per service
 
-For typing indicators specifically, debounce happens client-side (send after 300ms pause), but even debounced, an HTTP POST per indicator is:
-- A new request with headers (~500 bytes minimum overhead vs. ~10-byte WS frame)
-- Potentially a new TCP connection if no keep-alive or HTTP/2 stream
-
-### Problem 4: Two Connections vs. One
-
-If you use SSE for bot + WebSocket for P2P, the client manages two separate connections simultaneously during the transition period. Connection state, reconnection logic, auth token refresh, and error handling must be written twice. The mode-switch code becomes a non-trivial state machine: "which connection is active, do both need to be live during transition?"
-
-A single WebSocket eliminates this class of bugs entirely.
-
-### Problem 5: SSE Has a Browser Connection Limit (HTTP/1.1)
-
-Browsers cap concurrent HTTP/1.1 connections per domain at 6. SSE holds one of these open permanently. On HTTP/1.1, this means only 5 remaining connections for all other API calls on the same domain — thumbnails, property images, REST calls.
-
-HTTP/2 multiplexes streams over one TCP connection, which mitigates this. But it introduces a dependency on the server and any intermediary proxies supporting HTTP/2 correctly. WebSocket does not have this constraint.
+Each AI bot is a stateless HTTP service. Scale horizontally, no connection affinity needed, standard load balancing. Connection management complexity (heartbeats, reconnect tracking, per-connection subscriptions) does not exist on the bot side.
 
 ---
 
-## Pros and Cons of SSE
+## Why WebSocket for Relay Channels
 
-### Pros
+### 1. True bidirectionality is required
+
+In User-Seller Chat, either party sends a message at any time — not in request-response turns. The seller may send a message unprompted at any moment. The buyer does the same. This is genuine peer-to-peer messaging, not a turn-taking protocol.
+
+SSE can only receive. Each sent message would be a new HTTP POST, creating a new TCP connection (or HTTP/2 stream), going through auth middleware, and adding latency. Under near-zero latency requirements, the marginal cost of one more message should be one TCP write on an open socket — which is what WebSocket provides.
+
+### 2. Presence indicators and read receipts
+
+Presence (`user is online`) and read receipts are user-originated push events that must flow from the client to the server continuously or on every relevant user action. Over SSE, each of these is a separate HTTP POST with full headers. Over WebSocket, they are small frames on an already-open connection.
+
+For typing indicators specifically: even with client-side debounce, an HTTP POST per indicator involves ~500 bytes of header overhead vs. a ~10-byte WebSocket frame. At scale, across thousands of concurrent conversations, this is not negligible.
+
+### 3. Seller can push to buyer at any time
+
+A seller is not responding to a buyer's turn — they may initiate contact. This is not a request-response model at all. It requires a persistent channel where the server can push to either participant independently. WebSocket is designed for exactly this; SSE is not.
+
+### 4. Server fan-out to multiple participants
+
+A support conversation may have the user, the agent, and a supervisor observing. All receive the same messages in real time. The relay layer uses Redis Pub/Sub to fan out a message to all connected WebSocket nodes. SSE would require a separate subscription channel per participant, with no shared connection infrastructure.
+
+---
+
+## Protocol Comparison
+
+| | SSE | WebSocket |
+|---|---|---|
+| Direction | Server → Client (receive); HTTP POST (send) | Fully bidirectional |
+| Client send latency | New HTTP request + headers each time | Single TCP write on open socket |
+| CDN / proxy compatibility | Excellent — plain HTTP | Good on most; some proxies/CDNs require config |
+| Connection state | Stateless between turns | Persistent, stateful connection |
+| Auto-reconnect | Built into `EventSource` with `Last-Event-ID` | Must implement client-side |
+| Binary support | Text only (base64 for binary) | Native binary frames |
+| Backend scaling | Stateless, any node handles any turn | Sticky session helpful (not required if Redis used) |
+| Typing indicators / presence | HTTP POST per event | WS frame per event |
+| Server push (unprompted) | Not possible — client must hold stream open | Native |
+| Right choice for AI bots | Yes | Unnecessary complexity |
+| Right choice for relay channels | No — bidirectionality required | Yes |
+
+---
+
+## Pros and Cons Reference
+
+### SSE Pros
 
 | Advantage | Detail |
 |---|---|
-| Simplicity | No protocol upgrade, no handshake. Just a long-lived GET. Standard HTTP semantics. |
-| Automatic reconnect | `EventSource` reconnects automatically with `Last-Event-ID` header — built-in, no client code needed. |
+| Simplicity | No protocol upgrade, no handshake. Standard HTTP semantics. |
+| Automatic reconnect | `EventSource` reconnects automatically with `Last-Event-ID` — built in, no client code. |
 | HTTP/2 multiplexing | Over HTTP/2, SSE streams share the existing TCP connection with other requests. |
-| Firewall / proxy friendly | Plain HTTP, not a protocol upgrade. Corporate proxies and some mobile networks block WebSocket upgrades. |
-| Native browser support | `EventSource` is part of the browser spec. No library needed, no polyfill. |
-| Load balancer compatibility | Works behind any standard HTTP load balancer without sticky sessions (since no bidirectional state on the server per connection). |
-| Built-in retry with event IDs | `id:` field in the stream lets clients resume from last received event after reconnect. |
+| Firewall / proxy friendly | Plain HTTP. Corporate proxies and some mobile networks block WebSocket upgrades. |
+| Native browser support | `EventSource` is part of the browser spec. No library or polyfill needed. |
+| Standard load balancing | Works behind any HTTP load balancer without sticky sessions. |
+| Built-in retry with event IDs | `id:` field lets clients resume from the last received event after reconnect. |
 
-### Cons
+### SSE Cons
 
 | Disadvantage | Detail |
 |---|---|
 | Unidirectional | Server → client only. Client must POST separately to send anything. |
 | Extra request per send | Each user message is a new HTTP request with full headers, auth, and routing overhead. |
-| No binary frames | SSE is text-only (`text/event-stream`). Binary data must be base64-encoded, adding ~33% size overhead. |
-| Connection limit (HTTP/1.1) | Counts against the 6-connection browser limit per domain. |
-| No typing / presence push | Client-originated events (typing, presence, read receipts) all need separate HTTP calls. |
-| Harder backpressure | No built-in flow control; server must implement its own buffering if the client is slow. |
+| No binary frames | SSE is text-only. Binary data must be base64-encoded (~33% overhead). |
+| No typing / presence push | Client-originated real-time events (typing, presence, read receipts) all need separate HTTP calls. |
+| Connection limit (HTTP/1.1) | Counts against the 6-connection-per-domain browser limit. HTTP/2 mitigates this. |
 
 ---
 
-## When SSE Is the Right Choice
+## Where SSE Would Not Work for This System
 
-SSE excels when **data flows primarily in one direction (server to client)** and the use case does not require client-to-server real-time push.
+The relay channels (User-Seller Chat, Support Human Chat) have three properties that make SSE unsuitable:
 
-### Good SSE Use Cases
+1. **Either party initiates** — not a request-response pattern
+2. **Near-zero latency requirement** — HTTP POST overhead on every message is unacceptable
+3. **Presence and read receipts** — client-originated events, continuously pushed
 
-**1. LLM Response Streaming (standalone, no chat history)**
-If you are building a pure question-answer product — user submits a query via form, server streams the answer — SSE is perfect. The user does not send anything while the answer arrives. There is no P2P mode to switch to.
-
-```
-User types question → POST /ask → SSE stream of answer tokens
-```
-
-This is what OpenAI's ChatGPT web UI used initially (before they added features requiring bidirectional updates).
-
-**2. Live Dashboards / Feeds**
-Stock prices, sports scores, notification feeds, order tracking. Data flows one way. The user never "sends" anything in the real-time channel.
-
-**3. Build/CI Log Streaming**
-Streaming server logs or build output to a browser. The client is a passive observer.
-
-**4. Server-Sent Notifications**
-Push alerts to a logged-in user: "Your property inquiry was answered", "Price drop on saved listing". The client only receives; actions (dismiss, click) are normal API calls.
-
-**5. Bot Chat Only (No P2P, No Support Escalation)**
-If housing.com were only building a bot — no P2P, no human escalation, no typing indicators — SSE would work. User types, POSTs the message, gets a streaming SSE response. Simple, effective.
-
-### The Decision Boundary
-
-```
-Does the client need to push real-time events?           → WebSocket
-  (typing indicators, presence, P2P messages)
-
-Does the product have multiple connection modes           → WebSocket
-  that transition without reconnect?
-
-Is it pure server push, single mode, no real-time        → SSE is fine
-  client events?
-
-Are you behind a very aggressive corporate proxy         → SSE (fallback)
-  that blocks WebSocket upgrades?
-```
+These are the exact conditions where WebSocket is the right choice and SSE is not.
 
 ---
 
-## Hybrid Approach: When It Makes Sense
+## SSE Uses Outside the Chat Window
 
-A hybrid (SSE receive + HTTP POST send) is sometimes chosen for:
+SSE remains appropriate for read-only server push in other parts of the product, entirely separate from the chat architecture:
 
-- **Simpler backend**: Each POST goes through stateless HTTP handlers. No need to manage WS connection state, heartbeats, or per-connection subscriptions.
-- **Proxy environments**: Enterprise environments where WebSocket is blocked at the network layer (uncommon on consumer web/mobile).
-- **Pure streaming UX**: Some products (document editors, code assistants) stream server output and batch user input — SSE for output, POST for input, and the latency of the POST is acceptable.
+- Price drop notifications on a saved-listings page
+- Property availability updates on a listing detail page
+- Agent dashboard live queue (new conversations appear without polling)
 
-For housing.com, none of these apply. The P2P latency requirement and the mode-switching requirement make the hybrid unworkable.
-
----
-
-## What We Use SSE For (If Anything)
-
-SSE is not completely off the table for housing.com. It could be used for:
-
-- **Price drop notifications** pushed to a user's saved-listings page (no user action in the stream).
-- **Property availability updates** on a listing detail page (separate from the chat window).
-- **Agent dashboard live queue** — new conversations appear in agent queue without polling.
-
-In these cases, the page already has a WebSocket for chat. The SSE connection on a non-chat page is a lightweight choice with no hybrid complexity problem.
-
----
-
-## Summary
-
-| | SSE | WebSocket |
-|---|---|---|
-| Direction | Server → Client only | Bidirectional |
-| Client send | Separate HTTP POST | Same connection |
-| Latency (client → server) | One new HTTP request | One TCP write |
-| Mode switching | Requires reconnect | Server-side routing change |
-| Typing indicators | HTTP POST per event | WS frame per event |
-| P2P chat | Not suitable | Designed for this |
-| Proxy compatibility | Excellent | Good (most proxies support, not all) |
-| Binary support | Text only (base64 for binary) | Native binary frames |
-| Auto-reconnect | Built into EventSource | Must implement client-side |
-| Complexity | Lower (for pure server push) | Higher (but unified) |
-| **Right choice for housing.com** | No (P2P + mode switching) | **Yes** |
+In these contexts, the client is a passive observer of server state. There is no bidirectionality. SSE is the correct, simpler choice.

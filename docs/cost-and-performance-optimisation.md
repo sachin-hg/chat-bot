@@ -390,8 +390,8 @@ The system is not locked to Anthropic. Different tasks suit different models. Th
 
 | Task | Anthropic | OpenAI | Google | Recommended |
 |---|---|---|---|---|
-| **SLM classification** (Tier 2) | Haiku 4.5 — $0.80/1M in | GPT-4o-mini — $0.15/1M in | Gemini Flash — $0.075/1M in | **Gemini Flash or GPT-4o-mini** (5–10x cheaper than Haiku; benchmark accuracy first) |
-| **Tier 3a single-tool** (Haiku calls) | Haiku 4.5 | GPT-4o-mini | Gemini Flash | **Benchmark needed** — Haiku has better tool use fidelity; Gemini Flash is cheaper |
+| **SLM classification** (Tier 2) | **Haiku 4.5 — current** — $0.80/1M in | GPT-4o-mini — $0.15/1M in | Gemini Flash — $0.075/1M in | **Haiku is current model.** Gemini Flash is the primary benchmark candidate (5–10x cheaper); run full classification accuracy suite before switching |
+| **Tier 3a single-tool** (Haiku calls) | **Haiku 4.5 — current** | GPT-4o-mini | Gemini Flash | **Haiku is current.** Gemini Flash is benchmark candidate — cheaper, but verify tool call fidelity before switching |
 | **Tier 3b complex reasoning** (Sonnet) | Sonnet 4.6 + prompt caching | GPT-4o — no equivalent caching | Gemini 1.5 Pro — 1M context | **Claude Sonnet** (caching advantage is decisive — see below) |
 | **Conversation summary** | Haiku | GPT-4o-mini | Gemini Flash | **Gemini Flash** (cheapest, good summarization quality) |
 | **Support sentiment** | Haiku | GPT-4o-mini | Gemini Flash | **Gemini Flash** (binary classification, any model works; cost wins) |
@@ -425,7 +425,9 @@ The LLM Gateway abstracts over providers. Swapping models is a config change:
 
 ```typescript
 const MODEL_CONFIG = {
-  slm_classifier:        { provider: 'google',    model: 'gemini-1.5-flash-latest' },
+  // SLM classifier currently uses Haiku. Gemini Flash is the primary benchmark candidate
+  // (5–10x cheaper) — switch only after validating accuracy on the domain classification test suite.
+  slm_classifier:        { provider: 'anthropic', model: 'claude-haiku-4-5-20251001' },
   tier3a_haiku:          { provider: 'anthropic',  model: 'claude-haiku-4-5-20251001' },
   tier3b_sonnet:         { provider: 'anthropic',  model: 'claude-sonnet-4-6' },
   conversation_summary:  { provider: 'google',    model: 'gemini-1.5-flash-latest' },
@@ -555,8 +557,6 @@ comparison_entities: ${JSON.stringify(session.comparison_entities ?? [])}`;
 
 Tools are loaded by `main_intent`. The LLM never sees tools irrelevant to the current intent.
 
-Tools are loaded by `main_intent`. The LLM never sees tools irrelevant to the current intent.
-
 ```typescript
 const TOOLS_BY_INTENT: Record<MainIntent, ToolName[]> = {
   property_search: [
@@ -638,6 +638,12 @@ function selectToolSet(
 ### 2. Tool Result Summaries — Full JSON to FE, Compact Summary to LLM
 
 The LLM never sees the full tool response JSON. The Bot Orchestrator generates a compact summary before injecting it into the LLM continuation.
+
+> **Architecture note:** Tier A tool results (e.g. `searchProperties`, `getPropertyDetail`) are
+> handled as `pre_fetched_data` — `respond_node` uses them to build template cards (property
+> carousels, detail cards, etc.) that are sent directly to the FE. The LLM only receives a compact
+> textual summary of what was shown, not the raw property JSON. This means the LLM context window is
+> significantly smaller than in a design where the LLM receives full API responses directly.
 
 ```typescript
 function summariseToolResult(toolName: string, result: unknown): string {
@@ -787,7 +793,7 @@ function summariseTemplateForStorage(templateId: TemplateId, data: unknown): str
 }
 ```
 
-The full template JSON is still sent to the FE via the WS `bot_complete` frame — it is never stored in `conv:turns`. The stored record is the lean semantic string. When Haiku later summarizes these turns, it reads clean text, not a wall of JSON.
+The full template JSON is sent to the FE as a `chat_event` SSE event — it is never stored in `conv:turns`. The stored record is the lean semantic string. When Haiku later summarizes these turns, it reads clean text, not a wall of JSON.
 
 **Token savings at storage:** 90–98% reduction per template turn stored.
 **Token savings at summary time:** Haiku receives readable text, not JSON — smaller input, better summary quality.
@@ -1116,6 +1122,14 @@ Per turn (1 tool call)     3,630 tokens    2,150 tokens   41%  fewer tokens
                                            × ~20x cheaper model
                                            = ~95% cheaper than Sonnet
 ```
+
+> **Why tool results are so small:** Tier A tools (`searchProperties`, `getPropertyDetail`, etc.)
+> are called by `fetch_data_node` (the orchestrator), not by the LLM. Their results go to
+> `pre_fetched_data` — `respond_node` uses them to build template cards (property carousels,
+> detail cards) that are sent directly to the FE. The LLM receives only a compact summary of
+> what was shown (e.g. "Found 47 properties in Bandra. Sample: ..."), not the full property JSON.
+> This is why the "Before" column shows 2,000 tokens per tool result and "After" shows 100 — the
+> LLM context is structurally smaller, not just truncated.
 
 ### Interaction-level savings
 

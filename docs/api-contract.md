@@ -293,7 +293,7 @@ Emitted as SSE `message_delta` events when `streamingEnabled=true`.
 interface MessageDeltaEventToUser {
   messageId:       string;     // matches the text chat_event's messageId for this turn
   sourceMessageId: string;     // the user message being responded to
-  sequenceNumber:  number;     // 0 for the first chunk, then the text row's sequenceNumber
+  sequenceNumber:  number;     // fixed for ALL chunks of a given text event (matches the paired chat_event's sequenceNumber)
   messageType?:    "text" | "markdown";  // only on chunkIndex === 0
   chunkIndex:      number;     // 0-based; monotonically increasing
   content: { text: string; }; // append-only fragment
@@ -303,23 +303,23 @@ interface MessageDeltaEventToUser {
 
 **Mapping from our llm_node stream:**
 ```python
-# In llm_node, replace:
-#   on_chunk=lambda chunk: emit_sse({'type': 'bot_chunk', 'text': chunk})
-# With:
+# seq = (1 if summary_emitted else 0) + (template_count or 0)
+# text_message_id is pre-generated in llm_node so message_delta and followup_node's
+# chat_event share the same messageId (FE assembles streamed text by messageId).
 chunk_index = 0
 
-def on_chunk(chunk: str, message_id: str, source_message_id: str, seq: int):
+def on_chunk(chunk: str):
     nonlocal chunk_index
     delta_event = {
-        'messageId':       message_id,
-        'sourceMessageId': source_message_id,
+        'messageId':       text_message_id,
+        'sourceMessageId': source_msg_id,
         'sequenceNumber':  seq,
         'chunkIndex':      chunk_index,
         'content':         {'text': chunk},
     }
     if chunk_index == 0:
-        delta_event['messageType'] = 'text'   # or 'markdown' for Sonnet intents
-    emit_sse_event('message_delta', delta_event)
+        delta_event['messageType'] = 'text'   # 'markdown' for Sonnet intents
+    emit_sse('message_delta', delta_event)
     chunk_index += 1
 ```
 
@@ -336,21 +336,40 @@ data: <JSON>\n
 
 ### C1. Turn Lifecycle
 
-```
-1. connection_ack       — emitted immediately by HTTP handler after parsing request
-2. chat_event (text)    — emitted by respond_node; sourceMessageState: "IN_PROGRESS"
-   [message_delta ×N]  — emitted by llm_node during streaming (if streamingEnabled=true)
-   chat_event (text)    — final text row; sourceMessageState: "IN_PROGRESS" if templates follow
-3. chat_event (template)  — one per template in the response; last one has sourceMessageState: "COMPLETED"
-4. connection_close     — emitted by HTTP handler after graph exits
-```
-
-For short-circuit turns (safety block, gibberish, out_of_scope):
+**Template intents** (property_search/*, locality_research/trending_localities, locality_research/locality_comparison, comparison/compare_localities, portfolio/recommendations, property_detail/similar_properties):
 ```
 1. connection_ack
-2. chat_event (text)    — sourceMessageState: "COMPLETED"
+2. [Phase 1 — Summary, emitted BEFORE fetch]
+   message_delta (chunk 0, messageType: "text")   ← summary_node streams single chunk
+   chat_event (text, seq 0, sourceMessageState: "IN_PROGRESS")
+3. [Phase 2 — Templates, emitted immediately AFTER fetch]
+   chat_event (template, seq 1, sourceMessageState: "IN_PROGRESS")
+   chat_event (template, seq 2, sourceMessageState: "IN_PROGRESS")   ← if multiple templates
+4. [Phase 3 — Followup commentary, LLM-generated]
+   message_delta ×N                                ← llm_node streams chunks
+   chat_event (text/markdown, seq N, sourceMessageState: "COMPLETED")
+5. connection_close
+```
+
+**Text-only intents** (property_detail/about, price_trends, commute_time, FAQ, financial):
+```
+1. connection_ack
+2. [Single phase — LLM is the full response, no summary or templates]
+   message_delta ×N                                ← llm_node streams chunks
+   chat_event (text/markdown, seq 0, sourceMessageState: "COMPLETED")
 3. connection_close
 ```
+
+**Short-circuit turns** (safety block, gibberish, out_of_scope, clarification, user_location_needed):
+```
+1. connection_ack
+2. chat_event (text or template, seq 0, sourceMessageState: "COMPLETED")
+3. connection_close
+```
+
+**Ordering guarantee:** The graph topology enforces ordering. `summary_node` completes before
+`fetch_data_node` starts. `respond_node` (templates) completes before `llm_node` starts streaming.
+The FE receives events in causal order over the same SSE connection — no race conditions.
 
 ### C2. connection_ack
 
@@ -539,9 +558,7 @@ a PDF, the orchestrator requests a pre-rendered image URL list from Venus.
 interface ShareLocationData {}  // data is empty; template renders a permission request button
 ```
 
-**Current architecture gap:** `user_location_needed` is a filter key that triggers a client-side
-geolocation request. Currently documented as "orchestrator emits a get_location SSE event" —
-this must map to a `chat_event` with `templateId: "share_location"` instead.
+**Implementation:** `user_location_needed` is a filter key set by the SLM in `filter_delta`. `derive_node` detects it and short-circuits: instead of continuing the pipeline, it sets `bot_response` directly with a `share_location` template payload. The runner's `emit_final_state` emits the `chat_event`. No `get_location` SSE event is emitted.
 
 **Flow:**
 1. SLM outputs `filter_delta: { user_location_needed: true }`
@@ -668,6 +685,28 @@ interface ContactSellerData {
 
 ---
 
+### D8. login
+
+**templateId:** `"login"`
+**Triggers:** `route_node` when `record.requires_auth = True` and no `auth_token` is present.
+**Visibility:** Transient — last-only. Preceded by a plain text message explaining why login is needed.
+
+```typescript
+interface LoginData {}  // data is empty — FE renders a standard login CTA
+```
+
+**Auth model:**
+- `shortlist_property` and `contact_seller` templates handle their own login flow on the FE side — they never reach this path.
+- `login` template is emitted only for flows that require the BE to fetch user-specific data: `portfolio/saved_properties`, `portfolio/viewed_properties`, `portfolio/recent_searches`, `portfolio/recommendations`, `property_search/save_alert`.
+
+**Sequence emitted by `emit_final_state`:**
+```
+chat_event  { seq: 0, messageType: "text",     text: "Log in to see your saved properties.", sourceMessageState: "IN_PROGRESS" }
+chat_event  { seq: 1, messageType: "template", templateId: "login",                          sourceMessageState: "COMPLETED" }
+```
+
+---
+
 ## Part E — Incoming User Action Handling
 
 The frontend sends `messageType: "user_action"` for button taps, location responses, and form
@@ -764,169 +803,88 @@ These do not enter the LLM pipeline. Handle them directly in the HTTP layer:
 
 ## Part F — Multi-Event Turn Assembly
 
-A single bot turn produces multiple SSE `chat_event` rows. All rows in one turn share the same
-`sourceMessageId` (the user's message ID for this turn). `sequenceNumber` orders them.
+A single bot turn produces up to 3 phases of SSE events. All rows share the same `sourceMessageId`
+(= `request_id` for the turn). `sequenceNumber` orders them within the turn. The last event always
+has `sourceMessageState: "COMPLETED"` — the FE waits for this before marking the turn done.
 
 ### F1. Sequence Model
 
+**Template intents** (property_search, locality_research, comparison, portfolio, similar_properties):
 ```
-Turn N:
-  sourceMessageId = user_message_id_N
+sourceMessageId = request_id
 
-  Seq 0: chat_event (messageType: "text")
-         → validated_text content
-         → sourceMessageState: "IN_PROGRESS"  (if templates follow)
-                               "COMPLETED"    (if no templates)
+Phase 1 — Summary (summary_node, BEFORE fetch)
+  message_delta  { messageId: A, sequenceNumber: 0, chunkIndex: 0, content.text: "..." }
+  chat_event     { messageId: A, seq: 0, type: "text",     sourceMessageState: "IN_PROGRESS" }
 
-  Seq 1: chat_event (messageType: "template", templateId: "property_carousel")
-         → sourceMessageState: "IN_PROGRESS"  (if more templates follow)
-                               "COMPLETED"    (if this is the last)
+Phase 2 — Templates (respond_node, AFTER fetch)
+  chat_event     { messageId: B, seq: 1, type: "template", templateId: "property_carousel",
+                   sourceMessageState: "IN_PROGRESS" }
+  chat_event     { messageId: C, seq: 2, type: "template", templateId: "locality_carousel",
+                   sourceMessageState: "IN_PROGRESS" }   ← IN_PROGRESS even if last template
 
-  Seq 2: chat_event (messageType: "template", templateId: "locality_carousel")
-         → sourceMessageState: "COMPLETED"    (last in turn)
+Phase 3 — Followup (followup_node, AFTER LLM stream)
+  message_delta ×N  { messageId: D, sequenceNumber: 3, chunkIndex: 0..N-1, content.text: chunk }
+  chat_event     { messageId: D, seq: 3, type: "text",     sourceMessageState: "COMPLETED" }
 ```
 
-### F2. respond_node: Building the Event Sequence
+**Text-only intents** (property_detail/about, price_trends, commute_time, FAQ, financial):
+```
+Phase 1 — skipped (no summary)
+Phase 2 — skipped (no templates)
+Phase 3 only:
+  message_delta ×N  { messageId: A, sequenceNumber: 0, chunkIndex: 0..N-1, ... }
+  chat_event     { messageId: A, seq: 0, type: "text/markdown", sourceMessageState: "COMPLETED" }
+```
+
+### F2. Node Responsibilities (updated)
+
+| Node | Phase | Emits |
+|---|---|---|
+| `summary_node` | 1 | `message_delta` (1 chunk) + `chat_event` (text, seq 0) |
+| `respond_node` | 2 | `chat_event` × N templates (all `IN_PROGRESS`) |
+| `llm_node` | 3 | `message_delta` × N chunks (seq = 1 + template_count if summary, else template_count) |
+| `followup_node` | 3 | `chat_event` (text/markdown, COMPLETED, same messageId as message_delta) |
 
 ```python
-async def respond_node(state: BotState, emit_sse: Callable) -> dict:
-    c               = state['classification']
-    source_msg_id   = state['request_id']          # user turn's request_id = sourceMessageId
-    conversation_id = state['session']['session_id']
-    now             = datetime.utcnow().isoformat() + 'Z'
+# summary_node — dispatches via SUMMARY_BUILDERS registry
+builder = SUMMARY_BUILDERS.get((c['main_intent'], c['sub_intent']))
+if builder:
+    summary_text = builder(c, session, resolved)
+    emit_sse('message_delta', { 'messageId': summary_msg_id, 'sequenceNumber': 0,
+                                 'chunkIndex': 0, 'messageType': 'text',
+                                 'content': {'text': summary_text} })
+    emit_sse('chat_event', ChatEventToUser(sequence_number=0,
+                                           source_message_state='IN_PROGRESS', ...).dict())
 
-    events: list[ChatEventToUser] = []
+# respond_node — templates only; all IN_PROGRESS; followup_node closes with COMPLETED
+seq_start = 1 if state.get('summary_emitted') else 0
+for i, event in enumerate(template_events):
+    event.source_message_state = 'IN_PROGRESS'
+    event.sequence_number = seq_start + i
+    emit_sse('chat_event', event.dict())
 
-    # 1. Text event (always present if validated_text is non-empty)
-    if state.get('validated_text'):
-        events.append(ChatEventToUser(
-            conversation_id    = conversation_id,
-            message_id         = str(uuid.uuid4()),
-            source_message_id  = source_msg_id,
-            message_type       = 'markdown' if is_markdown(state['validated_text']) else 'text',
-            message_state      = 'COMPLETED',
-            source_message_state = 'IN_PROGRESS',   # will be updated after templates appended
-            created_at         = now,
-            sequence_number    = 0,
-            sender             = {'type': 'bot'},
-            content            = MessageContent(text=state['validated_text']),
-        ))
-
-    # 2. Template events derived from pre_fetched_data + tool_results
-    template_events = build_template_events(
-        classification   = c,
-        pre_fetched_data = state.get('pre_fetched_data') or {},
-        tool_results     = state.get('tool_results') or [],
-        session          = state['session'],
-        source_msg_id    = source_msg_id,
-        conversation_id  = conversation_id,
-        seq_start        = len(events),
-        now              = now,
-    )
-    events.extend(template_events)
-
-    # Mark last event as COMPLETED turn
-    if events:
-        events[-1].source_message_state = 'COMPLETED'
-
-    # Emit all events over SSE (respond_node now calls emit_sse directly for each row)
-    for event in events:
-        emit_sse('chat_event', event.model_dump(by_alias=True))
-
-    bot_response = events[-1].model_dump(by_alias=True) if events else None
-
-    await persist_to_kafka(conversation_id, [e.model_dump(by_alias=True) for e in events])
-    session = state['session']
-    saved   = await update_session_state(session, c, state.get('tool_results') or [])
-    if not saved:
-        await reconcile_session_conflict(session, bot_response)
-
-    return {'bot_response': bot_response}
+# followup_node — final text; always COMPLETED; seq = summary + templates
+seq = (1 if state.get('summary_emitted') else 0) + (state.get('template_count') or 0)
+emit_sse('chat_event', ChatEventToUser(message_id=text_message_id, sequence_number=seq,
+                                        source_message_state='COMPLETED', ...).dict())
 ```
 
 ### F3. build_template_events: Intent → Template Mapping
 
-```python
-# Maps each intent to its template builder.
-# Each builder receives the full (non-truncated) pre_fetched_data for that intent.
+`build_template_events` is called inside `respond_node`. It dispatches on `(main_intent, sub_intent)` to produce zero or more `chat_event` payloads containing structured template data.
 
-TEMPLATE_BUILDERS: dict[tuple[str, str], Callable] = {
-    ('property_search', 'filter_search'):            build_property_carousel,
-    ('property_search', 'explore_nearby'):           build_property_carousel,
-    ('property_search', 'discovery_collections'):    build_property_carousel,
-    ('property_detail', 'similar_properties'):       build_property_carousel,
-    ('property_detail', 'brochure'):                 build_download_brochure,
-    ('portfolio', 'saved_properties'):               build_property_carousel,
-    ('portfolio', 'viewed_properties'):              build_property_carousel,
-    ('portfolio', 'recommendations'):                build_property_carousel,
-    ('locality_research', 'trending_localities'):    build_locality_carousel,
-    ('comparison', 'compare_localities'):            build_locality_carousel,
-    ('locality_research', 'locality_comparison'):    build_locality_carousel,
-}
+Template intents and their output `templateId` values:
 
-def build_property_carousel(
-    pre_fetched_data: dict,
-    session: dict,
-    tool_results: list[dict],
-) -> dict | None:
-    # Use full searchProperties result (before response_truncation)
-    data = pre_fetched_data.get('searchProperties') or pre_fetched_data.get('getSimilarProperties') or \
-           pre_fetched_data.get('getRecommendations') or pre_fetched_data.get('getSavedProperties') or \
-           pre_fetched_data.get('getViewedProperties')
-    if not data:
-        return None
-    hits = data.get('hits') or data.get('properties') or []
-    return {
-        'templateId': 'property_carousel',
-        'data': {
-            'properties':     hits,
-            'property_count': data.get('total_count') or len(hits),
-            'pagination':     {'is_last_page': data.get('is_last_page', False)},
-            'service':        session.get('transaction_type'),
-            'city':           session.get('city'),
-        },
-    }
+| Intent | templateId |
+|---|---|
+| `property_search/*`, `property_detail/similar_properties`, `portfolio/*` | `property_carousel` |
+| `locality_research/trending_localities`, `comparison/compare_localities`, `locality_research/locality_comparison` | `locality_carousel` |
+| `property_detail/brochure` | `download_brochure` |
 
-def build_locality_carousel(
-    pre_fetched_data: dict,
-    session: dict,
-    tool_results: list[dict],
-) -> dict | None:
-    localities_raw = (pre_fetched_data.get('getTrendingLocalities') or {}).get('localities', [])
-    # For comparison intents, merge from fetch_key slots
-    if not localities_raw:
-        loc0 = pre_fetched_data.get('getLocalityDetail:0')
-        loc1 = pre_fetched_data.get('getLocalityDetail:1')
-        if loc0:
-            localities_raw = [loc0]
-        if loc1:
-            localities_raw.append(loc1)
-    if not localities_raw:
-        return None
-    return {
-        'templateId': 'locality_carousel',
-        'data': {
-            'localities': [map_to_locality_card(loc, session) for loc in localities_raw],
-        },
-    }
+Each builder receives the **full** (non-truncated) `pre_fetched_data` for that intent and returns a `templateId + data` dict, or `None` if the fetch came back empty (in which case `respond_node` produces no template events and falls through to the LLM path only).
 
-def map_to_locality_card(locality: dict, session: dict) -> dict:
-    return {
-        'id':           locality.get('locality_id') or locality.get('id', ''),
-        'name':         locality.get('name', ''),
-        'displayName':  locality.get('display_name') or locality.get('name', ''),
-        'cityName':     locality.get('city') or session.get('city', ''),
-        'cityUuid':     locality.get('city_uuid', ''),
-        'image':        locality.get('image_url', ''),
-        'rating':       locality.get('livability_score') or locality.get('rating', 0),
-        'percentGrowth': locality.get('yoy_change_pct') or locality.get('percent_growth'),
-        'priceTrend':   locality.get('price_psf') or locality.get('price_trend'),
-        'url':          locality.get('seo_url') or locality.get('url') or f'/locality/{locality.get("locality_id", "")}',
-        'link':         locality.get('seo_url') or locality.get('url'),
-        'description':  locality.get('description'),
-        'highlights':   locality.get('highlights'),
-    }
-```
+Builder implementations live in `solid-architecture.md` Part 5 (Middleware Pipeline → Helper Function Contracts) alongside `SUMMARY_BUILDERS` and `FOLLOWUP_PROMPT_BLOCKS`.
 
 ---
 
@@ -974,8 +932,8 @@ async def emit_final_state(state: BotState, emit_sse: Callable):
             )
             emit_sse('chat_event', event.model_dump(by_alias=True))
 
-        elif bot_response.get('type') == 'bot_complete':
-            # respond_node already emitted — no-op
+        elif bot_response.get('source_message_state') == 'COMPLETED':
+            # followup_node already emitted the final chat_event — no-op
             pass
 
         # Other structured short-circuits (auth_required, fetch_error) → emit as text
@@ -988,20 +946,38 @@ async def emit_final_state(state: BotState, emit_sse: Callable):
 
 ## Part H — Graph Node Invariant Update
 
-The previous invariant stated:
-> Nodes that short-circuit only set `bot_response` — they never call `emit_sse_event` directly.
-> This guarantees exactly one SSE emission per request.
+**Current invariant (3-phase model):**
 
-**Updated invariant:**
-- `respond_node` calls `emit_sse('chat_event', ...)` directly for each event in the turn (text + templates).
-- All other nodes that short-circuit only set `bot_response` — they do NOT call `emit_sse` directly.
-- After the graph exits, the HTTP handler calls `emit_final_state()` which emits `bot_response`
-  if `respond_node` did NOT run (i.e., a short-circuit path was taken).
-- `connection_ack` is emitted by the HTTP handler before the graph starts.
-- `connection_close` is emitted by the HTTP handler after the graph exits.
+Three graph nodes emit SSE directly: `summary_node`, `respond_node`, and `followup_node`.
+`llm_node` emits `message_delta` chunks. All short-circuit nodes only set `bot_response`.
 
-This replaces the old single-emit model with a multi-emit model for full turns, while preserving
-the single-emit guarantee for short-circuit paths.
+```
+connection_ack         ← HTTP handler (before graph)
+  [summary_node]       ← message_delta + chat_event (text, seq 0)   — BEFORE fetch
+  [respond_node]       ← chat_event × N templates                   — AFTER fetch
+  [llm_node]           ← message_delta × chunks                     — AFTER templates
+  [followup_node]      ← chat_event (text, COMPLETED)               — AFTER LLM stream
+  OR
+  [emit_final_state]   ← chat_event (short-circuit paths only)
+connection_close       ← HTTP handler (after graph)
+```
+
+**Invariant: the FE receives events in strict causal order** because the graph is a linear chain —
+each node runs to completion before the next starts. Summary always precedes templates; templates
+always precede LLM streaming; the COMPLETED marker always arrives last.
+
+**`emit_final_state` fires when:** `bot_response` is set AND `validated_text is None`.
+`validated_text` is set by `validate_output_node` (which runs after `llm_node`). When it is `None`,
+the pipeline short-circuited before reaching the LLM — `followup_node` never ran and the short-circuit
+node set `bot_response` directly. `emit_final_state` is called at the HTTP handler level after graph
+exit; it does NOT fire for full-pipeline turns because `validated_text` will be non-None on those paths.
+
+**Sequence number assignment:**
+- `summary_node` → seq 0 (always, when emitted)
+- `respond_node` → seq_start = 1 if `summary_emitted` else 0; increments per template
+- `llm_node` message_delta → sequenceNumber = (1 if summary_emitted else 0) + template_count
+- `followup_node` → same seq as message_delta (same messageId too, so FE assembles correctly)
+- `emit_final_state` → seq 0 always (short-circuit paths that reach `emit_final_state` fired before `summary_node` could emit)
 
 ---
 
@@ -1071,10 +1047,10 @@ added to session state).
 | SSE event | Emitted by | Shape |
 |---|---|---|
 | `connection_ack` | FastAPI handler (before graph) | `{ messageId, messageState }` |
-| `message_delta` | llm_node (streaming chunks) | `MessageDeltaEventToUser` |
-| `chat_event` (text) | respond_node or `emit_final_state` | `ChatEventToUser` (messageType: text/markdown) |
-| `chat_event` (template) | respond_node | `ChatEventToUser` (messageType: template + templateId) |
-| `connection_close` | FastAPI handler (after graph) | `{ reason }` |
+| `message_delta` | `summary_node` (1 chunk, seq 0) + `llm_node` (N chunks) | `MessageDeltaEventToUser` |
+| `chat_event` (text) | `summary_node`, `respond_node`, or `emit_final_state` | `ChatEventToUser` (messageType: text/markdown) |
+| `chat_event` (template) | `respond_node` | `ChatEventToUser` (messageType: template + templateId) |
+| `error` | FastAPI handler or graph node on unrecoverable failure | `{ code, message, recoverable }` |
 
 ## Summary: Complete Template Inventory
 
@@ -1085,5 +1061,6 @@ added to session state).
 | `download_brochure` | property_detail/brochure | No | property card + brochure_images |
 | `share_location` | user_location_needed filter = true | Yes (last-only) | derive_node short-circuit |
 | `nested_qna` | clarification_needed | Yes (last-only) | structured SLM clarification_data |
-| `shortlist_property` | Tier 1 save_property | Yes (auto-execute) | executes on render |
-| `contact_seller` | Tier 1 contact_seller | Yes (auto-execute) | executes on render |
+| `shortlist_property` | Tier 1 save_property | Yes (auto-execute) | FE template handles own login |
+| `contact_seller` | Tier 1 contact_seller | Yes (auto-execute) | FE template handles own login |
+| `login` | requires_auth=True intent + no auth_token | Yes (last-only) | Preceded by text message. FE renders login CTA. Portfolio and save_alert flows only. |

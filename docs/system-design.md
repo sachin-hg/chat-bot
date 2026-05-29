@@ -2,314 +2,173 @@
 
 ## Overview
 
-Housing.com is transitioning to a fully conversational model. All users land on a chat interface and progress through three distinct conversation modes within a single window:
+Housing.com is transitioning to a fully conversational model. All users land on a chat interface and interact with one of five services:
 
-| Mode | Description | Latency Target |
+| Service | Type | Transport |
 |---|---|---|
-| Bot Chat | AI-powered property discovery | 3–4s acceptable |
-| P2P Chat | Buyer ↔ Seller direct messaging | Near-zero |
-| Support Chat | Bot-first, escalates to human agent | 3–4s (bot), near-zero (human) |
+| Search & Discovery Bot | AI | SSE (POST /chat/message + GET /chat/stream) |
+| Seller Property Management Bot | AI | SSE |
+| Support Agent Bot | AI | SSE |
+| Support Human Chat | Relay | WebSocket (WS /chat/connect) |
+| User-Seller Chat | Relay | WebSocket |
+
+**This is a hybrid architecture.** AI bots use SSE. Real-time relay channels use WebSocket. See `sse-vs-websocket.md` for the reasoning behind each choice.
 
 ---
 
-## 1. Transport Layer Decision
+## 1. Transport Architecture
 
-**Single WebSocket connection for all three modes.** Not SSE + WebSocket hybrid.
+### AI Bots — SSE
 
-When a user transitions from bot chat to P2P chat (after contacting a seller), the connection does not drop or switch. The server changes the session state and routes subsequent messages differently — invisible to the user.
+Each AI bot exposes two endpoints:
+- `POST /chat/message` — client sends a message
+- `GET /chat/stream` — client opens SSE stream to receive events
 
 ```
-Client ──── WSS (single persistent connection) ──── WS Gateway
-                                                         │
-                                              ┌──────────┴──────────┐
-                                              │    Chat Router      │
-                                              │  (routes by state)  │
-                                              └──────────┬──────────┘
-                                                         │
-                                         ┌───────────────┼───────────────┐
-                                         │               │               │
-                                    Bot Service    P2P Service    Support Service
+Client                              Bot Service
+  │──── POST /chat/message ────────►│
+  │                                 │  (LangGraph pipeline runs)
+  │──── GET /chat/stream ──────────►│
+  │◄─── message_delta ──────────────│  (streaming text chunk)
+  │◄─── chat_event ─────────────────│  (structured template/state event)
+  │◄─── chat_event (COMPLETED) ─────│  (turn complete)
 ```
 
-SSE is not used. See `sse-vs-websocket.md` for the full analysis.
+### Relay Channels — WebSocket
+
+User-Seller Chat and Support Human Chat use persistent WebSocket connections for genuine bidirectionality: either party can push a message at any time, presence indicators, read receipts.
+
+```
+Buyer/User ──── WSS /chat/connect ──── WS Gateway ──── Seller/Agent
+```
 
 ---
 
 ## 2. High-Level Architecture
 
 ```
-                     ┌────────────────────────────────────────────┐
-                     │              Clients                        │
-                     │     Web (React)  ·  Android  ·  iOS        │
-                     └──────────────────┬─────────────────────────┘
-                                        │ WSS
-                     ┌──────────────────▼─────────────────────────┐
-                     │         NLB + WS Gateway                    │
-                     │    (Nginx / AWS API GW + NLB)               │
-                     └───────┬─────────────────┬───────────────────┘
-                             │                 │
-              ┌──────────────▼──┐        ┌─────▼──────────┐
-              │ Connection Svc  │        │  REST API GW   │
-              │ (WS router)     │        │  (HTTP/2)      │
-              └──────────┬──────┘        └────────────────┘
-                         │
-         ┌───────────────┼──────────────────────────┐
-         │               │                          │
-┌────────▼──────┐ ┌──────▼──────────┐ ┌─────────────▼──────┐
-│ Chat Router   │ │ Bot Orchestr.   │ │ P2P / Support Svc  │
-│ Service       │ │ Service         │ │                    │
-└────────┬──────┘ └──────┬──────────┘ └────────────┬───────┘
-         │               │                          │
-         │        ┌──────▼──────────┐               │
-         │        │  LLM Gateway    │               │
-         │        │  (Claude API,   │               │
-         │        │  tool calling,  │               │
-         │        │  streaming)     │               │
-         │        └──────┬──────────┘               │
-         │               │                          │
-         └───────────────┼──────────────────────────┘
-                         │
-         ┌───────────────▼───────────────────────────────┐
-         │             Message Broker                     │
-         │   Kafka  (durability, replay, audit)           │
-         │   Redis Pub/Sub  (real-time fan-out)           │
-         └───────────────┬───────────────────────────────┘
-                         │
-         ┌───────────────┼───────────────────────────┐
-         │               │                           │
-┌────────▼──────┐ ┌──────▼──────────┐ ┌─────────────▼──────┐
-│ PostgreSQL    │ │ Elasticsearch   │ │ Redis              │
-│ (conv, msgs)  │ │ (properties)    │ │ (presence, session,│
-│               │ │                 │ │  cache, dedup)     │
-└───────────────┘ └─────────────────┘ └────────────────────┘
+                 ┌────────────────────────────────────────────┐
+                 │              Clients                        │
+                 │     Web (React)  ·  Android  ·  iOS        │
+                 └──────────────┬──────────────┬──────────────┘
+                                │ SSE + HTTP   │ WSS
+              ┌─────────────────▼──┐    ┌──────▼──────────────┐
+              │   API Gateway       │    │   WS Gateway (NLB)  │
+              │   (HTTP/2)          │    │   (Nginx / AWS NLB) │
+              └─────────┬───────────┘    └──────┬──────────────┘
+                        │                       │
+       ┌────────────────┼────────────┐          │
+       │                │            │          │
+┌──────▼──────┐  ┌──────▼──────┐  ┌─▼──────┐  ┌▼─────────────────┐
+│ Search &    │  │ Seller Prop │  │Support │  │  Relay Services  │
+│ Discovery   │  │ Mgmt Bot    │  │Agent   │  │  (User-Seller,   │
+│ Bot         │  │             │  │Bot     │  │  Support Human)  │
+│ (SSE, AI)   │  │ (SSE, AI)   │  │(SSE,AI)│  │  (WebSocket)     │
+└──────┬──────┘  └──────┬──────┘  └─┬──────┘  └┬────────────────┘
+       │                │            │           │
+       └────────────────┼────────────┘           │
+                        │                        │
+       ┌────────────────▼────────────────────────▼──────┐
+       │                Message Broker                    │
+       │   Kafka  (durability, replay, audit)             │
+       │   Redis Pub/Sub  (real-time fan-out)             │
+       └────────────────┬───────────────────────────────┘
+                        │
+       ┌────────────────┼───────────────────────┐
+       │                │                       │
+┌──────▼──────┐  ┌──────▼──────────┐  ┌────────▼───────┐
+│ PostgreSQL  │  │ Elasticsearch   │  │ Redis          │
+│ (conv, msgs)│  │ (properties)    │  │ (session, hot  │
+│             │  │                 │  │  state, dedup, │
+│             │  │                 │  │  pub/sub)      │
+└─────────────┘  └─────────────────┘  └────────────────┘
 ```
 
 ---
 
-## 3. Conversation State Machine
+## 3. AI Bot Pipeline (LangGraph)
 
-Every session has an explicit state stored in Redis and mirrored to PostgreSQL. All routing decisions on the server are based on this state.
+All three AI bots run the same LangGraph `StateGraph` pipeline. `BotState` is a `TypedDict` that flows through each node. The nodes execute in this order:
 
 ```
-                    ┌──────────────┐
-                    │   LANDING    │
-                    └──────┬───────┘
-                           │ first message
-                    ┌──────▼───────┐
-                    │  BOT_ACTIVE  │◄─────────────────────────┐
-                    └──────┬───────┘                          │
-                           │                                  │ "search again"
-              ┌────────────┼──────────────┐                   │
-              │            │              │                   │
-   ┌──────────▼──┐  ┌──────▼──────┐  ┌───▼─────────────┐    │
-   │  PROPERTY   │  │   SUPPORT   │  │  FILTER/REFINE  │────┘
-   │  SELECTED   │  │  INITIATED  │  │  (still bot)    │
-   └──────┬──────┘  └──────┬──────┘  └─────────────────┘
-          │                │
-          │         ┌──────▼──────────┐
-          │         │  SUPPORT_BOT    │
-          │         └──────┬──────────┘
-          │                │ not resolved
-          │         ┌──────▼──────────┐
-          │         │  HUMAN_SUPPORT  │ ← agent claims from queue
-          │         └─────────────────┘
-          │
-   ┌──────▼──────────────┐
-   │  CONTACT_SELLER     │
-   │  (confirm intent)   │
-   └──────┬──────────────┘
-          │
-   ┌──────▼──────────────┐
-   │  P2P_ACTIVE         │ ← seller notified, both online
-   └──────┬──────────────┘
-          │
-   ┌──────▼──────────────┐
-   │  P2P + BOT_ASSIST   │ ← bot available as side panel
-   └─────────────────────┘
+safety → normalize → classify → validate_slm → filter_apply → sanitize →
+derive → clarify → resolve_entities → route → summary → experiment →
+fetch_data → respond → build_prompt → llm → validate_output → followup
 ```
 
-State transitions are events published to Kafka. The client receives a `session_state_change` frame and updates its UI accordingly (e.g., show/hide bot input vs. P2P input, change header).
+`solid-architecture.md` owns the detailed implementation of each node, the registry design, and the prompt composition strategy.
 
 ---
 
-## 4. WebSocket Message Protocol
+## 4. SSE Event Types
 
-Every frame on the wire is JSON with a consistent envelope:
+The AI bots emit three event types on the stream:
 
-```typescript
-interface WsFrame {
-  type: FrameType;
-  conversation_id: string;
-  message_id: string;       // UUID v7 (time-sortable), generated by sender
-  session_id: string;
-  timestamp: number;        // epoch ms
-  payload: unknown;
-}
+| Event | Purpose | Key Fields |
+|---|---|---|
+| `message_delta` | Streaming text chunk | `delta` (append-only text fragment) |
+| `chat_event` | Structured event (template, status) | `templateId`, `messageId`, `sequenceNumber`, `sourceMessageState` |
+| `error` | Error payload | error detail |
 
-type FrameType =
-  // Bot flow
-  | 'user_message'          // user → server
-  | 'bot_chunk'             // server → user (streaming token batch; append-only, same message_id as final bot_complete)
-  | 'bot_complete'          // server → user (final message + cards + response_id)
-  | 'bot_tool_event'        // server → user ("Searching 2BHK in Bandra...") — rendered in header, not chat bubble
-  // P2P / Support human
-  | 'p2p_message'           // either direction
-  | 'p2p_read'              // read receipt
-  | 'p2p_typing'            // typing indicator
-  // Presence
-  | 'presence_update'       // online / offline / away
-  // Control
-  | 'session_state_change'  // BOT_ACTIVE → P2P_ACTIVE etc.
-  | 'ack'                   // server acks every inbound message
-  | 'error';
-```
-
-### Idempotency
-
-Client generates a UUID v7 per outbound message. Server:
-1. Checks `p2p:dedup:{message_id}` in Redis before processing.
-2. If present, returns `ack` immediately without reprocessing.
-3. If absent, processes and sets key with TTL 24h.
-
-Safe to retry on reconnect without duplicate delivery.
+`sourceMessageState` is either `IN_PROGRESS` (more events coming for this turn) or `COMPLETED` (turn is done — treat the accumulated `chat_event` payload as authoritative).
 
 ---
 
-## 5. Bot Service Architecture
+## 5. Session State
+
+State is managed per-conversation, not per-connection.
+
+**Hot state (Redis):** Active session data available within a single TCP round-trip. Keyed by `conversation_id`. TTL refreshed on activity.
+
+**Durable state (PostgreSQL):** All conversations and messages are persisted asynchronously via Kafka. Source of truth for history, audit, and reconnect recovery.
+
+`BotState` is a `TypedDict` that flows through the LangGraph graph in memory during a single turn. It is not a Redis state machine with named states. The Redis/PostgreSQL "state machine" with `BOT_ACTIVE`, `P2P_ACTIVE` named states was a prior design that was replaced by the LangGraph approach.
+
+### Redis Key Space
 
 ```
-user_message frame
-       │
-       ▼
-Chat Router (checks session state → BOT_ACTIVE)
-       │
-       ▼
-Bot Orchestrator
-       │
-  ┌────▼─────────────────────────────┐
-  │        Context Builder            │
-  │  - Last 10 turns from Redis       │
-  │  - Compressed summary (beyond 10) │
-  │  - Active filters state           │
-  │  - Viewed property IDs            │
-  └────┬─────────────────────────────┘
-       │
-  ┌────▼─────────────────────────────┐
-  │        LLM Gateway               │
-  │   Model: claude-sonnet-4-6       │
-  │   Mode: streaming + tool use     │
-  │   Tools: loaded per session state│
-  └────┬─────────────────────────────┘
-       │
-  ┌────▼──────────────┐
-  │   Tool Executor   │
-  └────┬──────────────┘
-       │
-  ┌────┴──────────────────────────────────────────────────────┐
-  │              │                    │                        │
-  ▼              ▼                    ▼                        ▼
-Property    Locality Svc         Transaction            Builder / Project
-Search      (reviews, amenities, Data API               Svc (payment plans,
-(ES)         pro/cons, schools)  (price trends,          construction status,
-                                  old sales)             floor plans)
+session:{session_id}              → {user_id, conversation_id, node_id}     TTL: 24h
+conv:context:{conversation_id}    → structured session header (~5KB)          TTL: 24h (re-seeded from Postgres on reconnect)
+conv:turns:{conversation_id}      → list of last N raw turns (LPUSH + LTRIM) TTL: 7d
+conv:summary:{conversation_id}    → compressed summary of older turns        TTL: 7d
+presence:{user_id}                → {status, last_seen, node_id}             TTL: 5min (heartbeat)
+p2p:dedup:{message_id}            → 1 (idempotency)                          TTL: 24h
+support:queue:{tier}              → sorted set of conversation_ids by priority
+p2p:channel:{conversation_id}     → Redis Pub/Sub channel (ephemeral)
 ```
 
-### Tool Definitions
+**Cache read strategy:** Session read always hits Redis first. On cache miss, falls back to Postgres then re-warms Redis (~20–50ms extra). This overhead is acceptable for reconnect only — it does not occur in steady-state turns where Redis is warm.
 
-```typescript
-// Loaded into LLM system prompt as tool definitions
-
-searchProperties(
-  query: string,
-  filters: {
-    city?: string;
-    locality?: string[];
-    bhk?: number[];
-    price_min?: number;
-    price_max?: number;
-    property_type?: 'apartment' | 'villa' | 'plot' | 'commercial';
-    furnishing?: 'furnished' | 'semi' | 'unfurnished';
-    transaction_type?: 'rent' | 'buy';
-    amenities?: string[];
-    possession_by?: string;
-  }
-) → PropertyListing[]
-
-getPropertyDetail(property_id: string) → PropertyDetail
-getSimilarProperties(property_id: string, count?: number) → PropertyListing[]
-getProjectDetail(project_id: string) → ProjectDetail  // builder, phases, construction status
-getLocalityDetail(locality: string, city: string) → LocalityDetail  // amenities, connectivity, schools, reviews
-getFloorPlans(property_id: string) → FloorPlan[]      // image URLs + metadata
-getTransactionHistory(locality: string, bhk_type: number) → TransactionData[]
-getPriceTrends(locality: string, duration_months: number) → PriceTrend[]
-getTrendingLocalities(city: string) → RankedLocality[]
-getPaymentPlans(project_id: string) → PaymentPlan[]
-applyFilter(filter_delta: Partial<SearchFilters>) → UpdatedSearchState
-getSimilarLocalities(locality: string) → LocalitySummary[]
-```
-
-### Streaming over WebSocket
-
-LLM token stream → bot service buffers 3–5 tokens → emits `bot_chunk` frame → client appends to bubble.
-
-The `bot_chunk` frame is the WebSocket equivalent of the SSE `message_delta` event (v1.1 incremental streaming spec). Each chunk carries `chunk_index` (monotonic, starting at 0), optional `chunk_id` for dedup, and `content.text` as an **append-only** fragment. The final `bot_complete` frame (same `message_id`) is authoritative — FE replaces the streaming buffer with the canonical payload on receipt.
-
-```typescript
-// bot_chunk payload (streaming text only — templates remain atomic via bot_complete)
-interface BotChunkPayload {
-  source_message_id: string;  // user message_id this reply is for
-  sequence_number: number;    // part index in multi-part reply
-  chunk_index: number;        // 0-based, monotonically increasing within this message_id
-  chunk_id?: string;          // optional dedup id (idempotent: skip if already seen)
-  content: { text: string };  // append-only text fragment
-  message_type: 'text' | 'markdown';  // required on chunk_index === 0 only
-}
-```
-
-During tool execution: server emits `bot_tool_event` with a human-readable status ("Looking at properties in Bandra West..."). This keeps the UI responsive during the 200–500ms tool round-trip.
-
-**Message identity in multi-part replies:** A single user message can produce multiple bot parts (e.g. intro text then property_carousel). Each part has its own `message_id`. `source_message_id` links all parts back to the user turn. `sequence_number` orders the parts. The final part carries `is_turn_complete: true` in `bot_complete`.
-
-### Context Window Management
-
-- Keep last 10 turns (user + bot) in Redis as raw messages.
-- Beyond 10: send oldest 5 turns to LLM for summarization, store compressed summary in Redis.
-- Context sent to LLM = system prompt + compressed summary (if exists) + last 10 turns.
-- Haiku calls (Tier 3a) receive only last 3 turns; Sonnet calls (Tier 3b) receive the full 10.
-- This bounds per-conversation LLM cost regardless of session length.
+**Pipeline efficiency:** `conv:context`, `conv:turns`, and `conv:summary` are fetched in a single Redis pipeline (one round-trip) per turn, not three sequential calls.
 
 ---
 
-## 6. P2P Chat Architecture
+## 6. Relay Channel Architecture (WebSocket)
 
 Near-zero latency is achieved by separating the **delivery path** (Redis Pub/Sub) from the **persistence path** (Kafka → PostgreSQL).
 
 ```
-Seller WS ──► WS Server A ──► Redis Pub/Sub ──► WS Server B ──► Buyer WS
-                   │         (channel per conv)        │
-                   └────────────► Kafka ◄──────────────┘
-                                    │
-                             Persistence Svc
-                                    │
-                               PostgreSQL
+Seller WS ──► WS Node A ──► Redis Pub/Sub ──► WS Node B ──► Buyer WS
+                  │         (channel per conv)       │
+                  └──────────────► Kafka ◄───────────┘
+                                      │
+                               Persistence Svc
+                                      │
+                                 PostgreSQL
 ```
 
-### Hot Path (delivery, ~5–15ms end to end)
+### Hot Path (~5–15ms end to end)
 
-1. Buyer sends `p2p_message` frame to WS Server B.
-2. Server B publishes to Redis channel `p2p:{conversation_id}`.
-3. WS Server A (holding seller's connection) is subscribed, receives instantly.
-4. Server A pushes `p2p_message` frame to seller.
+1. Buyer sends a message to WS Node B.
+2. Node B publishes to Redis channel `p2p:{conversation_id}`.
+3. WS Node A (holding seller's connection) receives instantly.
+4. Node A pushes the message to the seller.
 
-### Warm Path (persistence, async)
+### Warm Path (async persistence)
 
-1. Same message also published to Kafka topic `chat.p2p.messages`.
-2. Persistence Service consumes, writes to PostgreSQL.
-3. If seller is offline, Notification Service also consumes → sends FCM/APNS push with deep link.
-
-### Why Redis Pub/Sub and not just Kafka for delivery?
-
-Kafka consumer lag is typically 50–200ms even under light load. Redis Pub/Sub is in-memory, sub-millisecond fan-out. Kafka is used for durability and replay, never for real-time delivery.
+1. The same message is also published to Kafka topic `chat.p2p.messages`.
+2. Persistence Service consumes and writes to PostgreSQL.
+3. If the recipient is offline, Notification Service consumes and sends FCM/APNS push.
 
 ### Offline Message Flow
 
@@ -317,17 +176,16 @@ Kafka consumer lag is typically 50–200ms even under light load. Redis Pub/Sub 
 Buyer sends message
       │
       ▼
-Redis Pub/Sub → no subscriber found (seller offline)
+Redis Pub/Sub → no subscriber (seller offline)
       │
       ▼
 Kafka topic: chat.p2p.messages
       │
       ▼
-Notification Service consumes
+Notification Service → FCM/APNS push
       │
-      ▼
-FCM / APNS push → Seller opens app → reconnects WS → 
-server delivers missed messages from PostgreSQL on reconnect
+Seller opens app → reconnects WS →
+server delivers missed messages from PostgreSQL
 ```
 
 ---
@@ -335,135 +193,36 @@ server delivers missed messages from PostgreSQL on reconnect
 ## 7. WebSocket Scaling
 
 ```
-                NLB (Layer 4)
-                     │
-       ┌─────────────┼─────────────┐
-       │             │             │
- ┌─────▼─────┐ ┌─────▼─────┐ ┌────▼──────┐
- │ WS Node 1 │ │ WS Node 2 │ │ WS Node N │
- │ ~100k     │ │           │ │           │
- │ conns     │ │           │ │           │
- └─────┬─────┘ └─────┬─────┘ └────┬──────┘
-       └─────────────┼─────────────┘
-               Redis Pub/Sub
-           (one channel per conversation_id)
+              NLB (Layer 4)
+                   │
+     ┌─────────────┼─────────────┐
+     │             │             │
+┌────▼──────┐ ┌────▼──────┐ ┌───▼───────┐
+│ WS Node 1 │ │ WS Node 2 │ │ WS Node N │
+│ ~100k     │ │           │ │           │
+│ conns     │ │           │ │           │
+└────┬──────┘ └────┬──────┘ └───┬───────┘
+     └─────────────┼─────────────┘
+             Redis Pub/Sub
+         (one channel per conversation_id)
 ```
 
-- **Technology**: Go with `nhooyr.io/websocket` or Node.js with `uWebSockets.js`. Go handles ~100k concurrent connections per node at ~50MB RAM.
-- **Load balancing**: NLB with IP hash for connection affinity. Correctness does not depend on affinity (Redis handles routing), but it reduces Redis subscription churn.
-- **Scaling trigger**: HPA on connection count metric, not CPU. Target: 80k connections per pod before scaling out.
-- **Session state**: Fully in Redis. Any node can handle any reconnect.
+- **Session state:** Fully in Redis. Any node can handle any reconnect.
+- **Load balancing:** NLB with IP hash for connection affinity. Correctness does not depend on affinity (Redis handles routing), but it reduces subscription churn.
+- **Scaling trigger:** HPA on connection count, not CPU. Target: ~80k connections per pod.
+- **Redis Cluster hash tags:** Redis Pub/Sub channels for P2P must use hash tags (`{p2p}`) in Redis Cluster mode so all channels for a conversation route to the same slot. Without hash tags, cluster sharding breaks cross-node Pub/Sub.
 
 ---
 
-## 8. Support Chat: Bot → Human Escalation
-
-```
-User reports issue
-      │
-      ▼
-Support Bot (same LLM infra, different system prompt + tool set)
-      │
-      ├── resolved → session ends or returns to property search
-      │
-      └── not resolved (triggers below)
-            │
-            ▼
-      ┌─────────────────────────────────────────────────────┐
-      │  Agent Queue (Redis sorted set)                     │
-      │  Key: support:queue:{tier}                          │
-      │  Score: timestamp + priority_boost                  │
-      │  Priority boost factors: paid user, high intent,    │
-      │  payment dispute, sentiment score                   │
-      └──────────────────────┬──────────────────────────────┘
-                             │
-                   Agent Dashboard polls queue
-                   Agent clicks "Claim"
-                             │
-                             ▼
-                   session_state → HUMAN_SUPPORT
-                   User sees: "Connected to Priya from Support"
-                             │
-                             ▼
-                   Same P2P infrastructure
-                   + Bot Co-pilot for agent
-```
-
-### Escalation Triggers
-
-Any one of these triggers escalation from support bot to human:
-
-- User explicitly says "talk to human" / "agent" / "real person"
-- Sentiment classifier score < -0.6 on last 3 user messages
-- Bot has attempted resolution 3+ times on the same issue (tracked in session state)
-- Issue type is in `always_escalate` set: payment disputes, legal, account bans
-
-### Agent Co-pilot
-
-After agent claims a conversation:
-- Bot reads full conversation history
-- Suggests next response in agent dashboard (one-click send or edit)
-- Surfaces relevant policy docs based on issue type
-- Tracks resolution status — if agent marks resolved, session can be closed or returned to property search flow
-
----
-
-## 9. Property Cards in Chat
-
-Bot responses are structured — not just text strings.
-
-```json
-{
-  "type": "bot_complete",
-  "payload": {
-    "text": "Here are 3 properties in Bandra under ₹2Cr that match your needs.",
-    "cards": [
-      {
-        "type": "property_listing",
-        "property_id": "prop_123",
-        "thumbnail_url": "https://cdn.housing.com/...",
-        "title": "2BHK in Bandra West",
-        "price": "₹1.85 Cr",
-        "area": "1050 sqft",
-        "highlights": ["Sea view", "Ready to move", "Gym"],
-        "quick_actions": [
-          { "label": "See Details", "intent": "get_property_detail", "property_id": "prop_123" },
-          { "label": "Similar Properties", "intent": "get_similar", "property_id": "prop_123" },
-          { "label": "Contact Seller", "intent": "contact_seller", "property_id": "prop_123" }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Quick action taps send structured `user_message` frames:
-
-```json
-{
-  "type": "user_message",
-  "payload": {
-    "intent": "get_property_detail",
-    "property_id": "prop_123",
-    "display_text": "Tell me more about this property"
-  }
-}
-```
-
-The `display_text` is shown in the chat bubble so the conversation remains readable. The `intent` + structured fields go to the bot for deterministic routing — no NLP parsing needed for card actions.
-
----
-
-## 10. Data Models
+## 8. Data Models
 
 ### PostgreSQL
 
 ```sql
 conversations (
-  id              UUID PRIMARY KEY,         -- conversation_id on wire
+  id              UUID PRIMARY KEY,         -- conversation_id
   user_id         UUID NOT NULL,
   mode            TEXT NOT NULL,            -- 'BOT' | 'P2P' | 'SUPPORT'
-  state           TEXT NOT NULL,            -- state machine state
   context         JSONB,                    -- active filters, viewed properties, intent
   created_at      TIMESTAMPTZ DEFAULT NOW(),
   updated_at      TIMESTAMPTZ DEFAULT NOW()
@@ -503,70 +262,11 @@ support_queue (
 );
 ```
 
-### Redis Key Space
+### Actual API Data Shapes
 
-```
-session:{session_id}              → {user_id, conversation_id, state, ws_node_id}   TTL: 24h
-conv:context:{conversation_id}    → full context JSON (LLM working memory)           TTL: 7d
-conv:turns:{conversation_id}      → list of last 10 raw turns (LPUSH + LTRIM 0 19)    TTL: 7d
-conv:summary:{conversation_id}    → compressed summary of turns beyond 20            TTL: 7d
-presence:{user_id}                → {status, last_seen, ws_node_id}                  TTL: 5min (heartbeat refreshed)
-p2p:dedup:{message_id}            → 1 (idempotency)                                  TTL: 24h
-support:queue:{tier}              → sorted set of conversation_ids, score = priority
-p2p:channel:{conversation_id}     → Redis Pub/Sub channel (ephemeral)
-```
+These shapes come from the production housing.com API and must be preserved in responses. FE templates depend on these exact field names.
 
----
-
-## 11. Failure Modes & Resilience
-
-| Failure | Impact | Mitigation |
-|---|---|---|
-| LLM API timeout | Bot doesn't respond | Retry 2x with backoff, then "I'm having trouble, try again in a moment" + alert |
-| WS disconnect mid-bot-response | User loses partial response | On reconnect, server checks `bot_in_progress` flag in Redis; resumes or restarts |
-| WS node crash | All connections on that node drop | NLB detects, clients reconnect; Redis session state is source of truth, any node picks up |
-| Redis Pub/Sub down | P2P delivery breaks | Circuit breaker → degraded mode: poll DB every 500ms, alert oncall |
-| Kafka lag spike | Persistence delayed, not delivery | Doesn't affect user experience; alerts on consumer lag > 10s |
-| LLM property hallucination | Wrong data shown | All property data comes from structured tool responses, LLM only writes prose around them |
-| Support queue empty of agents | User waits indefinitely | Show estimated wait time, offer callback/email, cap wait at configurable timeout |
-
----
-
-## 12. Phased Rollout
-
-### Phase 1 — Bot Chat (MVP)
-- WebSocket connection (even if only using bot today, avoids a future migration)
-- Bot service with property search tools
-- Redis session state, PostgreSQL persistence
-- Property cards with quick actions
-
-### Phase 2 — P2P Chat
-- P2P state transition from bot session
-- Redis Pub/Sub fan-out for real-time delivery
-- Kafka persistence path
-- Seller notification (push)
-
-### Phase 3 — Support Chat
-- Support bot with separate system prompt
-- Escalation triggers (explicit + sentiment)
-- Agent queue (Redis sorted set)
-- Agent dashboard
-
-### Phase 4 — Intelligence Layer
-- Agent co-pilot (bot suggests responses for human agents)
-- Conversation funnel analytics
-- A/B test bot prompts via conversation outcomes
-- Proactive suggestions based on dwell time on property cards
-
----
-
-## 13. Actual API Data Shapes (from existing implementation)
-
-These shapes come from the production housing.com API and must be preserved in BE responses. FE templates depend on these exact field names.
-
-### Filter format
-
-Filters use **numeric IDs** (not string names):
+**Filter format** — uses numeric IDs, not string names:
 ```json
 {
   "apartment_type_id": [1, 2],
@@ -583,9 +283,7 @@ Filters use **numeric IDs** (not string names):
 }
 ```
 
-### Entity format
-
-Localities are referenced by polygon UUID, not a custom `locality_id`:
+**Entity format** — localities referenced by polygon UUID:
 ```json
 {
   "entities": [
@@ -602,8 +300,7 @@ Localities are referenced by polygon UUID, not a custom `locality_id`:
 }
 ```
 
-### City format
-
+**City format:**
 ```json
 {
   "city": {
@@ -616,13 +313,9 @@ Localities are referenced by polygon UUID, not a custom `locality_id`:
 }
 ```
 
-### Service field
+**Service field:** Use `"service": "buy" | "rent"` (not `transaction_type`) in property_carousel and search payloads.
 
-Use `"service": "buy" | "rent"` (not `transaction_type`) in property_carousel and search payloads.
-
-### Property shape
-
-Properties within `property_carousel.data.properties[]`:
+**Property shape** within `property_carousel.data.properties[]`:
 ```json
 {
   "id": "107997",
@@ -655,10 +348,7 @@ Properties within `property_carousel.data.properties[]`:
 }
 ```
 
-Note: `_id` is card-unique (for dedup in UI), `id` is the stable property/project identifier.
-
-### Pagination
-
+**Pagination:**
 ```json
 {
   "pagination": {
@@ -674,79 +364,112 @@ Note: `_id` is card-unique (for dedup in UI), `id` is the stable property/projec
 
 Use `resale_total_count` (resale/rental listings) and `np_total_count` (new projects) as separate counts.
 
-### Location coordinates
-
-Coordinates from `location_shared` user_action are `[lat, lng]` array (not an object):
+**Location coordinates** from `location_shared` user_action are `[lat, lng]` array:
 ```json
 { "action": "location_shared", "coordinates": [28.4085982, 77.3166804] }
 ```
 
 ---
 
-## 14. Framework Decision: Why Not LangChain/LangGraph
+## 9. Failure Modes & Resilience
 
-LangChain and LangGraph are commonly proposed for LLM orchestration. This section explains why they are **not used** for this project — a practical judgment, not a bias.
-
-### LangChain
-
-**What it's good for:** Rapid prototyping, connecting unfamiliar data sources, teams who don't yet know their orchestration pattern.
-
-**Why it doesn't fit here:**
-
-| Our requirement | LangChain reality |
-|---|---|
-| 4-tier deterministic routing with custom logic | LangChain chains add abstraction without benefit — we know exactly what the routing looks like |
-| Redis-based atomic state machine (Lua transactions) | LangChain's memory is in-memory or poorly matched to Redis; we'd fight the abstraction |
-| Intent-specific tool loading + prompt cache control | LangChain assembles prompts for you — breaking cache boundaries you carefully designed |
-| Custom tool result summarization (90–95% token reduction) | LangChain's built-in tool result handling doesn't support this |
-| WebSocket streaming with `bot_chunk` frames | LangChain's streaming support targets HTTP SSE; WS integration requires bypassing the abstraction |
-| Multi-tier model selection (Haiku/Sonnet per intent) | Possible in LangChain, but requires fighting default routing |
-| Production debugging (what exactly went to the API?) | Raw API calls are far easier to trace than LangChain's layers |
-
-**Verdict:** LangChain is scaffolding for people who don't know their orchestration pattern yet. We know ours precisely. Writing the orchestrator directly is cleaner, faster, and debuggable.
-
-### LangGraph
-
-**What it's good for:** Complex multi-agent workflows where the next step depends on previous agent output in non-deterministic ways. Good for research agents, complex document processing pipelines.
-
-**Why it doesn't fit here:**
-
-| Our requirement | LangGraph reality |
-|---|---|
-| Simple 4-tier routing (already a clear state machine) | LangGraph adds node/edge overhead for a routing problem already solved by a switch statement |
-| Redis state machine (Lua atomic transitions) | LangGraph's state is in-memory; checkpointing to external stores requires custom implementation that matches what we built anyway |
-| Sub-100ms SLM classification | LangGraph's overhead adds latency on the hot path |
-| Real-time WS streaming | LangGraph is not designed for WS delivery |
-| Reproducible deterministic routing (Tier 1/2/4 are fully deterministic) | LangGraph's value is in conditional dynamic routing — irrelevant for 65% of our turns |
-
-**Verdict:** LangGraph is appropriate when you have a non-deterministic graph of agents that must decide at runtime which path to take. Our routing is deterministic for 65% of turns (Tier 1, 2, 4) and well-defined for the remaining 35% (Tier 3). This is an orchestrator pattern, not an agent graph pattern.
-
-### What We Use Instead
-
-A purpose-built **Bot Orchestrator** as a single service with:
-- Direct Anthropic/OpenAI/Google API calls (no abstraction layer)
-- Explicit 4-tier routing logic (readable, testable, debuggable)
-- Redis state machine for session management
-- Custom prompt assembly with prompt cache control
-- Inline tool result summarization
-- TypeScript/Go — typed, fast, familiar
-
-This is the correct choice at this stage. If the system later needs true multi-agent complexity (e.g., an agent that spawns sub-agents to research 10 localities simultaneously), LangGraph becomes worth revisiting at that point specifically.
+| Failure | Impact | Mitigation |
+|---|---|---|
+| LLM API timeout | Bot does not respond | Retry 2x with exponential backoff; emit `error` SSE event with user-facing message; alert |
+| SSE stream drops mid-response | User loses partial response | Client reconnects GET /chat/stream; server checks `bot_in_progress` in Redis; resumes or restarts the turn |
+| WS node crash (relay channels) | All connections on that node drop | NLB detects, clients reconnect; Redis session state is source of truth, any node picks up |
+| Redis Pub/Sub down | P2P/relay delivery breaks | Circuit breaker → degraded mode: poll PostgreSQL every 500ms; alert on-call |
+| Kafka lag spike | Persistence delayed, not delivery | No user-facing impact; alert on consumer lag > 10s |
+| LLM property hallucination | Wrong data shown | All property data comes from structured tool responses; LLM only writes prose around them |
+| Support queue empty of agents | User waits indefinitely | Show estimated wait time; offer callback/email; cap wait at configurable timeout |
+| Idempotency violation (duplicate message) | Duplicate delivery to recipient | Client generates UUID v7 per outbound message; server checks `p2p:dedup:{message_id}` in Redis before processing (TTL 24h); returns ack without reprocessing if already seen |
+| Redis Pub/Sub primary failover | ~1–5s message gap during Sentinel/Cluster failover | WS nodes re-subscribe on reconnect. Mitigation: clients re-request missed messages from Postgres on reconnect. |
+| Session Postgres write failure | Kafka DLQ captures failed writes | Alert if DLQ unprocessed > 24h (before Redis TTL of 7d expires and turns are lost). |
 
 ---
 
-## 15. Key Technology Decisions Summary
+## 10. Key Technology Decisions
 
 | Concern | Choice | Rationale |
 |---|---|---|
-| Transport | WebSocket (single conn) | Mode switching without reconnect, unified client state |
-| Bot streaming | WS `bot_chunk` frames | Equivalent to SSE `message_delta` (v1.1 spec); reuses same connection |
-| Real-time fan-out | Redis Pub/Sub | Sub-ms, avoids Kafka consumer lag on hot path |
+| AI bot transport | SSE (POST + GET) | Stateless turns, CDN/proxy compatible, same pattern as all major LLM products |
+| Relay transport | WebSocket | True bidirectionality, presence, read receipts, seller-push-to-buyer |
+| Bot pipeline | LangGraph StateGraph | Directed async graph with typed state; `solid-architecture.md` has details |
+| Real-time fan-out | Redis Pub/Sub | Sub-ms latency; avoids Kafka consumer lag on hot path |
 | Durability | Kafka → PostgreSQL | Replay, audit, offline delivery |
+| Session state | Redis hot + PostgreSQL durable | Any node handles any reconnect; bounded LLM context cost |
 | LLM | Claude claude-sonnet-4-6, streaming + tool use | Structured property data via tools prevents hallucination |
-| WS servers | Go (nhooyr.io/websocket) | 100k conns/node, low memory footprint |
-| Context management | Redis hot + DB summarization | Bounded LLM context cost, infinite session length |
-| Idempotency | UUID v7 + Redis dedup | Safe retries on reconnect without duplicate delivery |
+| Context management | Redis turns + DB summarization | Bounded LLM context cost regardless of session length |
 | Template IDs | Match existing FE contract | `download_brochure`, `nested_qna`, `share_location`, `shortlist_property` — do not rename |
 | Filter IDs | Numeric IDs from production API | `apartment_type_id: [1,2]` not `["2bhk"]` — FE passes these to SRP deep-link |
-| Property data in chat | Structured cards + intent-based quick actions | Deterministic routing, no NLP parsing for UI actions |
+
+---
+
+## 11. Observability
+
+### Structured Log Format
+
+Every pipeline request must emit a structured log with these fields:
+
+```json
+{
+  "ts":              "ISO-8601",
+  "request_id":      "UUID4",
+  "session_id":      "string",
+  "conversation_id": "string",
+  "user_id":         "string | null",
+  "node":            "string",
+  "event":           "string",
+  "latency_ms":      "integer",
+  "tier":            "0 | 1 | 2 | '3a' | '3b'",
+  "intent":          "string",
+  "sub_intent":      "string",
+  "model":           "string | null",
+  "error":           "string | null",
+  "experiment_id":   "string | null"
+}
+```
+
+### Distributed Tracing
+
+- Every `POST /chat/message` generates a `request_id` (UUID4) in the FastAPI handler
+- Injected into `BotState.request_id`, passed as `run_id` to LangSmith
+- All Kafka message headers and Redis call logs include `request_id`
+- SSE stream includes `request_id` in each `chat_event` payload for client-side correlation
+- LangSmith span names for the residual tool path: `llm_stream_start` → `tool_call: {tool_name}` (child span with `cache_hit`, `latency_ms`, `result_count`) → `llm_stream_resume` → `llm_stream_end`
+
+### Turn Latency SLOs
+
+| Tier | p50 | p95 | p99 | Alert threshold |
+|---|---|---|---|---|
+| Tier 1 (direct action) | < 50ms | < 200ms | < 500ms | p95 > 300ms |
+| Tier 2 (orchestrator) | < 200ms | < 500ms | < 1s | p95 > 800ms |
+| Tier 3a (Haiku + templates) | < 800ms | < 2s | < 4s | p95 > 3s |
+| Tier 3b (Sonnet full) | < 1.5s | < 4s | < 8s | p95 > 6s |
+| P2P relay hot path | < 5ms | < 15ms | < 50ms | p95 > 25ms |
+
+Measure from `POST /chat/message` receipt to `chat_event { sourceMessageState: COMPLETED }` emission.
+
+### Redis Memory Budget
+
+Estimated per active conversation:
+- `conv:context` (session header: entities, filters, last intent, pagination): ~5KB
+- `conv:turns` (last 20 turns JSON): ~40KB
+- `conv:summary` (compressed history): ~2KB
+- P2P relay keys (`p2p:channel:*`, `p2p:offline:*`): ~1KB per participant
+- **Total per active conversation: ~50KB**
+- At 10k concurrent: ~500MB, 50k concurrent: ~2.5GB, 100k concurrent: ~5GB
+
+TTL rationale: `conv:context` 24h (re-seeded on reconnect from Postgres), `conv:turns` 7d (compliance buffer), `conv:summary` 7d (same).
+
+### Alert Thresholds
+
+| Metric | Warning | Critical |
+|---|---|---|
+| SLM classification p95 latency | > 200ms | > 500ms |
+| SLM `out_of_scope` rate | > 5% over 10min | > 10% |
+| SLM `unknown_intent` count | > 0 | > 5/min |
+| LLM output validation violation rate | > 0.5% | > 2% |
+| Tier 3a turn p95 | > 3s | > 5s |
+| Redis Pub/Sub degraded mode active | — | any activation |
+| Kafka consumer lag | > 1000 msgs | > 5000 msgs |

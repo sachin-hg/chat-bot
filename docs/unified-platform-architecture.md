@@ -10,7 +10,7 @@ Five conversational products share a single UI entry point. They differ fundamen
 
 | Service | Nature | Protocol | Owns AI? |
 |---|---|---|---|
-| Search & Discovery Bot | AI — complex NLP, 13-step pipeline | SSE | Yes |
+| Search & Discovery Bot | AI — complex NLP, 18-node LangGraph pipeline | SSE | Yes |
 | Seller Property Management Bot | AI — write-heavy, listing CRUD | SSE | Yes |
 | Support Agent Bot | AI — KB + ticket routing | SSE | Yes |
 | Support Human Chat | Relay — human agent queue | WebSocket | No |
@@ -84,7 +84,7 @@ For everything else, the active service handles its own classification internall
 ```
 search_discovery    — property browsing, filter changes, locality research,
                       price trends, EMI questions
-seller_management   — my listings, leads, edit listing, publish, pricing analytics
+seller_mgmt         — my listings, leads, edit listing, publish, pricing analytics
 support             — packages, billing, RM assignment, complaints, account issues
 p2p_contact         — user wants to directly message a specific seller
                       (transition from search; requires active_property_id)
@@ -179,8 +179,13 @@ At any given time the client holds exactly one active connection.
   SSE_CONNECTED ──────────────── active during AI bot modes
   (search_discovery | seller_mgmt | support_agent)
          │
-         │ mode switch → close SSE, query gateway
-         │ gateway returns ws endpoint
+         │ Each turn = one new SSE connection:
+         │   POST /chat/message → submit user turn
+         │   GET  /chat/stream  → open fresh SSE, receive response
+         │   chat_event { sourceMessageState: "COMPLETED" } → stream closes
+         │   (repeat for next turn)
+         │
+         │ mode switch → query gateway, gateway returns ws endpoint
          ▼
    WS_CONNECTED ──────────────── active during relay modes
    (user_seller_chat | support_human)
@@ -189,6 +194,12 @@ At any given time the client holds exactly one active connection.
          ▼
         IDLE → query gateway → returns to prior bot mode
 ```
+
+**SSE per-turn lifecycle (AI bot modes):**
+- `connection_ack` — stream opened, pre-fetch complete
+- `message_delta` × N — LLM streaming chunks
+- `chat_event { sourceMessageState: "COMPLETED" }` — response done; HTTP stream closes
+- FE detects COMPLETED, re-enables input for the next user message
 
 ---
 

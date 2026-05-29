@@ -54,9 +54,10 @@ Adding a new intent → 8 places to update. Adding a new tool → 5 places. A ne
 ┌─────────────────────────────────────────────────────────────┐
 │           LANGGRAPH StateGraph PIPELINE (FastAPI/SSE)        │
 │   safety → normalize → classify → validate_slm →           │
-│   apply_filters → sanitize → derive → clarify →            │
-│   resolve_entities → route → fetch_data →                  │
-│   build_prompt → llm_call → validate_output → respond      │
+│   filter_apply → sanitize → derive → clarify →             │
+│   resolve_entities → route → summary → experiment →        │
+│   fetch_data → respond → build_prompt → llm →              │
+│   validate_output → followup                               │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -421,22 +422,6 @@ INTENT_REGISTRY: list[IntentRecord] = [
     pre_resolve_entities=True,
     requires_auth=False,
     description='User wants info or opinions about a specific named housing project.',
-  ),
-  IntentRecord(
-    main_intent='project_research',
-    sub_intent='price_trends',
-    tier='3a',
-    model='haiku',
-    data_requirements=[
-      DataRequirement(tool='getPriceTrends', params_source='entity_resolution', parallel_group=1),
-    ],
-    residual_tools=[],
-    session_inject=['city', 'transaction_type', 'active_project_id'],
-    carry_over_keys=['transaction_type', 'city', 'active_project_id'],
-    clear_keys=['active_property_id'],
-    pre_resolve_entities=True,
-    requires_auth=False,
-    description='User wants price appreciation or market movement data within a specific project.',
   ),
   IntentRecord(
     main_intent='project_research',
@@ -833,11 +818,10 @@ INTENT_REGISTRY: list[IntentRecord] = [
     description='User wants to save current search and receive email alerts for new matching properties: "Alert me when new 3BHKs appear in Powai under 1Cr", "Save this search".',
   ),
 
-  # ── project_research (price trends updated for project-level data) ────
-  # Note: project_research/price_trends already exists above. Adding this sub_intent
-  # alongside it for project-specific trend data (Gandalf projectTrends endpoint vs
-  # locality aggregate). The SLM disambiguates: if active_project_id is set → project_price_trends;
-  # if locality is the subject → locality_research/price_trends.
+  # ── project_research (project-level price trends) ────────────────────
+  # Uses getProjectPriceTrends (project-level data), distinct from locality_research/price_trends
+  # which uses getPriceTrends (locality aggregate). SLM routes to this intent when
+  # active_project_id is set; locality_research/price_trends when a locality is the subject.
   IntentRecord(
     main_intent='project_research',
     sub_intent='project_price_trends',
@@ -883,6 +867,20 @@ INTENT_REGISTRY: list[IntentRecord] = [
     pre_resolve_entities=False,
     requires_auth=False,
     description='Single characters, emoji-only input, gibberish, or too vague to classify even with history.',
+  ),
+  IntentRecord(
+    main_intent='out_of_scope',
+    sub_intent='social_pleasantry',
+    tier=0,
+    model=None,
+    data_requirements=[],
+    residual_tools=[],
+    session_inject=[],
+    carry_over_keys=[],
+    clear_keys=[],
+    pre_resolve_entities=False,
+    requires_auth=False,
+    description='Hi, thanks, bye, and other social greetings. Handled locally with a canned response — never passed to the gateway as out_of_scope.',
   ),
 ]
 ```
@@ -1146,7 +1144,9 @@ TOOL_REGISTRY: list[ToolRecord] = [
     response_truncation=ResponseTruncation(max_items=10),
     requires_auth=False,
     write_side=False,
-    # llm_visible=True — only LLM-visible tool; appears as residual in property_about.
+    # llm_visible=True — only LLM-visible RESIDUAL tool; appears as residual in property_about.
+    # Tier B tools (calculateEMI, calculateAffordability, convertUnit) are also llm_visible=True
+    # but those are injected via the Tier B mechanism, not as residual tools.
     # LLM calls this when user asks "what's nearby?" in the same turn as a property question.
     llm_visible=True,
   ),
@@ -2155,6 +2155,8 @@ class SLMPromptComposerProtocol(Protocol):
 class LLMContext:
     main_intent: str
     sub_intent: str
+    prompt_block: str                   # path to prompt file, dispatched via FOLLOWUP_PROMPT_BLOCKS
+    is_followup: bool                   # True when summary_node already emitted a phase-1 event
     session: dict                       # SessionState
     turn_count: int
     has_session_summary: bool
@@ -2261,6 +2263,15 @@ class BotState(TypedDict):
     # One session has many turns; each turn has exactly one request_id.
     # Passed to LangSmith as run_id — enables 1:1 lookup of any turn's full trace.
     request_id: str
+
+    # ── Turn emission tracking ────────────────────────────────────────────
+    # Set by summary_node when a pre-fetch summary is emitted (template intents only).
+    # Used by respond_node and followup_node to calculate correct sequenceNumbers.
+    summary_emitted: Optional[bool]
+
+    # Set by respond_node. Number of template chat_events emitted in this turn (0 for text-only intents).
+    # Used by followup_node to offset its sequenceNumber correctly.
+    template_count: Optional[int]
 
     # ── Experiment framework ──────────────────────────────────────────────
     # Set by experiment_node when an active A/B experiment targets this session.
@@ -2400,7 +2411,7 @@ def is_gibberish(msg: str) -> bool:
     return False
 
 # ── 3. classify_node ──────────────────────────────────────────────────
-# SLM call (Gemini 2.0 Flash). ≤150ms budget.
+# SLM call (Claude Haiku — current; Gemini Flash as benchmark candidate). ≤150ms budget.
 # Input:  state['normalized_message'], state['session'] (last 3 turns + active_filters)
 # Output: state['classification']:
 #   - main_intent, sub_intent, multi_intent, pivot, clarification_needed, reasoning
@@ -2475,10 +2486,11 @@ async def validate_slm_node(state: BotState) -> dict:
     if c.get('clarification_needed') and not c.get('clarification_data'):
         c['clarification_data'] = {'question_id': 'q1', 'options': []}
 
-    # entities_mentioned items must each have 'name' and 'type' keys
+    # entities_mentioned items must each have 'name' and 'inferred_type' keys
+    # (SLM outputs 'inferred_type', not 'type' — must match the SLM output schema)
     entities = [
         e for e in c.get('entities_mentioned', [])
-        if isinstance(e, dict) and 'name' in e and 'type' in e
+        if isinstance(e, dict) and 'name' in e and 'inferred_type' in e
     ]
     if len(entities) != len(c.get('entities_mentioned', [])):
         log.warn('slm_malformed_entities', {
@@ -2631,10 +2643,12 @@ async def route_node(state: BotState) -> dict:
     sub_intent   = c['sub_intent']
     record       = get_intent_record(main_intent, sub_intent)  # guaranteed by validate_slm_node
 
-    # Auth check: requires_auth = True (login-gated) OR write_side tool (explicit confirmation).
-    # Sets bot_response to a structured auth_required payload — graph runner emits as SSE.
+    # Auth check: requires_auth = True means this intent needs BE-fetched user data (portfolio,
+    # save_alert). FE-side actions (shortlist, contact_seller) handle their own login flow within
+    # the template — they don't set requires_auth=True.
+    # Response: chat_event with templateId="login" + a plain text message. emit_final_state sends it.
     if record.requires_auth and not state['session'].get('auth_token'):
-        return {'bot_response': build_auth_required_response(main_intent, sub_intent)}
+        return {'bot_response': build_login_template_response(main_intent, sub_intent)}
 
     routing = {'tier': record.tier, 'model': record.model}
 
@@ -2651,6 +2665,89 @@ async def route_node(state: BotState) -> dict:
         return {'routing': routing, 'bot_response': await execute_tier2_action(state)}
 
     return {'routing': routing}
+
+# ── 9b. summary_node ───────────────────────────────────────────────────
+# Emits a SHORT, deterministic summary message BEFORE data fetching begins.
+# Goal: user sees a "what I understood" confirmation immediately after entity resolution —
+# not after results arrive. Example: "I see you're looking for 2BHK in Indiranagar, Bengaluru"
+# NOT "I found 20 properties..." (that belongs in the followup, after templates).
+#
+# EAGERNESS GUARD — skip summary if:
+#   1. Tier is not 3 (Tier 0/1/2 short-circuited from route_node before this node)
+#   2. Intent has no templates (text-only intent — LLM response is the main content)
+#   3. Any mentioned entity was not resolved with high confidence (sector 32 not in DB →
+#      would mislead user if summary says "finding properties in sector 32" before we
+#      realise we need to ask which sector 32 they mean)
+#
+# Input:  state['classification'], state['session'], state['resolved_entities'], state['routing']
+# Output: emits message_delta + chat_event (seq 0, sourceMessageState: IN_PROGRESS);
+#         sets state['summary_emitted'] = True
+ENTITY_CONFIDENCE_THRESHOLD = 0.70   # below this → clarification is likely → skip summary
+
+async def summary_node(state: BotState, emit_sse: Callable) -> dict:
+    routing = state.get('routing') or {}
+    if routing.get('tier') not in ('3a', '3b'):
+        return {}
+
+    c = state.get('classification') or {}
+    intent_key = (c.get('main_intent', ''), c.get('sub_intent', ''))
+
+    # Dispatch to the intent-specific builder. If intent is not in SUMMARY_BUILDERS,
+    # it's a text-only intent — skip summary, LLM followup will be the only message.
+    builder = SUMMARY_BUILDERS.get(intent_key)
+    if not builder:
+        return {}
+
+    # Eagerness guard: skip if any mentioned entity was not confidently resolved.
+    # Example: "sector 32" → two DB matches (Gurgaon / Noida) → low confidence →
+    # clarification will follow → don't pre-announce a wrong entity name.
+    entities_mentioned = c.get('entities_mentioned', [])
+    resolved = state.get('resolved_entities') or {}
+    for entity in entities_mentioned:
+        name = entity.get('name', '')
+        conf = (resolved.get(name) or {}).get('confidence', 1.0)
+        if conf < ENTITY_CONFIDENCE_THRESHOLD:
+            log.info('summary_skipped_low_confidence_entity', {
+                'entity': name, 'confidence': conf, 'request_id': state.get('request_id'),
+            })
+            return {}
+
+    summary_text = builder(c, state['session'], resolved)
+    if not summary_text:
+        return {}   # Builder returned '' — intent has no useful summary copy
+
+    source_msg_id   = state['request_id']
+    conversation_id = state['session']['session_id']
+    now             = datetime.utcnow().isoformat() + 'Z'
+    summary_msg_id  = str(uuid.uuid4())
+
+    # Emit as a single message_delta chunk (deterministic text — not a real LLM stream
+    # but follows the same protocol so the FE handles it uniformly)
+    emit_sse('message_delta', {
+        'messageId':       summary_msg_id,
+        'sourceMessageId': source_msg_id,
+        'sequenceNumber':  0,
+        'chunkIndex':      0,
+        'messageType':     'text',
+        'content':         {'text': summary_text},
+    })
+
+    summary_event = ChatEventToUser(
+        conversation_id      = conversation_id,
+        message_id           = summary_msg_id,
+        source_message_id    = source_msg_id,
+        message_type         = 'text',
+        message_state        = 'COMPLETED',
+        source_message_state = 'IN_PROGRESS',   # more events follow (templates + followup)
+        created_at           = now,
+        sequence_number      = 0,
+        sender               = {'type': 'bot'},
+        content              = MessageContent(text=summary_text),
+    )
+    emit_sse('chat_event', summary_event.model_dump(by_alias=True))
+    await persist_to_kafka(conversation_id, [summary_event.model_dump(by_alias=True)])
+
+    return {'summary_emitted': True}
 
 # ── PARAM_RESOLVERS — OCP-compliant strategy map ───────────────────────
 # Adding a new ParamSource = add one entry here.
@@ -2769,27 +2866,42 @@ async def fetch_data_node(state: BotState, executor: CachedExecutorPort) -> dict
     return {'pre_fetched_data': pre_fetched_data, 'fetch_errors': fetch_errors}
 
 # ── 11. build_prompt_node ─────────────────────────────────────────────
-# Assembles system prompt. Injects pre-fetched data inline; for any tool in
-# fetch_errors, injects a { error, tool } stub so the LLM can say
-# "Some data was unavailable" rather than hallucinating it.
-# Tool list = residual_tools for this intent + Tier B tools (unless calculator/*).
-# Input:  state['routing'], state['pre_fetched_data'], state['fetch_errors'], state['session']
+# Assembles system prompt using the intent-specific prompt block from FOLLOWUP_PROMPT_BLOCKS.
+# Two modes depending on whether a summary was emitted this turn:
+#
+#   Template intents (summary + cards already sent):
+#     → uses a "followup" prompt block: "Cards have been shown. Add brief commentary."
+#     → prompt is short; LLM's job is commentary + next-step suggestions (2-4 sentences)
+#
+#   Text-only intents (no summary, no cards):
+#     → uses a "main" prompt block: full NLG response to the user's question
+#     → prompt is the complete response template as before
+#
+# OCP: the dispatch is via FOLLOWUP_PROMPT_BLOCKS — no if/elif per intent inside this node.
+# Input:  state['classification'], state['pre_fetched_data'], state['fetch_errors'],
+#         state['session'], state['summary_emitted']
 # Output: state['system_prompt'], state['tool_definitions']
 async def build_prompt_node(state: BotState, composer: LLMPromptComposerProtocol) -> dict:
     c           = state['classification']
     main_intent = c['main_intent']
     sub_intent  = c['sub_intent']
+    intent_key  = (main_intent, sub_intent)
     session     = state['session']
+
+    # Dispatch to the intent-specific prompt block via registry
+    prompt_block = FOLLOWUP_PROMPT_BLOCKS.get(intent_key, 'prompts/llm/main/generic.md')
 
     result = composer.build(LLMContext(
         main_intent=main_intent,
         sub_intent=sub_intent,
+        prompt_block=prompt_block,            # injected into composer — selects the template
+        is_followup=bool(state.get('summary_emitted')),  # tells composer: cards already shown
         session=session,
         turn_count=session.get('turn_count', 0),
         has_session_summary=bool(session.get('summary')),
         session_summary=session.get('summary'),
     ))
-    # Tier B tools injected here — LLM can call calculate_emi/calculate_affordability/convert_unit
+    # Tier B tools injected here — LLM can call calculateEMI/calculateAffordability/convertUnit
     # on-demand in any non-calculator intent. Calculator intents skip Tier B (result already inline).
     tool_definitions = build_all_llm_tools(get_residual_tools(main_intent, sub_intent), main_intent)
     return {'system_prompt': result.system, 'tool_definitions': tool_definitions}
@@ -2813,9 +2925,11 @@ async def llm_node(state: BotState, llm: LLMPort, emit_sse) -> dict:
     model   = MODELS['haiku'] if routing['model'] == 'haiku' else MODELS['sonnet']
 
     # Stable ID for the text row. Generated here so message_delta events and the
-    # final chat_event (text) emitted by respond_node share the same messageId.
+    # final chat_event (text) emitted by followup_node share the same messageId.
+    # sequenceNumber = position of the followup text in the turn (after summary + templates).
     text_message_id = str(uuid.uuid4())
     source_msg_id   = state['request_id']
+    seq             = (1 if state.get('summary_emitted') else 0) + (state.get('template_count') or 0)
     chunk_index     = 0
 
     def on_chunk(chunk: str):
@@ -2823,7 +2937,7 @@ async def llm_node(state: BotState, llm: LLMPort, emit_sse) -> dict:
         delta_event = {
             'messageId':       text_message_id,
             'sourceMessageId': source_msg_id,
-            'sequenceNumber':  0,
+            'sequenceNumber':  seq,
             'chunkIndex':      chunk_index,
             'content':         {'text': chunk},
         }
@@ -2882,40 +2996,29 @@ async def validate_output_node(state: BotState) -> dict:
     return {'validated_text': cleaned_text}
 
 # ── 14. respond_node ──────────────────────────────────────────────────
-# Builds the full ChatEventToUser sequence for this turn and emits each event over SSE.
-# One turn = one text chat_event + zero or more template chat_events (property_carousel,
-# locality_carousel, etc.), all sharing the same sourceMessageId = request_id.
-# This node calls emit_sse directly — NOT via bot_response — because a multi-template turn
-# requires multiple SSE frames. Short-circuiting nodes (clarify, route, etc.) still use
-# bot_response only; emit_final_state in the HTTP handler wraps those.
-# Input:  state['validated_text'], state['pre_fetched_data'], state['tool_results'], state['session']
-# Output: state['bot_response'] (last event dict); emits chat_event SSE frames directly
+# Emits ONLY template chat_events (property_carousel, locality_carousel, etc.).
+# The LLM text (followup commentary) is handled separately by followup_node AFTER this node.
+# This decoupling is what allows "summary → fetch → templates → LLM followup" ordering:
+# the user sees cards immediately after the fetch completes; commentary streams in after.
+#
+# Sequence number:
+#   seq_start = 0         if no summary was emitted this turn
+#   seq_start = 1         if summary_node emitted (seq 0 is taken)
+#
+# All template events are emitted with sourceMessageState: IN_PROGRESS —
+# followup_node emits the COMPLETED marker on the final text event.
+# If there is no followup text (validated_text is empty), followup_node emits a
+# COMPLETED close-turn event to prevent the FE from hanging on IN_PROGRESS.
+#
+# Input:  state['classification'], state['pre_fetched_data'], state['tool_results'], state['session']
+# Output: state['template_count']; emits template chat_event SSE frames; persists to Kafka
 async def respond_node(state: BotState, emit_sse: Callable) -> dict:
     c               = state['classification']
-    source_msg_id   = state['request_id']   # user turn's request_id = sourceMessageId
+    source_msg_id   = state['request_id']
     conversation_id = state['session']['session_id']
     now             = datetime.utcnow().isoformat() + 'Z'
-    # Reuse the text_message_id generated by llm_node so message_delta and chat_event share it.
-    text_message_id = (state.get('llm_response') or {}).get('text_message_id') or str(uuid.uuid4())
+    seq_start       = 1 if state.get('summary_emitted') else 0
 
-    events: list[ChatEventToUser] = []
-
-    # 1. Text event (always present when validated_text is non-empty)
-    if state.get('validated_text'):
-        events.append(ChatEventToUser(
-            conversation_id      = conversation_id,
-            message_id           = text_message_id,
-            source_message_id    = source_msg_id,
-            message_type         = 'markdown' if is_markdown(state['validated_text']) else 'text',
-            message_state        = 'COMPLETED',
-            source_message_state = 'IN_PROGRESS',  # updated to COMPLETED on last event below
-            created_at           = now,
-            sequence_number      = 0,
-            sender               = {'type': 'bot'},
-            content              = MessageContent(text=state['validated_text']),
-        ))
-
-    # 2. Template events derived from pre_fetched_data + residual tool_results
     template_events = build_template_events(
         classification   = c,
         pre_fetched_data = state.get('pre_fetched_data') or {},
@@ -2923,29 +3026,86 @@ async def respond_node(state: BotState, emit_sse: Callable) -> dict:
         session          = state['session'],
         source_msg_id    = source_msg_id,
         conversation_id  = conversation_id,
-        seq_start        = len(events),
+        seq_start        = seq_start,
         now              = now,
     )
-    events.extend(template_events)
 
-    # Last event marks the full turn as COMPLETED
-    if events:
-        events[-1].source_message_state = 'COMPLETED'
+    if not template_events:
+        return {'template_count': 0}
 
-    # Emit all events — respond_node calls emit_sse directly for multi-event turns
-    for event in events:
+    # All templates are IN_PROGRESS — followup_node closes the turn with COMPLETED
+    for event in template_events:
+        event.source_message_state = 'IN_PROGRESS'
         emit_sse('chat_event', event.model_dump(by_alias=True))
 
-    bot_response = events[-1].model_dump(by_alias=True) if events else None
+    await persist_to_kafka(conversation_id, [e.model_dump(by_alias=True) for e in template_events])
+    return {'template_count': len(template_events)}
 
-    # Persist + update session state. Both are reliable (not fire-and-forget) —
-    # see Part 8 for Kafka retry queue and optimistic session locking details.
-    await persist_to_kafka(conversation_id, [e.model_dump(by_alias=True) for e in events])
+# ── 15. followup_node ─────────────────────────────────────────────────
+# Emits the LLM-generated text as the FINAL message in this turn.
+# For template intents:  brief commentary on results + next-step suggestions.
+# For text-only intents: the complete main response (no summary, no templates precede it).
+#
+# Always the last emitter in a turn → always sets sourceMessageState: COMPLETED.
+# Also persists session state (once per turn, after all events have been emitted).
+#
+# sequenceNumber = (1 if summary_emitted else 0) + (template_count or 0)
+#
+# Input:  state['validated_text'], state['summary_emitted'], state['template_count'],
+#         state['llm_response']['text_message_id']
+# Output: state['bot_response']; emits final chat_event (text/markdown); persists session
+async def followup_node(state: BotState, emit_sse: Callable) -> dict:
+    c               = state['classification']
+    source_msg_id   = state['request_id']
+    conversation_id = state['session']['session_id']
+    now             = datetime.utcnow().isoformat() + 'Z'
+    validated_text  = state.get('validated_text') or ''
+    seq             = (1 if state.get('summary_emitted') else 0) + (state.get('template_count') or 0)
+
+    # Reuse the text_message_id generated by llm_node so message_delta and
+    # the final chat_event share the same messageId (FE assembles streamed text by messageId)
+    text_message_id = (state.get('llm_response') or {}).get('text_message_id') or str(uuid.uuid4())
+
+    if validated_text:
+        followup_event = ChatEventToUser(
+            conversation_id      = conversation_id,
+            message_id           = text_message_id,
+            source_message_id    = source_msg_id,
+            message_type         = 'markdown' if is_markdown(validated_text) else 'text',
+            message_state        = 'COMPLETED',
+            source_message_state = 'COMPLETED',   # always the last event in any turn
+            created_at           = now,
+            sequence_number      = seq,
+            sender               = {'type': 'bot'},
+            content              = MessageContent(text=validated_text),
+        )
+        emit_sse('chat_event', followup_event.model_dump(by_alias=True))
+        await persist_to_kafka(conversation_id, [followup_event.model_dump(by_alias=True)])
+        bot_response = followup_event.model_dump(by_alias=True)
+
+    else:
+        # LLM returned empty text (edge case: bad inference, safety strip emptied the output).
+        # Still need to close the turn so the FE doesn't hang on IN_PROGRESS templates.
+        # Emit a minimal COMPLETED marker with no content.
+        close_event = ChatEventToUser(
+            conversation_id      = conversation_id,
+            message_id           = str(uuid.uuid4()),
+            source_message_id    = source_msg_id,
+            message_type         = 'text',
+            message_state        = 'COMPLETED',
+            source_message_state = 'COMPLETED',
+            created_at           = now,
+            sequence_number      = seq,
+            sender               = {'type': 'bot'},
+            content              = MessageContent(text=''),
+        )
+        emit_sse('chat_event', close_event.model_dump(by_alias=True))
+        bot_response = None
+
+    # Session state update — happens once per turn, after all events are emitted.
     session = state['session']
     saved   = await update_session_state(session, c, state.get('tool_results') or [])
     if not saved:
-        # Optimistic lock conflict: another concurrent turn wrote first.
-        # Re-fetch session and apply non-destructive fields (turn list append).
         await reconcile_session_conflict(session, bot_response)
 
     return {'bot_response': bot_response}
@@ -3123,6 +3283,143 @@ async def execute_tier2_action(state: BotState, executor: CachedExecutorPort) ->
         pre_fetched[req.fetch_key or req.tool] = data
     return build_tier2_response(c, pre_fetched)
 
+# ── build_login_template_response ────────────────────────────────────
+# Called by route_node when requires_auth=True and auth_token is absent.
+# Returns a bot_response dict that emit_final_state wraps in a chat_event.
+# FE renders templateId="login" as a login prompt.
+# Note: write-side Tier 1 actions (shortlist, contact_seller) do NOT use this —
+# FE templates handle their own login flow internally.
+
+_LOGIN_PROMPT: dict[tuple[str, str], str] = {
+    ('portfolio', 'saved_properties'):  'Log in to see your saved properties.',
+    ('portfolio', 'viewed_properties'): 'Log in to see your recently viewed properties.',
+    ('portfolio', 'recent_searches'):   'Log in to see your recent searches.',
+    ('portfolio', 'recommendations'):   'Log in to get personalised recommendations.',
+    ('property_search', 'save_alert'):  'Log in to save this search and get alerts.',
+}
+
+def build_login_template_response(main_intent: str, sub_intent: str) -> dict:
+    message = _LOGIN_PROMPT.get(
+        (main_intent, sub_intent),
+        'Please log in to continue.',
+    )
+    return {
+        'text':                 message,
+        'source_message_state': 'COMPLETED',
+        'template': {
+            'templateId': 'login',
+            'data':       {},          # FE renders a standard login CTA; no data needed
+        },
+    }
+
+# ── SUMMARY_BUILDERS registry ─────────────────────────────────────────
+# One entry per (main_intent, sub_intent) that warrants a pre-fetch summary.
+# Each value is a pure function: (classification, session, resolved_entities) → str.
+# Returns '' to signal "no summary for this intent" (summary_node skips emission).
+#
+# OCP: adding a new intent = add one builder function + register it here.
+# No changes to summary_node itself.
+# Each builder is independently testable without constructing the full graph.
+#
+# MUST NOT mention result counts or data not yet fetched.
+# MUST use resolved entity display_name (not raw user text) — the DB entity must be
+# confirmed before naming it, otherwise the eagerness guard already skipped us.
+
+def _resolved_name(resolved: dict, entity_type: str) -> str | None:
+    for v in resolved.values():
+        if v.get('entity_type') == entity_type:
+            return v.get('display_name')
+    return None
+
+def build_property_search_summary(c: dict, session: dict, resolved: dict) -> str:
+    filters = session.get('active_filters', {})
+    txn     = session.get('transaction_type', 'buy')
+    parts   = []
+    bhk = filters.get('bhk')
+    if bhk:
+        bhk_str = '/'.join(str(b) for b in bhk) if isinstance(bhk, list) else str(bhk)
+        parts.append(f'{bhk_str}BHK')
+    parts.append('rental properties' if txn == 'rent' else 'properties for purchase')
+    locality = _resolved_name(resolved, 'locality') or (filters.get('localities') or [None])[0]
+    if locality:
+        parts.append(f'in {locality}')
+    city = _resolved_name(resolved, 'city') or session.get('city')
+    if city:
+        parts.append(city)
+    return "I see you're looking for " + ' '.join(parts)
+
+def build_explore_nearby_summary(c: dict, session: dict, resolved: dict) -> str:
+    txn = session.get('transaction_type', 'buy')
+    return f"Finding {'rental ' if txn == 'rent' else ''}properties near your location..."
+
+def build_locality_research_summary(c: dict, session: dict, resolved: dict) -> str:
+    locality = _resolved_name(resolved, 'locality') or 'this locality'
+    return f'Looking up details for {locality}...'
+
+def build_comparison_summary(c: dict, session: dict, resolved: dict) -> str:
+    names = [v.get('display_name') for v in resolved.values() if v.get('display_name')]
+    if len(names) >= 2:
+        return f"Comparing {' and '.join(names)} for you..."
+    return ''   # missing an entity — don't emit a vague summary
+
+def build_similar_properties_summary(c: dict, session: dict, resolved: dict) -> str:
+    return 'Finding similar properties for you...'
+
+def build_portfolio_saved_summary(c: dict, session: dict, resolved: dict) -> str:
+    return 'Fetching your saved properties...'
+
+def build_portfolio_viewed_summary(c: dict, session: dict, resolved: dict) -> str:
+    return 'Fetching your recently viewed properties...'
+
+def build_portfolio_recommendations_summary(c: dict, session: dict, resolved: dict) -> str:
+    return 'Fetching personalised recommendations for you...'
+
+# Registry: (main_intent, sub_intent) → builder
+# Intents absent from this dict do not emit a summary (text-only intents, Tier 0/1/2, etc.)
+SUMMARY_BUILDERS: dict[tuple[str, str], Callable[[dict, dict, dict], str]] = {
+    ('property_search', 'filter_search'):            build_property_search_summary,
+    ('property_search', 'explore_nearby'):           build_explore_nearby_summary,
+    ('property_search', 'discovery_collections'):    build_property_search_summary,
+    ('locality_research', 'trending_localities'):    build_locality_research_summary,
+    ('locality_research', 'locality_comparison'):    build_comparison_summary,
+    ('comparison', 'compare_localities'):            build_comparison_summary,
+    ('property_detail', 'similar_properties'):       build_similar_properties_summary,
+    ('portfolio', 'recommendations'):                build_portfolio_recommendations_summary,
+    # portfolio/saved_properties and portfolio/viewed_properties are Tier 2 (orchestrator-only)
+    # and never reach summary_node — omitted intentionally.
+}
+
+# ── FOLLOWUP_PROMPT_BLOCKS registry ───────────────────────────────────
+# Maps each intent to the prompt block file used to generate the LLM response.
+# Template intents → brief followup commentary block (sees tool results in context).
+# Text-only intents → full NLG response block (no summary or templates precede it).
+#
+# OCP: adding a new intent = add one prompt file + register it here.
+# No changes to build_prompt_node itself.
+
+FOLLOWUP_PROMPT_BLOCKS: dict[tuple[str, str], str] = {
+    # Template intents (Tier 3a) — brief followup commentary; cards are already shown in Phase 2
+    ('property_search', 'filter_search'):            'prompts/llm/followup/property_search.md',
+    ('property_search', 'explore_nearby'):           'prompts/llm/followup/property_search.md',
+    ('property_search', 'discovery_collections'):    'prompts/llm/followup/property_search.md',
+    ('locality_research', 'trending_localities'):    'prompts/llm/followup/locality_research.md',
+    ('locality_research', 'locality_comparison'):    'prompts/llm/followup/comparison.md',
+    ('comparison', 'compare_localities'):            'prompts/llm/followup/comparison.md',
+    ('property_detail', 'similar_properties'):       'prompts/llm/followup/property_search.md',
+    ('portfolio', 'recommendations'):                'prompts/llm/followup/portfolio.md',
+    # Text-only intents (Tier 3a/3b) — full NLG response; no templates precede
+    ('property_detail', 'property_about'):           'prompts/llm/main/property_detail.md',
+    ('property_detail', 'floor_plan'):               'prompts/llm/main/property_detail.md',
+    ('locality_research', 'locality_overview'):      'prompts/llm/main/locality_about.md',
+    ('locality_research', 'commute_time'):           'prompts/llm/main/commute_time.md',
+    ('comparison', 'compare_projects'):              'prompts/llm/main/comparison.md',
+    ('project_research', 'project_price_trends'):    'prompts/llm/main/price_trends.md',
+    # portfolio/saved_properties and portfolio/viewed_properties are Tier 2 (no LLM call)
+    # financial/* keys removed — financial is not a registered main_intent; calculator/* are Tier 1/2
+}
+# Fallback for intents not explicitly listed: 'prompts/llm/main/generic.md'
+# build_prompt_node uses: FOLLOWUP_PROMPT_BLOCKS.get(intent_key, 'prompts/llm/main/generic.md')
+
 # ── Adapter injection via functools.partial ───────────────────────────
 # LangGraph nodes are plain functions. Adapters (executor, llm, composer) are injected
 # at graph construction time using functools.partial so nodes remain testable in isolation.
@@ -3159,16 +3456,20 @@ graph.add_node('derive',           derive_node)
 graph.add_node('clarify',          clarify_node)
 graph.add_node('resolve_entities', resolve_entities_node)
 graph.add_node('route',            route_node)
-graph.add_node('experiment',       experiment_node)
+graph.add_node('summary',          summary_node)       # emits pre-fetch summary (Part 9b)
+graph.add_node('experiment',       experiment_node)    # A/B variant (Part 12)
 graph.add_node('fetch_data',       fetch_data_node)
-graph.add_node('build_prompt',     build_prompt_node)
+graph.add_node('respond',          respond_node)       # emits templates only (moved before LLM)
+graph.add_node('build_prompt',     build_prompt_node)  # builds followup/main LLM prompt
 graph.add_node('llm',              llm_node)
 graph.add_node('validate_output',  validate_output_node)
-graph.add_node('respond',          respond_node)
+graph.add_node('followup',         followup_node)      # emits LLM text as final turn event
 
 graph.set_entry_point('safety')
 
 # Each node: if bot_response is set (short-circuit), go to END; else continue linearly.
+# Critical ordering: respond (templates) comes BEFORE llm (followup text).
+# This means the user sees property cards while the LLM is still generating commentary.
 for src, dst in [
     ('safety',           'normalize'),
     ('normalize',        'classify'),
@@ -3179,50 +3480,68 @@ for src, dst in [
     ('derive',           'clarify'),
     ('clarify',          'resolve_entities'),
     ('resolve_entities', 'route'),
-    ('route',            'experiment'),      # experiment_node inserted here (Part 12)
+    ('route',            'summary'),         # summary before fetch — eagerness guard inside
+    ('summary',          'experiment'),
     ('experiment',       'fetch_data'),
-    ('fetch_data',       'build_prompt'),
+    ('fetch_data',       'respond'),         # templates immediately after fetch
+    ('respond',          'build_prompt'),    # LLM prompt built after templates emitted
     ('build_prompt',     'llm'),
     ('llm',              'validate_output'),
-    ('validate_output',  'respond'),
+    ('validate_output',  'followup'),
 ]:
     graph.add_conditional_edges(src, should_continue, {'continue': dst, END: END})
 
-graph.add_edge('respond', END)
+graph.add_edge('followup', END)
 
 bot_pipeline = graph.compile()
 ```
 
 ### Graph Node Invariants
 
-**Graph runner invariant (updated — multi-emit model):**
-- `respond_node` calls `emit_sse('chat_event', ...)` directly for each event in the turn (text row + zero or more template rows).
-- `llm_node` calls `emit_sse('message_delta', ...)` for each streaming chunk when `streamingEnabled=true`.
-- All other nodes that short-circuit only set `bot_response` — they never call `emit_sse` directly.
-- After the graph exits, the HTTP handler calls `emit_final_state()` which emits `bot_response` as a `chat_event` if `respond_node` did NOT run (short-circuit path).
-- `connection_ack` is emitted by the HTTP handler **before** the graph starts.
-- `connection_close` is emitted by the HTTP handler **after** the graph exits.
+**Graph runner invariant (3-phase multi-emit model):**
 
-This replaces the old single-emit-per-request guarantee with: exactly one emission for short-circuit paths (via `emit_final_state`), and one text + N template emissions for full turns (via `respond_node`).
+Three nodes emit SSE directly; all others only set `bot_response` (handled by `emit_final_state`):
 
-| Node | Short-circuits? | Mutates session? | External I/O? |
-|---|---|---|---|
-| safety_node | Yes (blocked) | No | No |
-| normalize_node | Yes (gibberish) | No | No |
-| classify_node | No | No | Yes (Gemini SLM) |
-| validate_slm_node | Yes (invalid/unknown) | No | No |
-| filter_apply_node | No | Yes (filters) | No |
-| sanitize_node | No | Yes (filters) | No |
-| derive_node | Yes (user_location_needed) | Yes (filters) | Yes (autosuggest for anchor, timeout 2s) |
-| clarify_node | Yes (clarify) | No | No — sets bot_response; emit_final_state handles SSE |
-| resolve_entities_node | No | Yes (entity map) | Yes (autosuggest, parallel) |
-| route_node | Yes (0/1/2/auth) | No | Yes (tier 1/2 actions) |
-| experiment_node | No | No | No |
-| fetch_data_node | Yes (all failed) | No | Yes (Khoj, Casa, etc.) |
-| build_prompt_node | No | No | No |
-| llm_node | No | No | Yes (Claude; Tier B + residual tools) |
-| validate_output_node | No | No | No |
-| respond_node | No | Yes (turn list) | Yes (Kafka, Redis) — emits SSE directly |
+| Emitter | SSE events | When |
+|---|---|---|
+| HTTP handler | `connection_ack` | Before graph starts |
+| `summary_node` | `message_delta` (chunk) + `chat_event` (text, seq 0) | After entity resolution, BEFORE fetch |
+| `llm_node` | `message_delta` × N chunks | After templates emitted, during LLM stream |
+| `respond_node` | `chat_event` × N (templates, seq 1..N) | Immediately after fetch |
+| `followup_node` | `chat_event` (text, seq N+1) | After LLM stream completes |
+| HTTP handler `emit_final_state` | `chat_event` (short-circuit paths only) | After graph exits early |
+| HTTP handler | `connection_close` | After graph exits |
+
+**Not all phases are present for every turn:**
+
+| Turn type | Phases |
+|---|---|
+| Clarification / out-of-scope / blocked | Single event via `emit_final_state` |
+| Text-only Tier 3 (no templates) | `followup_node` only (seq 0, COMPLETED) |
+| Template Tier 3 | summary (seq 0) → templates (seq 1..N) → followup (seq N+1, COMPLETED) |
+
+**Ordering is guaranteed by the graph:** `summary_node` completes before `fetch_data_node` starts; `respond_node` (templates) completes before `llm_node` starts streaming. The FE receives events in causal order over the same SSE connection.
+
+| Node | Short-circuits? | Emits SSE? | Mutates session? | External I/O? |
+|---|---|---|---|---|
+| safety_node | Yes (blocked) | No | No | No |
+| normalize_node | Yes (gibberish) | No | No | No |
+| classify_node | No | No | No | Yes (Claude Haiku SLM) |
+| validate_slm_node | Yes (invalid/unknown) | No | No | No |
+| filter_apply_node | No | No | Yes (filters) | No |
+| sanitize_node | No | No | Yes (filters) | No |
+| derive_node | Yes (user_location_needed) | No | Yes (filters) | Yes (autosuggest, 2s timeout) |
+| clarify_node | Yes (clarify) | No | No | No |
+| resolve_entities_node | No | No | Yes (entity map) | Yes (autosuggest, parallel) |
+| route_node | Yes (tier 0/1/2/auth) | No | No | Yes (tier 1/2 actions) |
+| summary_node | No | Yes (msg_delta + chat_event) | No | No (Kafka async) |
+| experiment_node | No | No | No | No |
+| fetch_data_node | Yes (all required failed) | No | No | Yes (Khoj, Casa, Odin, etc.) |
+| respond_node | No | Yes (chat_event × N templates) | No | No (Kafka async) |
+| build_prompt_node | No | No | No | No |
+| llm_node | No | Yes (msg_delta × chunks) | No | Yes (Claude; Tier B + residual) |
+| validate_output_node | No | No | No | No |
+| followup_node | No | Yes (chat_event) | Yes (session state) | Yes (Kafka, Redis) |
 
 ---
 
@@ -3448,7 +3767,7 @@ default per fetch. Overall per-turn target for Tier 3a: ≤ 1.5s to first LLM ch
 
 | Call | Hard Timeout | Notes |
 |---|---|---|
-| Gemini SLM (classification) | 2,000ms | Fail fast; SLM fallback fires (see below) |
+| Haiku SLM (classification) | 2,000ms | Fail fast; SLM fallback fires (see below) |
 | Khoj `searchProperties` | 1,500ms | User-blocking; fast-fail over waiting |
 | Casa `getPropertyDetail` | 2,000ms | |
 | Venus `getFloorPlans` / `getBrochure` | 2,000ms | |
@@ -3515,7 +3834,7 @@ Retry logic lives in the `CachedExecutorPort` implementation, using `tenacity` (
 
 ### SLM Failure Fallback
 
-If Gemini classification fails (timeout or 5xx) after 1 retry:
+If SLM classification fails (timeout or 5xx) after 1 retry:
 - Route to `out_of_scope` Tier 0 handler
 - Emit canned response: *"I'm having trouble understanding that — could you rephrase?"*
 - Log `classifier_unavailable` metric; alert if rate > 1% over 5 minutes
@@ -3544,7 +3863,7 @@ HALF_OPEN
 | Casa | 5 failures | 15s |
 | Venus / Gandalf / Odin | 5 failures | 15s |
 | Autosuggest | 5 failures | 10s |
-| Gemini (SLM) | 3 failures | 30s |
+| SLM (Haiku) | 3 failures | 30s |
 | Claude (LLM) | 3 failures | 30s |
 
 When a circuit is OPEN, the LLM is instructed via the `fetch_errors` context block:
@@ -3850,8 +4169,44 @@ async def emit_final_state(state: BotState, emit_sse: Callable):
         )
         emit_sse('chat_event', event.model_dump(by_alias=True))
 
+    elif isinstance(bot_response, dict) and bot_response.get('template'):
+        # Combined text + template short-circuits: login prompt, etc.
+        # Emit text first (seq 0), then the template (seq 1).
+        msg_id = str(uuid.uuid4())
+        if bot_response.get('text'):
+            text_event = ChatEventToUser(
+                conversation_id      = conversation_id,
+                message_id           = msg_id,
+                source_message_id    = source_msg_id,
+                message_type         = 'text',
+                message_state        = 'IN_PROGRESS',
+                source_message_state = 'IN_PROGRESS',
+                created_at           = now,
+                sequence_number      = 0,
+                sender               = {'type': 'bot'},
+                content              = MessageContent(text=bot_response['text']),
+            )
+            emit_sse('chat_event', text_event.model_dump(by_alias=True))
+        tmpl = bot_response['template']
+        tmpl_event = ChatEventToUser(
+            conversation_id      = conversation_id,
+            message_id           = str(uuid.uuid4()),
+            source_message_id    = source_msg_id,
+            message_type         = 'template',
+            message_state        = 'COMPLETED',
+            source_message_state = 'COMPLETED',
+            created_at           = now,
+            sequence_number      = 1 if bot_response.get('text') else 0,
+            sender               = {'type': 'bot'},
+            content              = MessageContent(
+                template_id = tmpl['templateId'],
+                data        = tmpl.get('data', {}),
+            ),
+        )
+        emit_sse('chat_event', tmpl_event.model_dump(by_alias=True))
+
     elif isinstance(bot_response, dict) and bot_response.get('template_id'):
-        # Template short-circuits: nested_qna, share_location, shortlist_property, contact_seller
+        # Template-only short-circuits: nested_qna, share_location
         event = ChatEventToUser(
             conversation_id      = conversation_id,
             message_id           = str(uuid.uuid4()),
@@ -3870,7 +4225,7 @@ async def emit_final_state(state: BotState, emit_sse: Callable):
         emit_sse('chat_event', event.model_dump(by_alias=True))
 
     elif isinstance(bot_response, dict) and bot_response.get('text'):
-        # auth_required, fetch_error canned messages — emit as text
+        # Text-only canned responses (fetch_error, out_of_scope)
         event = ChatEventToUser(
             conversation_id      = conversation_id,
             message_id           = str(uuid.uuid4()),
@@ -3943,8 +4298,8 @@ def compute_llm_cost(model_id: str, input_tokens: int, output_tokens: int) -> fl
 
 # classify_node emits cost after every SLM call:
 # emit_metrics(NodeMetrics(node_name='classify_node', ...,
-#     extra={'model': 'gemini-2.0-flash', 'input_tokens': 420, 'output_tokens': 80,
-#            'cost_usd': compute_llm_cost('gemini-2.0-flash', 420, 80), ...}))
+#     extra={'model': 'claude-haiku-4-5-20251001', 'input_tokens': 420, 'output_tokens': 80,
+#            'cost_usd': compute_llm_cost('claude-haiku-4-5-20251001', 420, 80), ...}))
 #
 # llm_node emits cost after every Claude call:
 # emit_metrics(NodeMetrics(node_name='llm_node', ...,
@@ -3996,7 +4351,422 @@ Example events and their required extra fields:
 
 ---
 
-## Part 11 — Debugging: Trace, Dry-Run, and Replay
+## Part 11 — Unified Platform Integration Contracts
+
+This section documents how the Search & Discovery service plugs into the unified platform
+gateway defined in `unified-platform-architecture.md`. It covers authentication, handoff
+context, out-of-scope signalling, session registry writes, chat history, the
+`contact_seller` handoff hint, and the turn/session lifecycle distinction.
+
+---
+
+### 1. Session Token Validation
+
+The routing gateway issues a short-lived `session_token` when it assigns a session to this
+service. Every subsequent request from the client must include that token. The service
+validates the token on each turn before loading session state.
+
+#### Updated `ChatEventFromUser`
+
+```python
+class ChatEventFromUser(BaseModel):
+    # Existing fields (unchanged):
+    conversation_id: str           # derived from validated token — not trusted from body
+    message_type:    str           # 'text' | 'user_action' | 'context' | 'system_event'
+    content:         MessageContent
+
+    # New field — required for platform integration:
+    session_token:   str           # gateway-issued JWT or opaque token
+```
+
+> **Note:** `conversation_id` is included in the body for backwards-compatibility with
+> direct service calls (testing, admin tools) but is **not trusted** when a
+> `session_token` is present. The authoritative `conversation_id` is derived from the
+> validated token.
+
+#### Validation flow
+
+```python
+async def resolve_session(body: ChatEventFromUser, request: Request) -> SessionState:
+    """
+    1. Validate session_token — JWT verify (signature + exp) or Redis lookup
+       mapping  session_token → conversation_id  (gateway writes this on RouteResponse).
+    2. Derive conversation_id from the token; ignore body.conversation_id.
+    3. Load session via session_store.load_by_conversation(conversation_id, request).
+    4. Raise HTTP 401 if token is missing, signature invalid, or expired.
+    """
+```
+
+| Validation outcome | HTTP response |
+|---|---|
+| Token valid, session found | 200 — proceed |
+| Token signature invalid | 401 `{ "error": "invalid_token" }` |
+| Token expired | 401 `{ "error": "token_expired" }` |
+| Token valid, session not found | 404 `{ "error": "session_not_found" }` |
+
+The gateway rotates `session_token` values on mode switches; the old token becomes invalid
+when a new `RouteResponse` is issued. Clients must use the current token from their most
+recent `RouteResponse`.
+
+---
+
+### 2. HandoffContext at Session Init
+
+When the gateway routes a session to this service after a mode switch, it attaches a
+`HandoffContext` snapshot to the first request body. This snapshot carries entities and a
+conversation summary from the prior service.
+
+#### Extended `ChatEventFromUser` (first turn only)
+
+```python
+class ChatEventFromUser(BaseModel):
+    # ... existing + session_token fields ...
+
+    # Present only on the first turn of a newly routed session:
+    handoff_context: HandoffContext | None = None
+```
+
+```python
+# Mirrors the TypeScript interface in unified-platform-architecture.md
+class SharedEntities(BaseModel):
+    user_id:             str
+    active_property_id:  str | None = None
+    active_seller_id:    str | None = None
+    active_listing_id:   str | None = None
+    active_ticket_id:    str | None = None
+    transaction_type:    Literal['buy', 'rent'] | None = None
+    city:                str | None = None
+
+class HandoffContext(BaseModel):
+    handoff_from:         str          # ServiceType
+    handoff_to:           str          # always 'search_discovery' for this service
+    trigger:              Literal['out_of_scope', 'system_event', 'ui_escape', 'session_end']
+    conversation_summary: str          # 1-2 sentence summary of prior session
+    shared_entities:      SharedEntities
+    event_context:        dict | None = None   # SystemEvent — present when trigger='system_event'
+```
+
+#### Handler mapping — before graph invocation
+
+When `handoff_context` is present, the FastAPI handler maps its fields into session state
+**before** `pipeline.ainvoke(initial_state, ...)` is called:
+
+```python
+if body.handoff_context:
+    hc = body.handoff_context
+    se = hc.shared_entities
+    session['active_property_id'] = se.active_property_id or session.get('active_property_id')
+    session['active_seller_id']   = se.active_seller_id   or session.get('active_seller_id')
+    session['city']               = se.city               or session.get('city')
+    session['transaction_type']   = se.transaction_type   or session.get('transaction_type')
+    session['handoff_summary']    = hc.conversation_summary   # injected on turn 1 only
+```
+
+#### Updated `BotState` / session state keys
+
+```python
+# Added to the documented session state keys:
+'handoff_summary': Optional[str]   # populated on turn 1 when HandoffContext is present;
+                                   # cleared after first LLM call so it is not repeated
+```
+
+#### `build_prompt_node` injection (turn 1 only)
+
+When `session['handoff_summary']` is non-empty, `build_prompt_node` prepends a context
+block to the system prompt before any other content:
+
+```
+[Context from previous session]
+{handoff_summary}
+```
+
+After injecting it, `build_prompt_node` clears `session['handoff_summary']` so subsequent
+turns in the same session do not repeat the context block.
+
+---
+
+### 3. `out_of_scope` Gateway Signal
+
+When the service cannot classify a message and the reason is a **domain mismatch** (not
+ambiguity or a social pleasantry), it must signal the gateway rather than respond to the
+user directly. The gateway then invokes the routing SLM and issues a new `RouteResponse`.
+
+#### New SSE event type: `out_of_scope`
+
+```typescript
+// SSE event types for this service (one new SSE connection per turn):
+type SSEEventName =
+  | 'connection_ack'    // emitted before graph starts
+  | 'message_delta'     // token-level LLM streaming chunks
+  | 'chat_event'        // complete ChatEventToUser envelope — includes templateId: "login" for auth-gated flows
+  | 'error'             // unrecoverable error
+  | 'out_of_scope';     // domain mismatch; gateway must re-route
+```
+
+#### `out_of_scope` event shape
+
+```typescript
+interface OutOfScopeEvent {
+  original_message: string;   // verbatim user message that triggered the signal
+  session_token:    string;   // current session token (gateway uses to correlate)
+}
+```
+
+Example SSE frame:
+
+```
+event: out_of_scope
+data: {"original_message": "I want to pay my electricity bill", "session_token": "eyJ..."}
+
+```
+
+#### When `route_node` emits this signal
+
+`route_node` emits `out_of_scope` and **closes the SSE stream** only when **both**
+conditions are met:
+
+| Condition | Value |
+|---|---|
+| `tier` | `0` |
+| `sub_intent` | `'out_of_scope_query'` |
+
+```python
+# Inside route_node
+if routing['tier'] == 0 and classification['sub_intent'] == 'out_of_scope_query':
+    emit_sse('out_of_scope', {
+        'original_message': state['raw_message'],
+        'session_token':    session['session_token'],
+    })
+    # No bot_response set — stream closes after this frame.
+    return {**state, 'routing': routing}
+```
+
+#### Distinction: what is handled locally vs passed to gateway
+
+| Signal | Classification | Handled by |
+|---|---|---|
+| Domain mismatch | `tier=0, sub_intent='out_of_scope_query'` | Gateway — `out_of_scope` SSE event |
+| Gibberish / too vague | `tier=0, sub_intent='insufficient_info'` | Local — clarification response |
+| Social pleasantry | `tier=0, sub_intent='social_pleasantry'` | Local — brief canned response |
+
+`insufficient_info` and `social_pleasantry` are **not** passed to the gateway. They are
+fully handled within this service without emitting `out_of_scope`.
+
+---
+
+### 4. Session Registry Integration
+
+The service writes lightweight session metadata to the shared Session Registry on session
+start and end. No message content is ever written to the registry.
+
+#### `RegistryPort` protocol
+
+```python
+from typing import Protocol
+from datetime import datetime
+
+SERVICE_TYPE = 'search_discovery'
+
+class SessionRecord(BaseModel):
+    session_id:   str
+    user_id:      str
+    service_type: str           # always SERVICE_TYPE for this service
+    started_at:   datetime
+    ended_at:     datetime | None = None
+    preview:      str           # ≤ 80 chars; first message or intent-derived title
+    status:       Literal['active', 'ended']
+
+class RegistryPort(Protocol):
+    async def write_session_start(self, record: SessionRecord) -> None: ...
+    async def write_session_end(self, session_id: str, ended_at: datetime) -> None: ...
+```
+
+`RegistryPort` is injected at startup via `functools.partial`, the same pattern used for
+`ClassifierPort`, `LLMPort`, and `SessionStorePort`:
+
+```python
+# startup.py
+registry: RegistryPort = PostgresRegistryAdapter(db_pool=pool)
+# injected into the handler via partial, not a global
+```
+
+#### Session start write — in `generate()`
+
+In the FastAPI `generate()` function, after session load and token validation, **before**
+`pipeline.ainvoke(...)`:
+
+```python
+async def generate():
+    yield sse_frame('connection_ack', {...})
+
+    # --- Session registry write (start) ---
+    preview = (
+        raw_message[:80]
+        if raw_message
+        else f"{classification.get('main_intent', 'search')} in {session.get('city', 'India')}"
+    )
+    await registry.write_session_start(SessionRecord(
+        session_id   = session['session_id'],
+        user_id      = session['user_id'],
+        service_type = SERVICE_TYPE,
+        started_at   = datetime.utcnow(),
+        preview      = preview,
+        status       = 'active',
+    ))
+    # --- End registry write ---
+
+    graph_task = asyncio.create_task(pipeline.ainvoke(initial_state, config=run_config))
+    ...
+```
+
+When `preview` must be derived from classification (e.g. the first turn is a `user_action`
+rather than text), the fallback pattern `f"{main_intent} in {city}"` produces a
+human-readable title such as `"search_properties in Mumbai"`.
+
+#### Session end write — in `followup_node`
+
+`followup_node` runs after every full turn's `update_session_state`. After the state write,
+it updates the registry:
+
+```python
+# Inside followup_node, after update_session_state(state, session)
+await registry.write_session_end(
+    session_id = session['session_id'],
+    ended_at   = datetime.utcnow(),
+)
+```
+
+> This marks the record `status='ended'` so the UI history list correctly shows sessions
+> that ended versus sessions that are still active.
+
+---
+
+### 5. Chat History Endpoint
+
+Each service owns its own message history. The Search & Discovery service exposes a
+paginated endpoint the UI calls after resolving the owning service from the Session Registry.
+
+#### Endpoint
+
+```
+GET /chat/history?session_id={X}&token={Y}
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `session_id` | `string` | Session to retrieve history for |
+| `token` | `string` | Session token issued by the gateway (same token used for SSE) |
+| `cursor` | `string?` | Opaque offset cursor for pagination (omit for first page) |
+
+#### Authentication
+
+The handler validates `token` against the same token store used by the message endpoint
+(JWT verify or Redis lookup). Requests with invalid or expired tokens receive `401`.
+
+#### Response
+
+```typescript
+interface ChatHistoryResponse {
+  session_id:  string;
+  messages:    ChatEventToUser[];   // ordered by sequence_number asc
+  next_cursor: string | null;       // null when no further pages
+  total:       number;              // total messages in the session
+}
+```
+
+- Maximum 50 messages per page.
+- `cursor` is an opaque string encoding the offset; clients must not parse or construct it.
+
+#### Storage
+
+Kafka consumer writes one row per `chat_event` SSE frame to a `chat_history` Postgres table:
+
+```sql
+CREATE TABLE chat_history (
+    id             bigserial PRIMARY KEY,
+    session_id     text        NOT NULL,
+    message_id     text        NOT NULL UNIQUE,
+    sequence_num   int         NOT NULL,
+    sender_type    text        NOT NULL,   -- 'user' | 'bot'
+    message_type   text        NOT NULL,   -- 'text' | 'template'
+    content_json   jsonb       NOT NULL,
+    created_at     timestamptz NOT NULL,
+    INDEX (session_id, sequence_num)
+);
+```
+
+Retention: **90 days**. Rows older than 90 days are deleted by a scheduled cleanup job.
+
+---
+
+### 6. `contact_seller` Handoff Hint
+
+When the `contact_seller` Tier 1 action completes successfully, the response payload
+includes a `handoff_hint` field. This hint signals the client that a `user_seller_chat`
+session can be opened with pre-populated entities — it is a suggestion, not a forced
+redirect.
+
+#### Response payload shape
+
+After the `contactSeller` API call succeeds, the Tier 1 response dict (which becomes
+`bot_response` and is then wrapped by `emit_final_state`) includes:
+
+```json
+{
+  "template_id": "contact_seller_success",
+  "data": {
+    "property_name":   "2BHK in Andheri West",
+    "seller_name":     "Rahul Sharma",
+    "message_preview": "Your message has been sent."
+  },
+  "handoff_hint": {
+    "target": "user_seller_chat",
+    "entities": {
+      "active_property_id": "prop_abc123",
+      "active_seller_id":   "seller_xyz789"
+    }
+  }
+}
+```
+
+#### Client behaviour
+
+1. Client renders the `contact_seller_success` template (confirmation message).
+2. Client renders a **"Chat with seller"** CTA button using `handoff_hint.target` and
+   `handoff_hint.entities`.
+3. If the user taps the CTA, the client sends a new `RouteRequest` to the gateway with
+   `handoff_hint.entities` pre-populated in `shared_entities`.
+4. If the user continues searching instead, the hint is discarded — no state change.
+
+The hint is **never** acted upon automatically. The user must explicitly tap the CTA.
+
+---
+
+### 7. Session Lifecycle
+
+The SSE model is **one new connection per turn** — stateless at the transport layer:
+
+```
+POST /chat/message  { session_token, content }   ← client submits user message
+GET  /chat/stream   { session_token }             ← client opens fresh SSE to receive response
+```
+
+The SSE stream opens, the pipeline runs, the service streams the response, and the HTTP response closes naturally after the final `chat_event { sourceMessageState: "COMPLETED" }`. Conversation state lives in Redis / Postgres — not on the connection.
+
+```
+connection_ack                        ← stream opened
+message_delta × N                     ← LLM streaming (if applicable)
+chat_event { COMPLETED }              ← end of response; HTTP response closes
+                                         FE detects COMPLETED and re-enables input
+```
+
+For the **next user message**, the client sends a new POST and opens a new GET /chat/stream. Any backend instance can handle it — no sticky sessions, no long-lived socket to maintain.
+
+**Session end (mode switch / timeout):** The gateway stops issuing RouteResponses for this service. The service writes `SessionRecord.ended_at` to the Registry when `session_token` is no longer valid. No special SSE event is needed — the next POST simply returns 401 or is not made at all (client queries the gateway first).
+
+---
+
+## Part 12 — Debugging: Trace, Dry-Run, and Replay
 
 ### Finding a Turn in LangSmith
 
@@ -4031,7 +4801,7 @@ async def dry_run(
     mock_executor: CachedExecutorPort | None = None,
 ) -> dict:
     """Runs safety → normalize → classify → validate_slm → filter_apply → sanitize →
-    derive → clarify → resolve_entities → route → fetch_data → build_prompt.
+    derive → clarify → resolve_entities → route → summary → experiment → fetch_data → build_prompt.
     Stops before llm_node. No LLM call, no token cost.
 
     Returns the assembled prompt state so you can inspect exactly what Claude would see.
@@ -4080,13 +4850,15 @@ derive_node          SKIP
 clarify_node         SKIP
 resolve_entities     Andheri→uuid=abc123 [38ms]  Bandra→uuid=def456 [41ms]
 route_node           tier=3b, model=sonnet
+summary_node         EMITTED  seq=0  "Comparing Andheri and Bandra for you..."  [builder=build_comparison_summary]
 experiment_node      experiment=slm_v2_test variant=control
 fetch_data_node      6 fetches parallel [152ms]  HITS: getRatingsReviews:0, getRatingsReviews:1
                      MISSES: getLocalityDetail:0, getLocalityDetail:1, getPriceTrends:0, getPriceTrends:1
-build_prompt_node    system=3218 tokens  tools=0
-llm_node             sonnet [920ms, 3218→3218 in, 412 out, $0.0103, ttft=240ms]
+respond_node         2 template events emitted (locality_carousel seq=1, locality_carousel seq=2)
+build_prompt_node    block=prompts/llm/followup/comparison.md  is_followup=True  tokens=3218
+llm_node             sonnet [920ms, in=3218 out=412 $0.0103, ttft=240ms, msg_delta×18 chunks seq=3]
 validate_output_node PASS
-respond_node         2 chat_events emitted (text + locality_carousel)  session saved
+followup_node        1 chat_event emitted (text followup seq=3, COMPLETED)  session saved
 ```
 
 ### Request Replay
@@ -4127,7 +4899,7 @@ python -m bot.tools.replay --eval-file tests/slm/eval/regression_cases.jsonl --c
 
 ---
 
-## Part 12 — A/B Experiment Framework
+## Part 13 — A/B Experiment Framework
 
 Three experiment types can run concurrently. Assignment is deterministic: the same session always
 gets the same variant across its lifetime — no statefulness needed.
@@ -4245,7 +5017,7 @@ async def experiment_node(state: BotState) -> dict:
 
 Graph wiring (see Part 5 for full graph — `experiment` node is included there):
 ```
-route → experiment → fetch_data
+route → summary → experiment → fetch_data → respond → build_prompt → llm → validate_output → followup
 ```
 
 ### Experiment Graduation Criteria
@@ -4270,7 +5042,7 @@ within one hot-reload cycle (≤60s). No deploy needed for rollback.
 
 ---
 
-## Part 13 — Testability and Dev Tooling
+## Part 14 — Testability and Dev Tooling
 
 ### BotState Factories: Node Isolation Testing
 
@@ -4301,6 +5073,8 @@ def make_base_state(**overrides) -> BotState:
         'tool_results':          None,
         'validated_text':        None,
         'bot_response':          None,
+        'summary_emitted':       None,
+        'template_count':        None,
         'experiment_id':         None,
         'experiment_variant':    None,
     }
