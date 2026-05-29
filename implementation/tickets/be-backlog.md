@@ -205,19 +205,57 @@ async def send_message_streamed(
 
 ---
 
-## CHAT-A-007: /chat/get-conversation-id endpoint
-**Sprint:** 1 | **SP:** 2 | **Status:** ⬜
+## CHAT-A-007: /chat/get-conversation-id endpoint + session token system
+**Sprint:** 1 | **SP:** 3 | **Status:** ⬜
 
 **Description:**  
-`GET /api/v1/chat/get-conversation-id` — creates or returns existing conversation.  
-See `docs/api/endpoints.md` Part A1.
+`GET /api/v1/chat/get-conversation-id` — the entry point for every session.  
+Also the source of the `token_id` (BE-generated device identifier for anonymous users).
+
+**Session token design (PM-confirmed):**
+```
+Anonymous flow:
+  1. FE calls GET /chat/get-conversation-id (no headers)
+  2. BE generates token_id = UUID4, creates conversation row
+  3. BE returns { conversationId, tokenId, isNew: true }
+  4. FE stores tokenId in cookie, sends on every future request as X-Token-ID header
+
+Logged-in flow:
+  1. FE calls GET /chat/get-conversation-id with Login-Auth-Token header
+  2. BE calls login service API to validate the token → gets user_id
+  3. BE looks up existing conversation for this user_id, or creates new one
+  4. Returns { conversationId, isNew } (no tokenId in response — FE already has it)
+
+migrate-chat:
+  1. User logs in while in an anonymous chat
+  2. FE calls POST /chat/migrate-chat with Login-Auth-Token + currentConversationId
+  3. BE validates login token → gets user_id
+  4. Updates conversations SET user_id = ? WHERE conversation_id = ? AND token_id = ?
+  5. Chat is now owned by the logged-in user
+```
+
+**Login service API call:**
+```python
+async def validate_login_token(login_auth_token: str) -> str | None:
+    """Calls Housing login service to validate token. Returns user_id or None."""
+    resp = await http_client.get(
+        f"{settings.login_service_url}/validate",
+        headers={"Login-Auth-Token": login_auth_token},
+    )
+    if resp.status_code == 200:
+        return resp.json()["userId"]
+    return None
+```
+
+Add `LOGIN_SERVICE_URL` to `.env.example`.
 
 **Acceptance Criteria:**
-- [ ] Logged-in user: returns existing conversation for `login-auth-token` or creates new one
-- [ ] Anonymous: returns existing conversation for `tokenId` cookie or creates new one
-- [ ] Response shape: `{"conversationId": "uuid", "isNew": true}`
-- [ ] Creates `conversations` row in PostgreSQL (via Kafka session_events, not synchronous)
-- [ ] Session initialized in Redis with empty state
+- [ ] Anonymous: generates `token_id` (UUID4), stores in `conversations.token_id`
+- [ ] Response: `{"conversationId": "uuid", "tokenId": "uuid", "isNew": true}`
+- [ ] Logged-in: validates `Login-Auth-Token` via login service; maps to `user_id`
+- [ ] If login service is down: fall back to anonymous flow (log warning)
+- [ ] Session initialized in Redis with empty state on conversation creation
+- [ ] `conversations` row created via Kafka `chat.session_events` (not synchronous)
 
 ---
 

@@ -108,6 +108,32 @@ FastAPI app runs locally (`uvicorn src.main:app --reload`), NOT in Docker, for h
 
 ---
 
+## BOT_ENV Modes
+
+Three modes control how the app behaves. Set in `.env` or passed as env var.
+
+| Mode | SLM | LLM | Tool Executors | DB | Redis | Kafka | Use when |
+|---|---|---|---|---|---|---|---|
+| `mock` | Real (Anthropic) | Real (Anthropic) | DryRunExecutor (fixtures) | In-memory | Optional | Optional | AI/ML development, no VPN needed |
+| `local` | Real | Real | HttpToolExecutor → real APIs via VPN | PostgreSQL | Redis | Kafka | Full local dev, all services running |
+| `production` | Real | Real | HttpToolExecutor → prod APIs | RDS | Redis Cluster | Kafka cluster | Production |
+
+**`BOT_ENV=mock` requires only:** `ANTHROPIC_API_KEY` + a scenario file in `tests/fixtures/scenarios/`
+
+```bash
+# Develop without VPN:
+BOT_ENV=mock make dry-run SCENARIO=2bhk_bandra_search MSG="show me 2bhk in bandra"
+
+# Full local development (VPN required):
+BOT_ENV=local make up && uvicorn src.main:app --reload
+
+# Specific scenario for debugging a node:
+BOT_ENV=mock DRY_RUN_SCENARIO=locality_comparison python -m src.tools.dry_run \
+  --message "compare Andheri and Bandra"
+```
+
+---
+
 ## Local → Production Checklist
 
 Every decision that is "local only" is documented here. Before deploying to production:

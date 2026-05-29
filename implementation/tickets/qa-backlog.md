@@ -5,28 +5,30 @@
 
 ---
 
-## Testing Strategy Overview
+## Testing Strategy
+
+**See `implementation/testing/testing-strategy.md` for the full strategy.**  
+**See `implementation/testing/requirements-test-matrix.md` for requirements → test mapping.**  
+**See `implementation/testing/dry-run-runner.md` for the dry run runner API and test patterns.**
+
+### The guiding principle
+Every requirement in the docs has a test. Every test can run in isolation. The dry run is not a convenience tool — it is the primary integration testing harness.
 
 ```
-Unit Tests (fast, offline)
-  → pytest tests/unit/         ~80% coverage target on nodes + helpers
-  → Mock all external I/O (Redis, APIs, Anthropic)
-  → Run on every commit (< 30s)
-
-Model Eval (calibrated, real SLM)
-  → pytest tests/model_eval/   100+ cases per domain
-  → Run with --real-model flag before every deploy
-  → Accuracy targets: ≥98% domain router, ≥95% per-domain classifier
-
-Integration Tests (real APIs)
-  → pytest tests/integration/  --run-integration flag
-  → Hits real Khoj/Odin/Casa via VPN
-  → Run once per sprint (not on every commit)
-
-E2E Golden Paths (full stack)
-  → 10 scripted flows via HTTP against running server
-  → Run nightly + before sprint review
+Layer 0: Contract Tests       Real APIs, shape validation, --run-integration
+Layer 1: Model Eval           SLM accuracy, LLM rubric, --real-model
+Layer 2: Unit Tests           Single component, mocked deps, < 30s
+Layer 3: Dry Run Integration  Full pipeline + real SLM/LLM + fixture tools, < 60s
+Layer 4: E2E Golden Paths     Full stack with chat-demo, nightly
 ```
+
+### What the dry run tests that unit tests cannot
+- The pipeline assembles SSE events in the correct order (seq 0 → 1 → 2 → COMPLETED)
+- The SLM correctly classifies the message in context (real Anthropic call)
+- Session state is correctly mutated by the complete node chain
+- Multi-turn conversations work correctly across turns
+- All error fallback paths complete gracefully (COMPLETED event always emitted)
+- Filter delta accumulation over multiple turns is correct
 
 ---
 
@@ -241,10 +243,157 @@ pytest tests/model_eval/property_search/ --real-model -v
 
 ---
 
+## CHAT-Q-DRY-005: Unit test suite for classification requirements (REQ-CLS-*)
+**Sprint:** 1 | **SP:** 8 | **Status:** ⬜
+
+Write a test for every REQ-CLS-* requirement in `requirements-test-matrix.md`. All currently marked ⬜.
+
+**Tests to implement (see matrix for exact test names):**
+- REQ-CLS-005: domain router returns out_of_scope when confidence < 0.65
+- REQ-CLS-006: domain router falls back to last_domain on timeout
+- REQ-CLS-012: `clarification_needed: ""` coerced to None
+- REQ-CLS-013: reasoning field ≤30 words
+- REQ-CLS-014: calculator main_intent accepted in property_detail domain
+- REQ-CLS-015: multi_intent bypasses domain guard check
+
+**File:** `tests/unit/nodes/test_validate_slm_node.py`, `test_route_domain_node.py`
+
+---
+
+## CHAT-Q-DRY-006: Unit test suite for processing node requirements (REQ-PROC-*)
+**Sprint:** 1 | **SP:** 8 | **Status:** ⬜
+
+All REQ-PROC-* marked ⬜ in the requirements matrix.
+
+**Tests to implement:**
+- REQ-PROC-004 + 005: price string parsing ("80L" → 8M, "2cr" → 20M)
+- REQ-PROC-008: sanitize preserves universal keys on pivot
+- REQ-PROC-010: derive skips sqft conversion if price already set
+- REQ-PROC-012: clarify_node sets bot_response (short-circuit)
+- REQ-PROC-014: resolve_entities context boost (+0.15 for carousel entity)
+- REQ-PROC-017 + 018: route Tier 0 (out_of_scope) + Tier 1 contact_seller (template only, no CRM)
+- REQ-PROC-019: route Tier 2 (no LLM)
+- REQ-PROC-021: route Tier 3b → Sonnet
+- REQ-PROC-022: recent_searches has requires_auth=False
+- REQ-PROC-023: saved_properties requires_auth=True
+
+**File:** `tests/unit/nodes/test_route_node.py`, `test_filter_apply_node.py`, `test_sanitize_node.py`, `test_derive_node.py`, `test_clarify_node.py`
+
+---
+
+## CHAT-Q-DRY-007: Dry run test suite for response + SSE requirements (REQ-RESP-*)
+**Sprint:** 2 | **SP:** 8 | **Status:** ⬜
+
+All REQ-RESP-* marked ⬜ in the requirements matrix. These MUST use `run_dry_pipeline()` — unit tests cannot verify SSE ordering.
+
+**Tests to implement:**
+- REQ-RESP-006: locality_carousel emitted for trending_localities
+- REQ-RESP-008: carousel seq = 0 if no summary
+- REQ-RESP-012: phone numbers blocked by validate_output
+- REQ-RESP-014: markdown tables blocked for non-comparison intents
+- REQ-RESP-016: unknown bot_response shape → safe error SSE
+- REQ-RESP-017 + 018: connection_ack first, COMPLETED last (every scenario)
+- REQ-RESP-020: text-only intent has single phase (seq:0, COMPLETED)
+- REQ-RESP-021: short-circuit emits single event
+
+**File:** `tests/dry_run/test_sse_event_structure.py`, `tests/unit/nodes/test_validate_output_node.py`
+
+---
+
+## CHAT-Q-DRY-008: Dry run test suite for session state requirements (REQ-SESS-*)
+**Sprint:** 2 | **SP:** 5 | **Status:** ⬜
+
+Multi-turn tests — these MUST use `run_dry_pipeline()` with `session=` param for Turn 2+.
+
+**Tests to implement:**
+- REQ-SESS-001: city inferred from locality
+- REQ-SESS-002: transaction_type inferred from price scale  
+- REQ-SESS-006: srset_id stored after search
+- REQ-SESS-007: recent_searches stored with token_id
+- REQ-SESS-008: optimistic lock conflict returns False
+- REQ-SESS-009: turns trimmed at 20
+- REQ-SESS-010: summary triggered after turn 20
+
+**File:** `tests/dry_run/test_session_state_mutation.py`, `tests/unit/helpers/test_session_state.py`
+
+---
+
+## CHAT-Q-DRY-009: Dry run test suite for SLM classification requirements (REQ-SLM-*)
+**Sprint:** 2 | **SP:** 5 | **Status:** ⬜
+
+These combine unit tests (shape validation) and dry run tests (full classification).
+
+**Tests to implement:**
+- REQ-SLM-005: Hindi price units ("80 lakhs" → 8M)
+- REQ-SLM-007 + 008: BHK ADD semantics
+- REQ-SLM-009: pivot detection
+- REQ-SLM-011: calculator domain routing
+
+**File:** `tests/dry_run/test_classification_flows.py`, `tests/unit/nodes/test_classify_node.py`
+
+---
+
+## CHAT-Q-DRY-010: Unit tests for all ⬜ API contract requirements (REQ-API-*)
+**Sprint:** 2 | **SP:** 5 | **Status:** ⬜
+
+- REQ-API-001 → 003: session token, migrate-chat
+- REQ-API-004 → 005: history pagination with cursor
+- REQ-API-008 → 009: rate limiting per user type
+- REQ-API-010: error SSE has valid ErrorCode
+
+**File:** `tests/unit/api/test_chat_endpoints.py`
+
+---
+
+## CHAT-Q-DRY-011: Unit tests for tool contract requirements (REQ-TOOL-*)
+**Sprint:** 2 | **SP:** 3 | **Status:** ⬜
+
+- REQ-TOOL-004 → 006: cache TTL, searchProperties not cached, getSavedProperties invalidation
+- REQ-TOOL-007: contact_seller no CRM call
+- REQ-TOOL-008: getNearbyLandmarks truncation
+
+**File:** `tests/unit/tools/test_tool_executor.py`, `tests/unit/tools/test_cache.py`
+
+---
+
+## Model Eval Cases — Minimum Required
+
+@rahul owns writing the labeled eval cases. These are the ground truth for SLM accuracy.
+
+### Format
+`tests/model_eval/{domain}/cases.jsonl` — one JSON object per line:
+```json
+{"id": "case_001", "input": {"message": "show me 2bhk in bandra", "history": [], "active_filters": {}, "previous_intent": null, "previous_domain": null}, "expected": {"domain": "property_search", "confidence_min": 0.85}, "calibration": {"strict_fields": ["domain"], "soft_fields": []}, "tags": ["primary"], "notes": "Basic property search"}
+```
+
+### Minimum counts and coverage requirements
+
+| Domain | Min cases | Must include |
+|---|---|---|
+| domain_router | 100 | ≥20 Hindi, ≥10 ordinal refs, ≥10 low-confidence, ≥10 cross-domain |
+| property_search | 150 | ≥30 Hindi price units, ≥20 pivot cases, ≥15 ADD semantics, ≥10 multi-filter |
+| property_detail | 80 | ≥20 ordinal refs to property, ≥15 contact_seller, ≥10 floor_plan |
+| locality | 100 | ≥25 disambiguation, ≥15 commute, ≥10 Hindi, ≥10 comparison |
+| project_research | 60 | ≥20 named project, ≥10 builder query, ≥10 pricing |
+| portfolio | 50 | ≥10 auth-gated, ≥10 Hindi, ≥10 recent_searches (no auth) |
+
+### Edge cases that MUST be in every domain's eval set
+- Empty string input → out_of_scope (insufficient_info)
+- Prompt injection attempt → out_of_scope
+- Pure Hindi message
+- Hinglish (mixed)
+- BHK expressed as words ("two bedroom flat" / "do kamre ka")
+- Ordinal reference to prior turn ("the second one" / "doosra wala")
+- Context-dependent (same message different intent depending on session)
+
+---
+
 ## QA Principles
 
-1. **Test with real data shapes** — use actual API responses captured from staging, not invented payloads
-2. **Test error paths as carefully as happy paths** — the system is only as reliable as its fallbacks
-3. **SLM eval cases are living documentation** — add a case every time a production misclassification is found
-4. **Never mock Anthropic in integration tests** — the prompt engineering must be validated against the real model
-5. **Performance tests are not optional** — the LLM concurrency gate must be validated before Sprint 4 closes
+1. **Requirements traceability**: every REQ-* in the matrix has a test. No requirement without a test.
+2. **Dry run is the integration standard**: "tests in isolation" means dry run, not unit test alone
+3. **Test with real data**: scenario fixtures use real Mumbai localities and realistic prices
+4. **Test error paths equally**: the system is only as reliable as its worst failure mode
+5. **SLM eval cases are living documentation**: add a case every time a misclassification is found in production
+6. **Never mock Anthropic in Layer 1 or 3**: the prompt engineering must be validated against the real model
+7. **Performance gate before release**: load test (CHAT-Q-018) must pass before Sprint 4 closes

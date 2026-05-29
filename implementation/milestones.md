@@ -58,7 +58,12 @@
 | CHAT-A-009: ChatEventToUser Pydantic model + emit_sse | @arjun | 3 | ⬜ |
 | CHAT-Q-001: Node unit test scaffold + make_base_state factories | @rahul | 3 | ⬜ |
 | CHAT-Q-002: Unit tests — classification nodes (safety, normalize, route_domain, classify, validate_slm) | @rahul | 5 | ⬜ |
-| **Sprint 1 Total** | | **75 SP** | |
+| CHAT-Q-DRY-001: DryRunExecutor — fixture-based tool executor | @priya | 3 | ⬜ |
+| CHAT-Q-DRY-002: 10 scenario JSON files (QA authors) | @rahul | 5 | ⬜ |
+| CHAT-Q-DRY-003: BOT_ENV=mock wiring + `make dry-run` CLI | @arjun | 2 | ⬜ |
+| **Sprint 1 Total** | | **85 SP** | |
+
+> **Dry Run Exit Criteria (added):** `make dry-run SCENARIO=2bhk_bandra_search MSG="show me 2bhk in bandra"` runs without VPN and prints SSE events with correct classification.
 
 > **Note:** Sprint 1 is heavy because it sets up the whole pipeline skeleton. @priya will pair with @arjun on the adapter injection pattern. @rahul starts writing tests as nodes are committed — not waiting for Sprint 4.
 
@@ -84,8 +89,8 @@
 | CHAT-P-027: fetch_data_node — parallel group execution with asyncio.gather | @priya | 5 | ⬜ |
 | CHAT-P-028: respond_node — build_template_events (all TEMPLATE_BUILDERS) | @priya | 5 | ⬜ |
 | CHAT-P-029: SUMMARY_BUILDERS registry + all builder functions | @priya | 3 | ⬜ |
-| CHAT-P-030: Tier 1 actions — execute_tier1_action (contact_seller, save_property, save_alert) | @priya | 5 | ⬜ |
-| CHAT-P-031: Tier 2 actions — execute_tier2_action (portfolio, calculator) | @priya | 3 | ⬜ |
+| CHAT-P-030: Tier 1 actions — execute_tier1_action (contact_seller=template only, save_property, save_alert) | @priya | 3 | ⬜ |
+| CHAT-P-031: Tier 2 actions — execute_tier2_action (portfolio, calculator); recent_searches uses token_id (no login), others require auth | @priya | 3 | ⬜ |
 | CHAT-P-032: resolve_entities_node — real autosuggest + session entity tracking | @priya | 5 | ⬜ |
 | CHAT-P-033: Wire tool cache (Redis TTLs from TOOL_REGISTRY) | @priya | 3 | ⬜ |
 | CHAT-A-010: Kafka producer — publish messages from followup_node | @arjun | 3 | ⬜ |
@@ -99,7 +104,8 @@
 | CHAT-Q-003: Unit tests — processing nodes (filter_apply, sanitize, derive, clarify, resolve_entities, route) | @rahul | 5 | ⬜ |
 | CHAT-Q-004: Integration tests — tool executors hit real APIs (smoke test, not load test) | @rahul | 5 | ⬜ |
 | CHAT-Q-005: Unit tests — response nodes (summary, respond, build_prompt, followup) | @rahul | 5 | ⬜ |
-| **Sprint 2 Total** | | **108 SP** | |
+| CHAT-Q-DRY-004: Intent identification test suite (10 scenario flows, mocked tools) | @rahul | 5 | ⬜ |
+| **Sprint 2 Total** | | **113 SP** | |
 
 > **Note:** Sprint 2 is the largest sprint. @priya focuses on tools; @arjun focuses on persistence + concurrency. @rahul tests as tickets are completed, not after.
 
