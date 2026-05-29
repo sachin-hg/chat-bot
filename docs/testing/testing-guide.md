@@ -135,7 +135,7 @@ async def test_validate_slm_node_coerces_string_localities():
 
 ```python
 class MockClassifier:
-    """Stub ClassifierPort for testing graph nodes without real Gemini calls."""
+    """Stub ClassifierPort for testing graph nodes without real Anthropic calls."""
     def __init__(self, response: dict):
         self._response = response
 
