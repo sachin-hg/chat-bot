@@ -22,7 +22,8 @@ src/registries/
 ├── intent_registry.py     # INTENT_REGISTRY list[IntentRecord]
 ├── tool_registry.py       # TOOL_REGISTRY list[ToolRecord]
 ├── filter_registry.py     # FILTER_REGISTRY list[FilterRecord]
-└── helpers.py             # get_intent_record(), get_tool_record(), get_data_fetch_plan()
+├── helpers.py             # get_intent_record(), get_tool_record(), get_data_fetch_plan()
+└── model_registry.py      # MODEL_REGISTRY dict + ModelAssignment, QualityContract, CostProfile, build_adapter()
 ```
 
 **See:** `docs/registries/intent-registry.md`, `docs/registries/tool-registry.md`, `docs/registries/filter-registry.md`
@@ -32,12 +33,39 @@ src/registries/
 - [ ] `get_data_fetch_plan("property_search", "filter_search")` returns `[DataRequirement(tool='searchProperties', ...)]`
 - [ ] All 70+ IntentRecords implemented (use the docs as spec)
 - [ ] All 30+ ToolRecords implemented with correct `input_params`, `cache_ttl_seconds`, `llm_visible`
-- [ ] `build_intent_taxonomy_block(domain)` generates the SLM prompt Section 2 from registry
+- [ ] `build_intent_taxonomy_block()` generates the SLM prompt Section 2 from registry (no domain argument — generates full cross-domain taxonomy; domain scoping is done at the file level by CHAT-P-005)
 - [ ] `build_filter_delta_block(domain)` generates Section 3
 - [ ] Registry integrity check runs on startup (see `docs/pipeline/registry-integrity.md`)
+- [ ] src/registries/model_registry.py created with full MODEL_REGISTRY dict from docs/models/model-registry.md
+- [ ] build_adapter(assignment: ModelAssignment) → Protocol instance works for all task_ids
 
 **Technical Notes:**  
 The docs contain the full registry in Python dataclass syntax. Copy-translate directly. The registry must be runnable on Python import — no external I/O.
+
+---
+
+## CHAT-P-001b: build_graph() factory function
+**Sprint:** 1 | **SP:** 2 | **Blocked by:** CHAT-P-015
+
+src/pipeline/graph.py — the factory that wires all 19 nodes with their injected adapters.
+
+def build_graph(
+    emit_sse: Callable,
+    executor: CachedExecutorPort,
+    router: DomainRouterPort,
+    classifier: ClassifierPort,
+    llm: LLMPort,
+    composer: LLMPromptComposerProtocol,
+    session_store: SessionStorePort,
+    registry: RegistryPort,
+) -> CompiledGraph:
+    # All add_node() calls use functools.partial for injection
+    # See docs/pipeline/response-nodes.md Graph Wiring section for full list
+
+Acceptance Criteria:
+- [ ] All 19 nodes wired with correct partial injections
+- [ ] DryRunExecutor can be passed as executor (BOT_ENV=mock path)
+- [ ] graph.compile() produces a runnable graph
 
 ---
 
@@ -186,7 +214,7 @@ Key implementation guidance per node:
 - `filter_apply_node`: ADD vs REPLACE semantics from FILTER_REGISTRY; CHAT-A-008 must be done first (needs session store)
 - `derive_node`: price_per_sqft → absolute range conversion; landmark anchor → lat/lng via autosuggest
 - `resolve_entities_node`: ordinal resolution (carousel_state) + autosuggest for named entities
-- `route_node`: reads from INTENT_REGISTRY `tier`, `requires_auth`, `model`; must handle all 5 tiers
+- `route_node`: reads from INTENT_REGISTRY `tier`, `requires_auth`, `model`; must handle all 5 tiers; `build_login_template_response(main_intent, sub_intent)` helper implemented — reads from `_LOGIN_PROMPT` dict, returns dict with text + template fields. Called by route_node when requires_auth=True and no auth_token.
 - `summary_node`: SUMMARY_BUILDERS dispatch; eagerness guard (entity confidence ≥ 0.70)
 - `build_prompt_node`: FOLLOWUP_PROMPT_BLOCKS dispatch; reads prompt files; constructs LLMContext
 - `llm_node`: AnthropicStreamingAdapter; residual tool handling; sequence number calc
@@ -265,6 +293,37 @@ class SearchPropertiesExecutor(HttpToolExecutor):
 
 **Wire format translation** is documented in `docs/llm/tool-contracts.md` "Orchestrator API Translation" section.
 
+### CHAT-P-025: Tool executors — getProjectDetail, getProjectPriceTrends
+**Sprint:** 2 | **SP:** 3 | **Status:** ⬜
+
+getProjectDetail (Venus — VENUS_BASE_URL), getProjectPriceTrends (Gandalf — GANDALF_BASE_URL)
+
+### CHAT-P-026: Tool executors — getRecommendations, getSavedProperties, getViewedProperties
+**Sprint:** 2 | **SP:** 3 | **Status:** ⬜
+
+## CHAT-P-026b: Tool executors — missing tools
+**Sprint:** 2 | **SP:** 5 | **Status:** ⬜
+
+The following TOOL_REGISTRY tools have no executor ticket and are required for full taxonomy support:
+
+| Tool | Backend | Base URL setting | Intents |
+|---|---|---|---|
+| getTransactionHistory | gandalf | GANDALF_BASE_URL | locality/transaction_data, comparison/compare_projects |
+| getDemandSupplyInsight | casa | CASA_BASE_URL | locality/market_insight, locality_comparison |
+| getTravelTime | regions | REGIONS_BASE_URL | locality/commute_time |
+| getPriceBuckets | khoj | KHOJ_BASE_URL | locality/price_fairness |
+| getFilterSuggestions | data | DATA_BASE_URL | locality/filter_suggestions |
+| getCollections | data | DATA_BASE_URL | property_search/discovery_collections |
+| getPopularCityLandmarks | data | DATA_BASE_URL | locality/city_orientation |
+| getTopSocieties | seo | SEO_BASE_URL | locality/top_societies |
+| getRecentlyViewed | data | DATA_BASE_URL | portfolio/recently_viewed_cross_session |
+| getTrendingProjects | odin | ODIN_BASE_URL | project_research/trending_projects |
+
+Acceptance Criteria:
+- [ ] Each executor follows HttpToolExecutor base class pattern (CHAT-P-016)
+- [ ] Wire format translation from docs/llm/tool-contracts.md Orchestrator API Translation section
+- [ ] GANDALF_BASE_URL, REGIONS_BASE_URL, DATA_BASE_URL, SEO_BASE_URL added to Settings and .env.example
+
 ---
 
 ## CHAT-P-034: HandoffContext at session init
@@ -302,6 +361,8 @@ When `conv:turns` LLEN reaches 20, trigger async Haiku summarization call off th
 ## CHAT-P-036: A/B experiment_node — ExperimentConfig hot-reload
 **Sprint:** 4 | **SP:** 3 | **Status:** ⬜
 
+**Note:** CHAT-P-011 builds a pass-through stub only (no ACTIVE_EXPERIMENTS loading). CHAT-P-036 in Sprint 4 adds the full hot-reload + ExperimentConfig logic. The stub must wire the node correctly in the graph but can return {} always.
+
 **Description:**  
 Load `experiments.yaml` from config dir. Hot-reload every 60s (file watcher or periodic poll). `experiment_node` resolves active experiments for this session.
 
@@ -329,3 +390,9 @@ The system prompt is assembled from:
 - Registry-generated taxonomy in `prompts/slm/domains/` (auto-generated on startup)
 
 Never edit generated sections — edit the registry and re-run `make generate-prompts`.
+
+### locality_comparison is NOT in SUMMARY_BUILDERS (Tier 3b, text-only)
+`locality_research/locality_comparison` is Tier 3b (Sonnet). It is a text-only synthesis intent — no template cards are emitted before the LLM response. Therefore:
+- It must NOT be in SUMMARY_BUILDERS (no Phase 1 summary)
+- Its FOLLOWUP_PROMPT_BLOCKS entry should point to `prompts/llm/main/comparison.md` (not followup/)
+This was incorrect in docs/pipeline/response-nodes.md. The registry has been corrected.

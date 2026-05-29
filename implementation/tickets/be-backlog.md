@@ -45,18 +45,19 @@ Create Alembic migration that builds the full schema from `docs/operations/db-sc
 
 **Schema to implement:**
 - `conversations` table (see db-schema.md lines 46–90)
-- `messages` table with `PARTITION BY RANGE (created_at)` (see db-schema.md lines 92–150)
+- `messages` table with `PARTITION BY RANGE (created_at)` (see db-schema.md lines 92–150); messages table columns include: ... `template_id`, **`request_id UUID` (for distributed tracing — injected from BotState.request_id by Kafka consumer)**, `content JSONB`
 - Monthly partition for current month + 2 future months
 - All indexes from db-schema.md
 - Trigger: `fn_update_conversation_on_message()` (updates `turn_count` and `updated_at`)
-- pg_partman extension setup (or manual partitions if pg_partman not available in Docker)
-- All enums: `conversation_status`, `message_type_enum`, `sender_type_enum`, `message_state_enum`
+- Extensions: `pgcrypto` (for `gen_random_uuid()` default), `pg_partman`, **`pg_cron`** (requires `shared_preload_libraries = 'pg_cron'` in PostgreSQL config — add to Docker Compose `POSTGRES_INITDB_ARGS`)
+- All enums: `conversation_status`, `message_type_enum`, `sender_type_enum`, `message_state_enum`, **`transaction_type_enum AS ENUM ('buy', 'rent')`**
 
 **Acceptance Criteria:**
 - [ ] `make migrate` runs clean from empty DB
 - [ ] `make migrate` is idempotent (safe to run twice)
 - [ ] `EXPLAIN ANALYZE SELECT ... FROM messages WHERE conversation_id = X ORDER BY created_at DESC LIMIT 20` shows index scan (not seq scan)
 - [ ] Trigger fires correctly: inserting a user message increments `conversations.turn_count`
+- [ ] `UPDATE partman.part_config SET retention = '90 days', retention_keep_table = FALSE WHERE parent_table = 'public.messages'` runs as part of migration
 
 **Technical Notes:**  
 For local setup, use manual monthly partitions (skip pg_partman). Document the production migration path in a comment. See `docs/operations/db-schema.md` for exact DDL.
@@ -96,13 +97,19 @@ class Settings(BaseSettings):
     autosuggest_base_url: str
     
     # Application
-    bot_env: Literal["local", "staging", "production"] = "local"
+    bot_env: Literal["mock", "local", "staging", "production"] = "local"
     log_level: str = "INFO"
     secret_key: SecretStr
     
     # LLM
     llm_max_concurrent: int = 20
     llm_queue_max: int = 50
+    
+    login_service_url:       str                    # Housing login service for token validation
+    kafka_consumer_group:    str = "chat-db-writer"
+    langchain_tracing_v2:    bool = False
+    langchain_api_key:       Optional[SecretStr] = None
+    langchain_project:       str = "housing-bot-local"
     
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 ```
@@ -202,6 +209,8 @@ async def send_message_streamed(
 - [ ] `/cancel` request mid-stream causes the generator to stop cleanly
 - [ ] If LangGraph raises, emits `error` SSE event and closes stream (does not return 500)
 - [ ] `streamingEnabled=false` query param falls back to A4 non-streaming response
+- [ ] After graph exits (success or error), emit connection_close: { reason: "response_complete" | "error" | "cancelled" }
+- [ ] out_of_scope SSE event type supported: emitted by route_node when domain mismatch detected; closes stream without connection_close
 
 ---
 
@@ -250,8 +259,9 @@ async def validate_login_token(login_auth_token: str) -> str | None:
 Add `LOGIN_SERVICE_URL` to `.env.example`.
 
 **Acceptance Criteria:**
-- [ ] Anonymous: generates `token_id` (UUID4), stores in `conversations.token_id`
-- [ ] Response: `{"conversationId": "uuid", "tokenId": "uuid", "isNew": true}`
+- [ ] Anonymous — first visit: generates token_id (UUID4), creates conversation, returns {"conversationId": "uuid", "tokenId": "uuid", "isNew": true}
+- [ ] Anonymous — return visit: if X-Token-ID header present AND conversation exists for that token → return {"conversationId": "uuid", "tokenId": "uuid", "isNew": false}
+- [ ] Response always includes tokenId (FE stores this in houzy_token cookie): {"conversationId": "uuid", "tokenId": "uuid", "isNew": true/false}
 - [ ] Logged-in: validates `Login-Auth-Token` via login service; maps to `user_id`
 - [ ] If login service is down: fall back to anonymous flow (log warning)
 - [ ] Session initialized in Redis with empty state on conversation creation
@@ -340,6 +350,36 @@ def sse_frame(event_type: str, data: dict) -> str:
 
 ## CHAT-A-010 → CHAT-A-017: (See milestones.md Sprint 2 tickets)
 
+### CHAT-A-010: Kafka producer
+**Sprint:** 2 | **SP:** 3 | **Status:** ⬜
+
+**Acceptance Criteria:**
+- [ ] On publish failure: message goes into local in-memory ring buffer (max 500 entries)
+- [ ] Background worker retries every 5 seconds for up to 60 attempts (5 minutes)
+- [ ] After max retries: write to dead-letter log file (logs/kafka_dead_letter.jsonl) and emit alert metric kafka_dead_letter_count
+- [ ] Ring buffer survives the SSE request lifecycle (does not block SSE response)
+
+---
+
+## CHAT-A-016: LLM concurrency gate (Redis token bucket + queue)
+**Sprint:** 2 | **SP:** 5
+
+Redis keys:
+  llm:concurrent:count   → atomic integer via INCR/DECR; max = LLM_MAX_CONCURRENT (default 20 local / 120 prod)
+  llm:queue              → List (RPUSH enqueue, BLPOP dequeue); max length = LLM_QUEUE_MAX (default 50 local / 300 prod)
+
+Behavior:
+  - acquire_llm_slot(): atomic EVAL — if count < max, INCR and return True; else check queue length
+  - If queue full → emit error SSE { code: "rate_limited", recoverable: true, retry_after: 3 }
+  - If queue has space → RPUSH item; BLPOP wait (max LLM_QUEUE_MAX_WAIT ms = 8000ms default)
+  - release_llm_slot(): DECR count + PUBLISH llm:slot_available
+
+Acceptance Criteria:
+- [ ] 20 concurrent LLM calls work simultaneously locally
+- [ ] 21st request queues and completes when a slot frees
+- [ ] Queue overflow returns 503-style error SSE (not HTTP 503 — stream is already open)
+- [ ] All values configurable via Settings: LLM_MAX_CONCURRENT, LLM_QUEUE_MAX, LLM_QUEUE_MAX_WAIT_MS
+
 ---
 
 ## CHAT-A-018: /api/v1/chat/migrate-chat endpoint
@@ -348,6 +388,21 @@ def sse_frame(event_type: str, data: dict) -> str:
 **Description:**  
 `POST /api/v1/chat/migrate-chat?currentConversationId=<id>` — creates a new conversation carrying over session context.  
 See `docs/api/endpoints.md` Part A6.
+
+---
+
+## CHAT-A-024: POST /api/v1/chat/send-message (non-streaming, A4)
+**Sprint:** 2 | **SP:** 2 | **Status:** ⬜
+
+Silent user_action endpoint. FE sends this for responseRequired: false actions (shortlistProperty, removeFromShortlist) where no SSE stream is needed.
+
+Response: { "statusCode": "2XX", "responseCode": "SUCCESS", "data": { "messageId": "uuid", "messageState": "COMPLETED" } }
+
+Acceptance Criteria:
+- [ ] Returns JSON (not SSE) synchronously after graph runs
+- [ ] Handles shortlistProperty, removeFromShortlist Tier 1 actions
+- [ ] Returns 429 with Retry-After header if rate limit exceeded
+- [ ] Publishes to Kafka same as A3 path
 
 ---
 

@@ -84,7 +84,7 @@ Validate all non-property templates render correctly.
 
 **Templates to validate:**
 - `locality_carousel` — locality cards with rating, price trend, quick actions
-- `floor_plan_carousel` — image gallery + floor plan image
+- floor_plan intent → renders as markdown text with image links (NO template event emitted — it is text-only). Validate that `property_detail/floor_plan` produces a text chat_event with markdown content, NOT a template event.
 - `nested_qna` — question chips (e.g. "Rent or Buy?") render and submitting a selection works
 - `share_location` — location permission button renders; user granting location triggers next turn
 - `login` — login CTA renders for auth-gated portfolio intents (anonymous user)
@@ -119,7 +119,7 @@ User actions submitted via `POST /api/v1/chat/send-message` with `responseRequir
 - `contact_seller_confirmed` — tapping Confirm on the contact_seller template → triggers BE contactSeller API call → bot responds with success text
 - `location_shared` — user grants location → sends coordinates → next turn uses location for explore_nearby
 - `nested_qna_selection` — user taps a chip → correct `filter_delta` applied in next turn
-- `applyFilter` — quick filter chip tap (e.g. "Furnished only") → new search executes
+- Quick filter chip tap → sends `nested_qna_selection` user_action with the filter value (e.g. furnishing: 'furnished') — NOT a separate applyFilter action. Validate this sends the correct action type.
 
 **For each:**
 - [ ] Correct `ChatEventFromUser` shape sent
