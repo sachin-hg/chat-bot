@@ -18,6 +18,30 @@ Five conversational products share a single UI entry point. They differ fundamen
 
 **Key distinction:** Support Human Chat and User-Seller Chat are not bots. They are message relay channels. They have no intent classification, no LLM calls, and no AI pipeline. Calling them "bots" is a naming mistake that drives unnecessary architectural complexity.
 
+The diagram below shows how the routing gateway directs each service to its protocol — SSE for AI bots, WebSocket for relay channels.
+
+```mermaid
+graph LR
+    GW[Routing Gateway]
+
+    subgraph SSE["AI Bots — SSE (stateless per turn)"]
+        SD[Search & Discovery]
+        SM[Seller Management]
+        SA[Support Agent]
+    end
+
+    subgraph WS["Relay — WebSocket (persistent connection)"]
+        SH[Support Human Chat]
+        US[User-Seller Chat]
+    end
+
+    GW -->|RouteResponse: SSE endpoint| SD
+    GW -->|RouteResponse: SSE endpoint| SM
+    GW -->|RouteResponse: SSE endpoint| SA
+    GW -->|RouteResponse: WS endpoint| SH
+    GW -->|RouteResponse: WS endpoint| US
+```
+
 ---
 
 ## Unified Entry Point
@@ -195,6 +219,19 @@ At any given time the client holds exactly one active connection.
         IDLE → query gateway → returns to prior bot mode
 ```
 
+The state machine below formalises the client connection lifecycle — the client holds exactly one connection at a time, switching between IDLE, SSE_CONNECTED, and WS_CONNECTED states.
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> SSE_CONNECTED : gateway returns SSE endpoint\n(search_discovery / seller_mgmt / support_agent)
+    SSE_CONNECTED --> SSE_CONNECTED : turn completes, new POST for next message
+    SSE_CONNECTED --> IDLE : mode switch → query gateway
+    IDLE --> WS_CONNECTED : gateway returns WS endpoint\n(user_seller_chat / support_human)
+    WS_CONNECTED --> IDLE : session ends
+    IDLE --> [*]
+```
+
 **SSE per-turn lifecycle (AI bot modes):**
 - `connection_ack` — stream opened, pre-fetch complete
 - `message_delta` × N — LLM streaming chunks
@@ -337,6 +374,23 @@ provides: {
 requires: {
   active_ticket_id: required,
 }
+```
+
+The sequence below illustrates a full handoff flow — from an out-of-scope signal in Service A, through the gateway's routing decision, to Service B's context-aware opening message.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as Service A (e.g. search_discovery)
+    participant G as Routing Gateway
+    participant B as Service B (e.g. support_agent)
+
+    U->>A: "I bought Housing Premium but my RM hasn't called"
+    A->>A: out_of_scope signal (support topic)
+    A->>G: out_of_scope + HandoffContext{summary, entities}
+    G->>G: SLM routes → support_agent
+    G->>B: RouteResponse{endpoint, session_token, handoff_context}
+    B-->>U: "I see you recently purchased Premium. Are you following up on RM assignment?"
 ```
 
 ### Receiving Service Acknowledgment

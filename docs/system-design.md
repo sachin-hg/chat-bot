@@ -14,6 +14,51 @@ Housing.com is transitioning to a fully conversational model. All users land on 
 
 **This is a hybrid architecture.** AI bots use SSE. Real-time relay channels use WebSocket. See `sse-vs-websocket.md` for the reasoning behind each choice.
 
+The diagram below shows the full system — clients connect through a routing gateway to either AI bot services (SSE) or relay services (WebSocket), all backed by shared infrastructure.
+
+```mermaid
+graph TB
+    subgraph Client
+        FE[Chat Frontend]
+    end
+
+    subgraph Gateway
+        GW[Routing Gateway\nConnection Broker]
+    end
+
+    subgraph AI Bots — SSE
+        SD[Search & Discovery Bot\nLangGraph Pipeline]
+        SM[Seller Management Bot]
+        SA[Support Agent Bot]
+    end
+
+    subgraph Relay Services — WebSocket
+        SH[Support Human Chat]
+        US[User-Seller Chat]
+    end
+
+    subgraph Shared Infrastructure
+        PG[(PostgreSQL\nChat History)]
+        RD[(Redis Cluster\nSession State)]
+        KF[(Kafka\nAsync Writes)]
+        MG[(MongoDB\nif migrated)]
+    end
+
+    FE -->|1 handshake per session| GW
+    GW -->|SSE endpoint| SD
+    GW -->|SSE endpoint| SM
+    GW -->|SSE endpoint| SA
+    GW -->|WS endpoint| SH
+    GW -->|WS endpoint| US
+
+    SD --> PG
+    SD --> RD
+    SD --> KF
+
+    style SD fill:#4a9eff,color:#fff
+    style GW fill:#f59e0b,color:#fff
+```
+
 ---
 
 ## 1. Transport Architecture
@@ -118,6 +163,27 @@ The AI bots emit three event types on the stream:
 
 ## 5. Session State
 
+The sequence below traces the exact data flow for a single user turn — from the frontend POST through Redis, Kafka, the LangGraph pipeline, and back to the client via SSE.
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend
+    participant App as FastAPI Pod
+    participant RD as Redis
+    participant LLM as Claude API
+    participant KF as Kafka
+    participant PG as PostgreSQL
+
+    FE->>App: POST /chat/send-message
+    App->>RD: load session (~1ms)
+    App->>KF: publish user message (fire-and-forget)
+    App->>App: run LangGraph pipeline
+    App-->>FE: SSE stream (connection_ack → events → COMPLETED)
+    App->>KF: publish bot messages (fire-and-forget)
+    Note over App,FE: HTTP response closes after COMPLETED
+    KF->>PG: batch INSERT messages (async, ~100ms delay)
+```
+
 State is managed per-conversation, not per-connection.
 
 **Hot state (Redis):** Active session data available within a single TCP round-trip. Keyed by `conversation_id`. TTL refreshed on activity.
@@ -127,6 +193,31 @@ State is managed per-conversation, not per-connection.
 `BotState` is a `TypedDict` that flows through the LangGraph graph in memory during a single turn. It is not a Redis state machine with named states. The Redis/PostgreSQL "state machine" with `BOT_ACTIVE`, `P2P_ACTIVE` named states was a prior design that was replaced by the LangGraph approach.
 
 ### Redis Key Space
+
+The diagram below maps the full Redis key taxonomy across the four functional namespaces — session state, LLM gate, tool cache, and rate limiting.
+
+```mermaid
+graph LR
+    subgraph session["Session State (TTL: 24h)"]
+        S1[session:{id}]
+        S2[conv:context:{id}]
+        S3[conv:turns:{id}]
+        S4[conv:summary:{id}]
+    end
+    subgraph gate["LLM Gate"]
+        G1[llm:concurrent:count]
+        G2[llm:queue]
+    end
+    subgraph cache["Tool Cache (various TTLs)"]
+        C1[cache:tool:property:{id}]
+        C2[cache:tool:locality:{id}]
+        C3[cache:tool:...]
+    end
+    subgraph rl["Rate Limiting (TTL: 60s)"]
+        R1[ratelimit:chat:{token}]
+        R2[ratelimit:llm:{token}]
+    end
+```
 
 ```
 session:{session_id}              → {user_id, conversation_id, node_id}     TTL: 24h

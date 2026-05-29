@@ -72,3 +72,79 @@ Adding a new intent → 8 places to update. Adding a new tool → 5 places. A ne
 
 ---
 
+The diagram below shows the full LangGraph pipeline as a left-to-right node graph, with SLM classification nodes highlighted in amber, SSE-emitting nodes in green, and the LLM node in blue.
+
+```mermaid
+graph LR
+    S([safety]) --> N([normalize])
+    N --> RD([route_domain\nStage 1 SLM\n~40ms])
+    RD --> CL([classify\nStage 2 SLM\n~120ms])
+    CL --> VS([validate_slm])
+    VS --> FA([filter_apply])
+    FA --> SA([sanitize])
+    SA --> DE([derive])
+    DE --> CLA([clarify])
+    CLA --> RE([resolve_entities])
+    RE --> RT([route\nTier 0/1/2/3])
+    RT --> SU([summary\nPhase 1 SSE])
+    SU --> EX([experiment])
+    EX --> FD([fetch_data])
+    FD --> RS([respond\nPhase 2 SSE])
+    RS --> BP([build_prompt])
+    BP --> LLM([llm\nPhase 3 SSE])
+    LLM --> VO([validate_output])
+    VO --> FO([followup])
+
+    style RD fill:#f59e0b,color:#000
+    style CL fill:#f59e0b,color:#000
+    style SU fill:#10b981,color:#fff
+    style RS fill:#10b981,color:#fff
+    style FO fill:#10b981,color:#fff
+    style LLM fill:#4a9eff,color:#fff
+```
+
+The diagram below shows how the route node short-circuits for Tier 0–2 requests and follows the full LLM path only for Tier 3.
+
+```mermaid
+graph TD
+    RT[route_node]
+    RT -->|Tier 0 out_of_scope| SC0[emit_final_state\ncanned response]
+    RT -->|Tier 1 direct action| SC1[emit_final_state\nexecute + respond]
+    RT -->|Tier 2 orchestrator| SC2[emit_final_state\nfetch + format]
+    RT -->|Tier 3a/3b LLM| LLM[summary → experiment\n→ fetch_data → respond\n→ build_prompt → llm\n→ validate_output → followup]
+
+    style SC0 fill:#ef4444,color:#fff
+    style SC1 fill:#f59e0b,color:#000
+    style SC2 fill:#f59e0b,color:#000
+    style LLM fill:#4a9eff,color:#fff
+```
+
+The diagram below illustrates the adapter injection pattern — each port interface is bound to a concrete adapter at startup via `functools.partial`, keeping graph nodes decoupled from I/O implementations.
+
+```mermaid
+graph TD
+    subgraph graph["LangGraph StateGraph"]
+        RDN[route_domain_node]
+        CLN[classify_node]
+        FDN[fetch_data_node]
+        LN[llm_node]
+        FWN[followup_node]
+    end
+
+    subgraph adapters["Injected at startup via functools.partial"]
+        DR[DomainRouterPort\nAnthropicChatAdapter]
+        CP[ClassifierPort\nAnthropicChatAdapter]
+        TE[CachedExecutorPort\nHttpToolExecutor]
+        LP[LLMPort\nAnthropicStreamingAdapter]
+        EM[emit_sse: Callable]
+    end
+
+    DR -->|router=| RDN
+    CP -->|classifier=| CLN
+    TE -->|executor=| FDN
+    LP -->|llm=| LN
+    EM -->|emit_sse=| FWN
+```
+
+---
+

@@ -54,6 +54,12 @@
 ### Operations
 | Doc | What's in it |
 |---|---|
+| [Database — Index](operations/database.md) | Entry point for all DB docs |
+| [DB Schema](operations/db-schema.md) | PostgreSQL schema, Redis keys, Kafka topics, write path |
+| [DB Capacity](operations/db-capacity.md) | Traffic model, storage projections, instance sizing |
+| [DB Decisions](operations/db-decisions.md) | Why these databases, mental model, QnA reassessment framework |
+| [DB Operations](operations/db-operations.md) | LLM concurrency gate, partition maintenance |
+| [DB Migration](operations/db-migration.md) | Live migration playbook: Postgres-only → Postgres + MongoDB |
 | [Resilience](operations/resilience.md) | Timeouts, retries, circuit breakers, fallbacks |
 | [Observability](operations/observability.md) | Metrics, cost tracking, logging, SLOs, alerts |
 | [Cost Optimisation](operations/cost-optimization.md) | Token reduction, model selection, caching, self-hosted economics |
