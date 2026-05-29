@@ -136,10 +136,14 @@ Domain is stored in `conv:state.chat_domain`. Changing domain changes the system
 The LangGraph `StateGraph` pipeline for every turn:
 
 ```
-safety → normalize → classify → validate_slm → filter_apply → sanitize →
+safety → normalize → route_domain → classify → validate_slm → filter_apply → sanitize →
 derive → clarify → resolve_entities → route → summary → experiment →
 fetch_data → respond → build_prompt → llm → validate_output → followup
 ```
+
+`route_domain` (Stage 1) routes to a coarse domain in ~40ms with ~200 tokens.
+`classify` (Stage 2) runs the domain-scoped intent classifier in ~120ms with ~800 tokens.
+For `out_of_scope` domain: Stage 2 is skipped entirely — zero token cost.
 
 Node responsibilities:
 - `classify`: SLM produces `classification` dict (sees last 3 turns)

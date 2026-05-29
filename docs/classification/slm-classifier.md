@@ -1,81 +1,251 @@
-# SLM Intent Classifier — Design & Prompt
+# SLM Intent Classifier — Two-Stage Cascade Design & Prompt
 
-## Role
+## Architecture Overview
 
-The SLM classifier is the **second stop** in the request pipeline (after Tier 0 regex safety check). It runs on every user message that survives Tier 0 and produces a structured classification that drives:
+Classification runs as a **two-stage cascade**:
 
-1. **Tier routing** — Tier 1 (no AI), Tier 2 (orchestrator direct), Tier 3a/3b (Haiku/Sonnet)
-2. **Model selection** — `entities_mentioned` feeds `getModelForIntent()` (derived from `INTENT_REGISTRY`) to choose Haiku vs Sonnet
-3. **Tool set selection** — `main_intent` + `sub_intent` maps to `getResidualTools()` (derived from `INTENT_REGISTRY`; `getToolsForIntent` is a kept alias)
-4. **Filter delta** — `filter_delta` tells the orchestrator what changed vs what to preserve
+```
+Stage 1 — Domain Router       Stage 2 — Domain-Scoped Classifier
+───────────────────────       ──────────────────────────────────
+Prompt:  ~200 tokens          Prompt: ~800 tokens (domain-specific)
+Output:  domain + confidence  Output: full SLMOutput JSON
+Latency: ≤40ms                Latency: ≤120ms
+Node:    route_domain_node    Node: classify_node
+```
 
-**Model:** `claude-haiku-4-5-20251001 (current; Gemini Flash as benchmark candidate)`
-**Latency budget:** ≤ 150ms (classification only, no tool calls)
-**Prompt cache:** Sections 1–4 are static per registry version — prime cache on cold start. Cache key includes `registry_hash` (SHA256 of INTENT_REGISTRY + FILTER_REGISTRY JSON); cache is invalidated and re-primed automatically on registry change.
+**Why the cascade:**
+- The full INTENT_REGISTRY across all domains is ~2,500 tokens. At scale (10M calls/day) this costs ~$2,000/day in cached reads.
+- Domain-specific taxonomy files are ~800 tokens each — 68% cheaper for the same quality.
+- Domains are independently cacheable: adding a `locality` sub-intent only invalidates the locality domain cache. All other domain caches stay warm.
+- Adding new domains or intents never bloats sibling domains. The taxonomy scales horizontally instead of vertically.
 
-The pipeline calls the classifier through `ClassifierPort` (see `solid-architecture.md` — Adapter Interfaces). Swapping the underlying model (Haiku → Gemini Flash) requires only a new adapter implementing this protocol — no pipeline node changes.
+**Protocol interfaces** (see `solid-architecture.md` — Adapter Interfaces):
+- Stage 1: `DomainRouterPort` injected into `route_domain_node`
+- Stage 2: `ClassifierPort` injected into `classify_node`
 
-> **Architecture note:** The intent taxonomy injected into this prompt (Section 2) is generated
-> from `INTENT_REGISTRY` at startup. The filter delta rules (Section 3) are generated from
-> `FILTER_REGISTRY`. Do not edit these sections directly — edit the registries.
-> See [solid-architecture.md](./solid-architecture.md) for the full registry definitions and the
-> `registry_hash` cache-key rule (Part 5 — Middleware Pipeline, Template Rendering Rules section).
+Swapping the underlying model requires only a new adapter — no pipeline changes.
+
+---
+
+## Domains
+
+```
+property_search    browsing inventory, filter changes, collection search, save alerts
+property_detail    specific property: gallery, floor plan, EMI, contact seller, similar
+locality           locality research, trends, commute, locality comparison
+project_research   new-launch projects, builders, project price trends
+portfolio          personal activity: saved, viewed, recent searches, recommendations
+out_of_scope       chitchat, safety, gibberish — Stage 2 skipped entirely
+```
 
 ---
 
 ## Model & Cost Profile
 
-**Current model:** `claude-haiku-4-5-20251001`
-**Benchmark candidate:** Gemini Flash (~5–10× cheaper at $0.075/1M input vs $0.80/1M). Switch only after passing the accuracy evaluation suite on the full domain test set.
+**Model (both stages, current):** `claude-haiku-4-5-20251001`
+**Authoritative model assignment:** `MODEL_REGISTRY` in `solid-architecture.md` Part 15. The model can be changed per domain independently without touching any prompt or pipeline node — update the relevant `intent_classifier_<domain>` or `domain_router` entry and register the adapter.
+**Benchmark candidate:** Gemini Flash (~5–10× cheaper). Switch only after passing the per-domain accuracy evaluation suite and meeting the `QualityContract` thresholds in MODEL_REGISTRY.
 
-**Token budget per classification call:**
-- Static system prompt (Sections 1–4, cached): ~2,500 tokens
-- Per-request input (session context + user message): ~200 tokens
-- Output (JSON + reasoning): ~150 tokens average
-- Estimated cost: ~$0.40 per 1,000 classifications (Haiku, mostly uncached input + output)
-- Gemini Flash equivalent: ~$0.04 per 1,000. Switch only after accuracy validation.
+**Token budget per classification turn:**
 
-Note: The `reasoning` field adds ~40 output tokens per call. At 100k daily classifications this is ~4M extra output tokens/day (~$1.20/day on Haiku). Cap reasoning strings at 50 words.
+| | Stage 1 | Stage 2 | Total |
+|---|---|---|---|
+| Static prompt (cached) | ~170 tokens | ~770 tokens | ~940 tokens |
+| Per-request input | ~30 tokens | ~170 tokens | ~200 tokens |
+| Output | ~12 tokens | ~130 tokens | ~142 tokens |
+| **Total** | **~212 tokens** | **~1,070 tokens** | **~1,282 tokens** |
+
+vs. old monolithic single-call: ~2,650 tokens total. **Saving: ~52% per turn.**
+
+For `out_of_scope` turns (Stage 2 skipped): only Stage 1 fires → ~212 tokens total, ~92% saving.
+
+Estimated cost at 10M calls/day (cache-read rate):
+- Old: 10M × 2,650 × $0.08/1M = **$2,120/day**
+- New: 10M × 1,282 × $0.08/1M = **$1,026/day** → **$394K/year saving**
 
 ---
 
-## Resilience
+## Stage 1 — Domain Router
 
-`classify_node` wraps the SLM call with `asyncio.wait_for(timeout=2.0)`. On timeout or 5xx after 2 retries (tenacity exponential backoff, max 2 attempts), the pipeline short-circuits with `main_intent: 'out_of_scope', sub_intent: 'out_of_scope_query'` — serving a "I'm having trouble understanding that right now" response rather than hanging the user. The timeout event is logged as `slm_classification_timeout` and counted toward the alert threshold.
+### Prompt: `prompts/slm/domain_router.md`
 
-The SLM HTTP client is shared across requests via a connection pool (not re-instantiated per turn).
+This file is entirely static (never changes per-request) — it is always served from the prompt cache after the first request of each 5-minute window.
+
+```
+You are a domain router for a real estate chat platform.
+Classify the user message into exactly one domain.
+
+DOMAINS:
+  property_search    — finding, browsing, or filtering properties from live inventory.
+                       BHK, price, locality, amenity, property type, listing type filters.
+                       "show me 2bhk in powai under 80L", "furnished apartments in Bandra"
+
+  property_detail    — information about a specific named or active property.
+                       Photos, floor plan, EMI, contact seller, similar properties.
+                       "show me photos", "what's the EMI", "connect with seller"
+
+  locality           — locality or area research, trends, commute, locality comparison.
+                       "what's Powai like", "compare Andheri and Bandra", "commute from Vikhroli"
+
+  project_research   — new-launch housing projects or specific builders.
+                       "tell me about Lodha Palava", "trending projects in Pune"
+
+  portfolio          — user's own activity: saved, viewed, recent searches, recommendations.
+                       "my saved properties", "show my recent searches", "recommendations for me"
+
+  out_of_scope       — chitchat, greetings, off-topic, gibberish, or genuine ambiguity.
+
+RULES:
+  - Output ONLY the JSON below. No prose.
+  - If the message fits two domains equally, pick the one more specific to the user's action.
+  - If confidence < 0.65 for all domains, output out_of_scope.
+  - "this property", "the third one", "it" → use PREVIOUS_DOMAIN as a strong prior.
+
+OUTPUT:
+{ "domain": "<domain>", "confidence": <0.0-1.0> }
+```
+
+### Per-request input injected:
+
+```
+PREVIOUS_DOMAIN: property_search
+LAST_INTENT: filter_search
+USER: "show me 2bhk in powai"
+```
+
+### Output:
+```json
+{ "domain": "property_search", "confidence": 0.97 }
+```
+
+### Resilience
+
+`route_domain_node` uses `asyncio.wait_for(timeout=0.5)`. On timeout or 5xx, defaults to the session's `last_domain` if available, otherwise `out_of_scope`. Logged as `domain_router_timeout`. Max 1 retry (fast timeout — no value retrying a slow call).
+
+---
+
+## Stage 2 — Domain-Scoped Classifiers
+
+Each domain has its own prompt file. These are generated from INTENT_REGISTRY and FILTER_REGISTRY at startup (same auto-generation as before, now domain-scoped).
+
+### Prompt structure (per domain)
+
+```
+[SECTION 1: Role + Output Schema]        ← static, shared across all domain prompts
+[SECTION 2: Domain Taxonomy]             ← generated from INTENT_REGISTRY for this domain
+[SECTION 3: Filter Delta Rules]          ← generated from FILTER_REGISTRY for this domain
+[SECTION 4: Disambiguation Examples]     ← curated per domain
+[SECTION 5: Per-request context]         ← UNCACHED: message + history + active filters
+```
+
+> **NOTE: Sections 2 and 3 are auto-generated** from INTENT_REGISTRY and FILTER_REGISTRY at startup.
+> Do not edit domain prompt files directly — edit the registries.
+> See `solid-architecture.md` Part 5 for the `registry_hash` cache-key rule.
+
+### Domain Prompt Files
+
+| Domain | Prompt file | Intents covered |
+|---|---|---|
+| `property_search` | `prompts/slm/domains/property_search.md` | filter_search, explore_nearby, discovery_collections, save_alert |
+| `property_detail` | `prompts/slm/domains/property_detail.md` | property_about, floor_plan, similar_properties, contact_seller, save_property, calculate_emi, nearby_landmarks |
+| `locality` | `prompts/slm/domains/locality.md` | trending_localities, locality_comparison, locality_overview, price_trends, commute_time, ratings_reviews, market_insight, price_fairness, filter_suggestions, top_societies, city_orientation; comparison/compare_localities |
+| `project_research` | `prompts/slm/domains/project_research.md` | project_overview, project_price_trends, ratings_reviews, trending_projects; comparison/compare_projects |
+| `portfolio` | `prompts/slm/domains/portfolio.md` | saved_properties, viewed_properties, recent_searches, recommendations, recently_viewed_cross_session |
+
+### Cache behaviour
+
+Each domain prompt is cached under its own key: `sha256(domain_prompt_content)`. Updating `locality` intents invalidates only the locality domain cache. `property_search` cache stays warm. On deploy, only changed domain caches need to be re-primed.
+
+### Resilience
+
+Timeout and retry counts come from MODEL_REGISTRY (`timeout_ms`, `max_retries`) — not hardcoded:
+- Stage 1 (`domain_router`): 500ms timeout, 1 retry. Fallback: use session's `last_domain`.
+- Stage 2 (`intent_classifier_<domain>`): 2,000ms timeout, 2 retries. Fallback: `out_of_scope_query`.
+
+On final failure in either stage, logged as `domain_router_timeout` or `slm_classification_timeout`.
+
+The SLM HTTP client is shared across both stages via a single connection pool (not re-instantiated per turn).
 
 ---
 
 ## Logging Spec
 
-Per classification call, emit:
+Two events per turn (Stage 1 always; Stage 2 only when domain ≠ out_of_scope):
 
+**Stage 1 — `domain_routing`:**
 ```json
 {
-  "event":                 "slm_classification",
-  "request_id":            "string",
-  "main_intent":           "string",
-  "sub_intent":            "string",
-  "entity_count":          "integer",
-  "filter_keys_count":     "integer",
-  "clarification_needed":  "boolean",
-  "pivot":                 "boolean",
-  "latency_ms":            "integer",
-  "model":                 "string",
-  "registry_hash":         "string"
+  "event":           "domain_routing",
+  "request_id":      "string",
+  "domain":          "string",
+  "confidence":      "float",
+  "latency_ms":      "integer",
+  "model":           "string",
+  "previous_domain": "string | null",
+  "router_hash":     "string"
 }
 ```
+
+**Stage 2 — `slm_classification`:**
+```json
+{
+  "event":                "slm_classification",
+  "request_id":           "string",
+  "domain":               "string",
+  "main_intent":          "string",
+  "sub_intent":           "string",
+  "entity_count":         "integer",
+  "filter_keys_count":    "integer",
+  "clarification_needed": "boolean",
+  "pivot":                "boolean",
+  "latency_ms":           "integer",
+  "model":                "string",
+  "domain_hash":          "string"
+}
+```
+
+`domain_hash` is the SHA256 of the domain-specific prompt file — changes when that domain's taxonomy changes.
 
 ---
 
 ## Evaluation Framework
 
-Maintain a ground-truth test set of ≥500 labeled examples: `(message, session_context, expected_main_intent, expected_sub_intent)`. Run after every INTENT_REGISTRY change or prompt edit.
+**Two eval suites — one per stage:**
 
-**Targets:** ≥95% exact match on `main_intent`, ≥90% on `sub_intent`.
+### Stage 1 Eval (Domain Router)
 
-Track per-intent recall to catch per-class regressions. A drop in `locality_research` recall while overall accuracy holds often means the new intent is cannibalizing it.
+≥200 labeled examples: `(message, previous_domain, expected_domain)`.
+
+**Targets:** ≥98% domain accuracy (5-way classification is much simpler than full intent).
+
+Key test cases:
+- Pronoun references: "this property" → `property_detail` (not `property_search`)
+- Cross-domain signals: "compare Andheri and Bandra prices" → `locality` (not `property_search`)
+- Ambiguous: "show me 2bhk" alone → `property_search` at 0.95 confidence
+- Low-confidence: single-word "hi" → `out_of_scope`
+
+Alert if domain router false-positive rate on primary intents (`property_search`) exceeds 3% — this means users are getting 2 SLM calls for common queries.
+
+### Stage 2 Eval (Domain-Scoped Intent Classifier)
+
+≥300 labeled examples per domain (≥1,500 total): `(message, session_context, domain, expected_main_intent, expected_sub_intent, expected_filter_delta)`.
+
+**Targets per domain:**
+- ≥95% exact match on `sub_intent` within the domain
+- ≥90% filter delta key accuracy (correct keys extracted)
+
+Domain-scoped evals catch regressions without cross-domain noise. A drop in `locality/commute_time` recall is now visible without it being masked by high `property_search` volume.
+
+### Alerts (10-minute rolling window, both stages)
+
+| Metric | Warning | Critical |
+|---|---|---|
+| Stage 1 `domain_router_timeout` | > 0.5% | > 2% |
+| Stage 1 `out_of_scope` rate | > 5% | > 10% |
+| Stage 2 `slm_classification_timeout` | > 0.5% | > 2% |
+| Stage 2 `cross_domain_intent` rejections | > 1% | > 3% |
+| Stage 2 `clarification_needed` rate | > 10% | > 20% |
+| Stage 2 `unknown_intent` events | > 0 | — |
 
 **Alert thresholds** (production monitoring, rolling 10-minute window):
 - `out_of_scope` rate > 5%: may indicate regression or prompt injection campaign
@@ -87,13 +257,25 @@ Track per-intent recall to catch per-class regressions. A drop in `locality_rese
 
 ## Taxonomy Update Checklist
 
-When adding a new intent:
-1. Add `IntentRecord` to `INTENT_REGISTRY` in `solid-architecture.md`
+**Adding a new intent to an existing domain:**
+1. Add `IntentRecord` to `INTENT_REGISTRY` in `solid-architecture.md` (under the correct domain)
 2. Add `ToolRecord`(s) to `TOOL_REGISTRY` if the intent requires new API calls
-3. Add examples to `slm/examples/<intent>.md` (positive AND negative)
-4. Re-run the evaluation suite (target ≥95% main_intent, ≥90% sub_intent)
-5. Re-prime the prompt cache (the taxonomy block regenerates automatically from the registry)
+3. Add examples to `slm/examples/<domain>/<intent>.md` (positive AND negative)
+4. Re-run Stage 2 eval for that domain only (target ≥95% sub_intent within domain)
+5. Re-prime that domain's prompt cache (auto-regenerates; other domain caches unaffected)
 6. Update `FOLLOWUP_PROMPT_BLOCKS` and `SUMMARY_BUILDERS` in `solid-architecture.md`
+7. Update `DOMAIN_MAIN_INTENTS` in `solid-architecture.md` if new `main_intent` is added
+
+**Adding a new domain:**
+1. Add `DomainType` literal in `solid-architecture.md`
+2. Add domain description to `prompts/slm/domain_router.md` (Stage 1 prompt)
+3. Add `IntentRecord`(s) to `INTENT_REGISTRY`
+4. Create `prompts/slm/domains/<new_domain>.md` prompt file
+5. Add entry to `DOMAIN_TAXONOMY_PROMPTS` dict in `classify_node`
+6. Add entry to `DOMAIN_MAIN_INTENTS` dict in `validate_slm_node`
+7. Run Stage 1 eval (domain router — must reach ≥98% for all 5+ domains including new one)
+8. Run Stage 2 eval for new domain (≥95% sub_intent target)
+9. Re-prime both Stage 1 (domain router) and new domain's Stage 2 caches
 
 ---
 
@@ -588,6 +770,13 @@ Multi-intent:
 
 Field rules:
 
+  reasoning
+    Brief explanation (≤30 words) of which rule fired.
+    MUST be ≤30 words. Output tokens for reasoning cost ~$0.40/1000 calls — keep it concise.
+    Example: "BHK=2, locality=Powai, scale implies buy, filter_search"
+    NOT: "The user asked to see properties with 2 bedrooms in the Powai area of Mumbai,
+         which is a locality in the state of Maharashtra, India..."
+
   pivot
     true when main_intent changed from the previous turn's main_intent.
     Signals the orchestrator to run sanitize_filters_on_pivot() — which clears
@@ -600,6 +789,9 @@ Field rules:
     null when the message is unambiguous and can be fully resolved.
     String (the question text to ask the user) when the bot must ask before proceeding.
     Examples: "Which city are you looking in?", "Rent or buy?", "Did you mean Andheri or Andhra?"
+
+    MUST NOT output empty string "". If you have nothing to ask, output null.
+    The orchestrator treats any non-null, non-empty string as a clarification trigger.
 
     NOTE: this is a plain string, NOT an object. The orchestrator's validate_slm_node
     normalises it and separately populates clarification_data (object with type/options).
@@ -652,6 +844,13 @@ Field rules:
     2. Pre-resolution trigger — orchestrator resolves each entity via autosuggest
        BEFORE the LLM call, injecting UUID/project_id into session state.
        (See Orchestrator: Entity Pre-Resolution below.)
+
+    Ordinal references ("the 3rd one", "second property") should be extracted as
+    __ordinal_N__ tokens in entities_mentioned so the orchestrator can resolve them
+    against the last-seen carousel.
+    Hindi ordinals: "pehla" = 1st, "doosra/doosri" = 2nd, "teesra/teesri" = 3rd,
+    "chautha/chauthi" = 4th. Extract the ordinal number and output it as __ordinal_N__.
+    Example: "doosri locality dikhao" → entities_mentioned contains ordinal reference 2.
 
   filter_delta
     **This section is auto-generated from FILTER_REGISTRY at startup via `build_filter_delta_block()`. Do not edit directly — edit the registry instead.**
@@ -757,6 +956,23 @@ Field rules:
 
     "any budget"
       → { price_max: null, price_min: null }     ← RELAX both bounds
+
+    ── FILTER ENUM RULES ─────────────────────────────────────────
+
+    construction_status
+      REPLACE. Values: ready_to_move | under_construction.
+      "ready to move" → ready_to_move
+      "ready" alone in property context → ready_to_move
+      "under construction" | "new launch" → under_construction
+      Hindi signals: "ready property" / "tayaar ghar" → ready_to_move
+
+    property_type
+      REPLACE. Values: apartment | builder_floor | plot | villa | independent_house.
+      "flat" | "apartment" → apartment
+      "builder floor" | "independent floor" → builder_floor
+      "plot" | "land" → plot
+      "villa" | "bungalow" → villa
+      "independent house" | "kothi" → independent_house
 ```
 
 ---

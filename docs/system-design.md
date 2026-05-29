@@ -91,10 +91,12 @@ Buyer/User ──── WSS /chat/connect ──── WS Gateway ──── S
 All three AI bots run the same LangGraph `StateGraph` pipeline. `BotState` is a `TypedDict` that flows through each node. The nodes execute in this order:
 
 ```
-safety → normalize → classify → validate_slm → filter_apply → sanitize →
+safety → normalize → route_domain → classify → validate_slm → filter_apply → sanitize →
 derive → clarify → resolve_entities → route → summary → experiment →
 fetch_data → respond → build_prompt → llm → validate_output → followup
 ```
+
+Classification is a two-stage cascade: `route_domain` (Stage 1, ~200 tokens, domain router) feeds `classify` (Stage 2, ~800 tokens, domain-scoped intent classifier). Total: ~1,280 tokens vs the former 2,650-token monolithic call — 52% cheaper, independently scalable per domain.
 
 `solid-architecture.md` owns the detailed implementation of each node, the registry design, and the prompt composition strategy.
 

@@ -386,60 +386,104 @@ const CONTEXT_TURNS: Record<'haiku' | 'sonnet', number> = {
 
 The system is not locked to Anthropic. Different tasks suit different models. The right choice is based on benchmarked accuracy for our classification taxonomy + cost per task.
 
+### Model Registry — Single Source of Truth
+
+All model assignments live in `MODEL_REGISTRY` in `solid-architecture.md` Part 15. Every task has a `task_id`, current `model_id`, `QualityContract`, `CostProfile`, and `fallback_behavior`. The adapters implement `DomainRouterPort`, `ClassifierPort`, or `LLMPort` — graph nodes never reference provider SDKs directly.
+
+**Switching a model = updating MODEL_REGISTRY + registering an adapter. No pipeline changes, no prompt changes.**
+
+See `solid-architecture.md` Part 15 for: `ModelAssignment` schema, `PROVIDER_ADAPTERS` registry, `SelfHostedChatAdapter`, `ModelRouter` (A/B integration), and promotion quality gates.
+
+---
+
+### Cost at 1M Messages/Day (Current Model Assignments)
+
+Assumptions: 15% out_of_scope (Stage 1 only), 85% reach Stage 2; 70% of non-OOS reach Tier 3 LLM; 10% of Tier 3 uses Sonnet; 5% of sessions trigger async summarisation.
+
+| Task | Daily calls | Daily cost | Dominant factor |
+|---|---|---|---|
+| Stage 1 — domain router | 1,000,000 | ~$29 | Output tokens (12 × $4/1M × 1M calls) |
+| Stage 2 — property_search classifier | ~425,000 | ~$220 | Output tokens |
+| Stage 2 — property_detail classifier | ~170,000 | ~$80 | Output tokens |
+| Stage 2 — locality classifier | ~128,000 | ~$65 | Output tokens |
+| Stage 2 — project_research classifier | ~43,000 | ~$20 | Output tokens |
+| Stage 2 — portfolio classifier | ~85,000 | ~$35 | Smallest domain, lowest cost |
+| **Stage 2 subtotal** | ~851,000 | **~$420** | |
+| LLM Tier 3a (Haiku) | ~630,000 | ~$430 | Balanced: cache reads + output |
+| LLM Tier 3b (Sonnet) | ~70,000 | ~$462 | **7% of calls, 30% of LLM cost** |
+| Conversation summariser | ~50,000 | ~$15 | Async, off critical path |
+| **Total** | | **~$1,356/day** | **~$495K/year** |
+
+**Key insight: Tier 3b (Sonnet) is the largest single lever.** 7% of calls generates 34% of total AI cost. Strategies:
+1. Tighten Tier 3b routing — comparison intents should require TWO explicit named entities before routing to Sonnet; ambiguous comparison queries fall back to Haiku
+2. Benchmark Sonnet for comparison vs a fine-tuned Haiku — quality delta may not justify 20× cost difference for straightforward locality comparisons
+3. Self-hosted model for comparison synthesis (if quality bar is met)
+
+**SLM cascade saving vs old monolithic single call:**
+
+| | Old (monolithic) | New (cascade) | Saving |
+|---|---|---|---|
+| SLM daily cost | ~$620/day | ~$449/day | **~$171/day (~$62K/year)** |
+| Driver | Output tokens: 150 × 1M × $4/1M = $600 | Stage 1 output: 12 tokens; Stage 2 output: ~100 tokens (850K calls) | 27% output token reduction |
+
+---
+
 ### Provider Comparison by Task
 
-| Task | Anthropic | OpenAI | Google | Recommended |
-|---|---|---|---|---|
-| **SLM classification** (Tier 2) | **Haiku 4.5 — current** — $0.80/1M in | GPT-4o-mini — $0.15/1M in | Gemini Flash — $0.075/1M in | **Haiku is current model.** Gemini Flash is the primary benchmark candidate (5–10x cheaper); run full classification accuracy suite before switching |
-| **Tier 3a single-tool** (Haiku calls) | **Haiku 4.5 — current** | GPT-4o-mini | Gemini Flash | **Haiku is current.** Gemini Flash is benchmark candidate — cheaper, but verify tool call fidelity before switching |
-| **Tier 3b complex reasoning** (Sonnet) | Sonnet 4.6 + prompt caching | GPT-4o — no equivalent caching | Gemini 1.5 Pro — 1M context | **Claude Sonnet** (caching advantage is decisive — see below) |
-| **Conversation summary** | Haiku | GPT-4o-mini | Gemini Flash | **Gemini Flash** (cheapest, good summarization quality) |
-| **Support sentiment** | Haiku | GPT-4o-mini | Gemini Flash | **Gemini Flash** (binary classification, any model works; cost wins) |
-| **Support issue classification** | Haiku | GPT-4o-mini | Gemini Flash | **GPT-4o-mini** (consistent JSON schema output, good classification) |
+| Task (task_id) | Current | Best cost alternative | Blocking concern before switch |
+|---|---|---|---|
+| `domain_router` | Haiku | Any capable 7B model (self-hosted) | Must hit ≥98% on 5-way domain eval first |
+| `intent_classifier_property_search` | Haiku | Gemini Flash (10× cheaper) | Filter extraction accuracy — BHK/price/locality delta; run per-domain eval |
+| `intent_classifier_property_detail` | Haiku | Gemini Flash | Entity extraction (ordinal resolution, property names) |
+| `intent_classifier_locality` | Haiku | Gemini Flash | Locality name disambiguation (Andheri E vs W, etc.) |
+| `intent_classifier_project_research` | Haiku | Self-hosted (tiny domain, 5 sub-intents) | Low volume — cost barely matters; quality validation still required |
+| `intent_classifier_portfolio` | Haiku | Self-hosted (simplest domain, 5 sub-intents) | Almost any model works; prime candidate for first self-hosted deployment |
+| `llm_tier3a` | Haiku | Gemini Flash | Tool call format fidelity (getNearbyLandmarks mid-stream call) |
+| `llm_tier3b` | Sonnet | — | Prompt cache advantage is decisive; no provider match yet |
+| `conversation_summarizer` | Haiku | Gemini Flash or self-hosted | Any model that preserves entity names verbatim; easy switch |
 
-### Why Claude Sonnet Wins for Tier 3b Despite Higher Price
-
-Prompt caching is the deciding factor. Claude's prompt cache read cost is **10% of full input token cost**. No other provider has equivalent, reliable prompt caching at this level.
+### Why Sonnet Wins for Tier 3b — The Cache Math
 
 ```
-Cached sections per Tier 3b call:
-  System prompt (identity + rules): ~1,200 tokens
-  Tool definitions (intent-specific): ~300 tokens
-  Total cached: ~1,500 tokens
+Tier 3b Sonnet: 3,500 cached tokens per call
 
-At scale (1,000 Tier 3b calls/hour):
-  Without caching:  1,500 × 1,000 × $3.00/1M = $4.50/hour just on system tokens
-  With caching:     1,500 × 1,000 × $0.30/1M = $0.45/hour
-  Saving:           $4.05/hour — on system tokens alone
+At 70,000 calls/day:
+  Without caching: 3,500 × 70K × $3.00/1M  = $735/day
+  With caching:    3,500 × 70K × $0.30/1M  = $73.5/day
+  Caching saves: $661.5/day — just on the static system prompt
 
-Over a month at this scale: ~$2,916 savings just from prompt caching.
+GPT-4o: auto-caching, hash-based, not controllable. Cache hit rate ~30-40%.
+Gemini: explicit cache object API — different cache per session → no shared prompt cache benefit.
+Claude: prompt cache is shared across ALL requests with the same prefix. First 5-min window primes it; every request after is cache-read.
 ```
 
-GPT-4o has auto-caching but it's unreliable (cache key is hash-based, not controlled by you). Gemini has context caching, but it requires explicit cache object management per session — much higher implementation overhead with less benefit for our prompt structure.
+**Rule:** Use Claude (with prompt caching) whenever the system prompt exceeds ~1,000 tokens and is repeated across requests. Use cheaper models (or self-hosted) for classification tasks where the static prompt is small.
 
-**Rule:** Use Claude for any turn where the system prompt is large and repeated. Use cheaper models for stateless classification tasks with minimal system prompts.
+### Self-Hosted Model Strategy
 
-### Multi-Provider Implementation
+```
+Phase 1 (now — explore): portfolio classifier on self-hosted
+  - Simplest domain, 5 sub-intents, high accuracy bar easy to meet
+  - Candidate: Qwen2.5-7B-Instruct or Llama-3.1-8B-Instruct via vLLM
+  - GPU cost at single A100 (80GB): ~$2/hour = ~$48/day
+  - vs Haiku cost for portfolio classifier: ~$35/day
+  → Self-hosted is MORE expensive at 1M/day volume for a single domain.
+  → Break-even is when GPU handles 3+ domains simultaneously.
 
-The LLM Gateway abstracts over providers. Swapping models is a config change:
+Phase 2 (when volume justifies): 3-domain SLM on one GPU
+  - portfolio + project_research + property_detail classifiers on one vLLM instance
+  - Combined Haiku cost for these 3: ~$135/day
+  - GPU (2× A100): ~$96/day
+  → Break-even crossed. ~$40/day saving (~$15K/year) with full control.
 
-```typescript
-const MODEL_CONFIG = {
-  // SLM classifier currently uses Haiku. Gemini Flash is the primary benchmark candidate
-  // (5–10x cheaper) — switch only after validating accuracy on the domain classification test suite.
-  slm_classifier:        { provider: 'anthropic', model: 'claude-haiku-4-5-20251001' },
-  tier3a_haiku:          { provider: 'anthropic',  model: 'claude-haiku-4-5-20251001' },
-  tier3b_sonnet:         { provider: 'anthropic',  model: 'claude-sonnet-4-6' },
-  conversation_summary:  { provider: 'google',    model: 'gemini-1.5-flash-latest' },
-  support_sentiment:     { provider: 'google',    model: 'gemini-1.5-flash-latest' },
-  support_issue_class:   { provider: 'openai',    model: 'gpt-4o-mini' },
-  support_escalation:    { provider: 'google',    model: 'gemini-1.5-flash-latest' },
-} as const;
+Phase 3 (10M+ calls/day): dedicated GPU cluster for all classifiers
+  - All 5 domain classifiers + domain router on self-hosted
+  - Haiku cost at 10M/day: ~$4,490/day just for SLM
+  - GPU cluster (8× A100): ~$384/day
+  → Massive saving at scale. Quality validation is the gating factor, not cost.
 ```
 
-Each provider has its own adapter in the LLM Gateway that normalizes tool call format, streaming, and response parsing to a single internal interface. This isolates provider-specific quirks from the orchestrator logic.
-
-**Before switching any model:** run the full SLM classification test suite against the new model using the same test set. Accuracy on our domain-specific taxonomy (locality names, BHK modifiers, price formats, filter extraction) matters more than benchmark scores.
+**Self-hosted is not a cost win at 1M/day for a single domain. It becomes compelling at 3M+/day for multiple domains or when regulatory requirements demand on-premises inference.**
 
 ---
 

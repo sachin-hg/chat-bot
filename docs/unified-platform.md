@@ -10,7 +10,7 @@ Five conversational products share a single UI entry point. They differ fundamen
 
 | Service | Nature | Protocol | Owns AI? |
 |---|---|---|---|
-| Search & Discovery Bot | AI — complex NLP, 18-node LangGraph pipeline | SSE | Yes |
+| Search & Discovery Bot | AI — complex NLP, 19-node LangGraph pipeline (2-stage SLM cascade) | SSE | Yes |
 | Seller Property Management Bot | AI — write-heavy, listing CRUD | SSE | Yes |
 | Support Agent Bot | AI — KB + ticket routing | SSE | Yes |
 | Support Human Chat | Relay — human agent queue | WebSocket | No |
