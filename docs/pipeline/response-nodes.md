@@ -497,26 +497,46 @@ def build_params_from_entity(tool_name: str, entity: dict, session: dict) -> dic
 
 # ── execute_tier1_action ──────────────────────────────────────────────
 # Tier 1: direct orchestrator action, no LLM call.
-# Write-side tools (contactSeller, shortlistProperty, createSearchAlert) always emit
-# a confirmation card first; the action executes only after user taps "Confirm".
-# Returns a dict with 'template_id' key (e.g. 'shortlist_property', 'contact_seller')
-# or a plain text dict with 'text' key. emit_final_state handles the SSE wrapping.
-# Receives executor via partial injection at graph construction time.
+# Write-side tools (shortlistProperty, createSearchAlert) emit a confirmation card
+# first; the action executes only after user taps "Confirm".
+# contact_seller is template-only — no BE API call; FE handles seller contact directly.
+# Returns a dict with 'template_id' key or a plain text dict with 'text' key.
+# emit_final_state handles the SSE wrapping.
 async def execute_tier1_action(state: BotState, executor: CachedExecutorPort) -> dict:
-    c = state['classification']
+    c       = state['classification']
+    session = state['session']
+
+    # contact_seller: template-only — no API call.
+    # BE emits template with property_id + seller_id from session; FE handles everything.
+    if c['main_intent'] == 'property_detail' and c['sub_intent'] == 'contact_seller':
+        return build_contact_seller_template(session)
+
     TIER1_TOOL_MAP: dict[tuple[str, str], str] = {
         ('property_detail', 'save_property'):  'shortlistProperty',
         ('property_detail', 'remove_saved'):   'removeFromShortlist',
-        ('property_detail', 'contact_seller'): 'contactSeller',
         ('property_search', 'save_alert'):     'createSearchAlert',
     }
     tool_name = TIER1_TOOL_MAP.get((c['main_intent'], c['sub_intent']))
     if not tool_name:
         return build_out_of_scope_response(c)
-    params = build_params_from_session(tool_name, state['session'])
-    wired  = translate_to_wire_format(tool_name, params, state['session'])
+    params = build_params_from_session(tool_name, session)
+    wired  = translate_to_wire_format(tool_name, params, session)
     result = await asyncio.wait_for(executor.execute(tool_name, wired, ttl=0), timeout=5.0)
     return build_tier1_response(c, result)
+
+
+def build_contact_seller_template(session: dict) -> dict:
+    """Returns the bot_response dict for contact_seller — template only, no API call."""
+    return {
+        'template_id': 'contact_seller',
+        'data': {
+            'property_id':    session.get('active_property_id'),
+            'seller_id':      session.get('active_seller_id'),
+            'property_title': session.get('active_property_title', ''),
+            'price_display':  session.get('active_property_price_display', ''),
+        },
+        'source_message_state': 'COMPLETED',
+    }
 
 # ── execute_tier2_action ──────────────────────────────────────────────
 # Tier 2: orchestrator fetches + formats directly, no LLM.

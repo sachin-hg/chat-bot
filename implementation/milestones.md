@@ -123,7 +123,7 @@
 | CHAT-D-004: Validate property_carousel template render end-to-end | @dev | 3 | ⬜ |
 | CHAT-D-005: Validate locality_carousel, floor_plan_carousel, nested_qna renders | @dev | 3 | ⬜ |
 | CHAT-D-006: Validate login template render (auth-gated portfolio) | @dev | 2 | ⬜ |
-| CHAT-D-007: Validate user_action submissions (contact_seller_confirmed, location_shared) | @dev | 3 | ⬜ |
+| CHAT-D-007: Validate user_action submissions (contact_seller_confirmed, location_shared, nested_qna_selection) | @dev | 3 | ⬜ |
 | CHAT-D-008: GraphQL bridge check — validate all tool API response shapes against housing.brahmand | @dev | 5 | ⬜ |
 | CHAT-D-009: Error state handling (error SSE event, auth expired, rate_limited) | @dev | 2 | ⬜ |
 | CHAT-P-034: Handoff context acceptance — validate HandoffContext at session init | @priya | 3 | ⬜ |

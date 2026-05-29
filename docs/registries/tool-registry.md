@@ -35,9 +35,12 @@ from pydantic import BaseModel
 from typing import Literal, Optional
 
 ApiBackend = Literal[
-    'khoj',          # property search + price buckets
-    'casa',          # property detail (resale/rent), demand-supply, shortlist, contact
-    'venus',         # new-project detail, floor plans, brochure
+    'khoj',          # property search index (rent + resale listings)
+    'casa',          # rent/resale listing detail, shortlist, similar properties
+                     # NOTE: Casa listings may link to a Venus project via 'region_entity' field
+    'venus',         # new-launch project data: gallery, floor plans, brochure, amenities,
+                     #   highlights, pros/cons, sellers list, project overview
+                     #   Venus project_id = casa.region_entity when the listing is in a project
     'gandalf',       # price trends, transaction history
     'odin',          # locality detail, nearby landmarks, ratings, top societies, trending
     'autosuggest',   # entity resolution
@@ -162,13 +165,26 @@ TOOL_REGISTRY: list[ToolRecord] = [
   # ── Property Detail ─────────────────────────────────────────────────
   ToolRecord(
     name='getPropertyDetail',
-    description='Fetch full details for a specific property ID. Orchestrator routes to the correct backend service based on property_type.',
+    description=(
+        'Fetch full details for a rent/resale listing (Casa) or a new-launch project (Venus). '
+        'Orchestrator routes based on property_type from session.\n'
+        '\n'
+        'Casa (rent/resale):\n'
+        '  Response includes "region_entity" field — when non-null, this is the Venus project_id\n'
+        '  for the project this unit belongs to. Orchestrator optionally fetches Venus project data\n'
+        '  (getProjectDetail) in a parallel_group when region_entity is present.\n'
+        '\n'
+        'Venus (new-launch project):\n'
+        '  Primary source for project overview, gallery images, floor plans (getFloorPlans),\n'
+        '  brochure (getBrochure), sellers list, highlights, pros/cons, amenities.\n'
+        '  Use when user asks about a project directly or active_property_kind = "project".\n'
+    ),
     input_params=[
       # property_type and transaction_type are NOT LLM parameters — orchestrator injects
       # them from session state. The LLM never passes routing parameters to this tool.
       ToolParam(key='property_id', type='string', required=True, description='From searchProperties hits or active_property_id in session'),
     ],
-    return_schema_summary='{ property_id, title, price, area_sqft, bhk, amenities[], builder, possession_date, rera_id, coordinates: {lat,lng}, polygon_uuid, ... }',
+    return_schema_summary='{ property_id, title, price, area_sqft, bhk, amenities[], builder, possession_date, rera_id, region_entity (Venus project_id if applicable), coordinates: {lat,lng}, polygon_uuid, ... }',
     # Routing table — orchestrator resolves from session.active_property_kind:
     #   project      → Venus  /api/v9/new-projects/{id}/webapp
     #   resale       → Casa   /api/v2/flat/{id}/resale/details
@@ -195,9 +211,13 @@ TOOL_REGISTRY: list[ToolRecord] = [
   ),
   ToolRecord(
     name='getFloorPlans',
-    description='Get floor plan image URLs and room layout data for a property or project.',
+    description=(
+        'Get floor plan image URLs and room layout data. Venus-only — applies to new-launch '
+        'projects. For a Casa listing inside a project, use the region_entity (Venus project_id) '
+        'as the project_id parameter.'
+    ),
     input_params=[
-      ToolParam(key='property_id', type='string', required=True, description='Property or project ID'),
+      ToolParam(key='project_id', type='string', required=True, description='Venus project ID — from session.active_project_id or casa.region_entity'),
     ],
     return_schema_summary='{ floor_plans: [{ type, sqft, image_url, rooms }] }',
     api_backend='venus',
@@ -209,9 +229,9 @@ TOOL_REGISTRY: list[ToolRecord] = [
   ),
   ToolRecord(
     name='getBrochure',
-    description='Get the brochure download URL for a project.',
+    description='Get the brochure download URL for a new-launch project (Venus-only).',
     input_params=[
-      ToolParam(key='project_id', type='string', required=True, description='Project ID — resolved by pre-resolution from entities_mentioned'),
+      ToolParam(key='project_id', type='string', required=True, description='Venus project ID — from session.active_project_id or casa.region_entity'),
     ],
     return_schema_summary='{ brochure_url, file_size_mb, project_name }',
     api_backend='venus',
@@ -596,21 +616,12 @@ TOOL_REGISTRY: list[ToolRecord] = [
     write_side=True,
     llm_visible=False,   # Tier 1: orchestrator acts directly, no LLM
   ),
-  ToolRecord(
-    name='contactSeller',
-    description='Express user interest — triggers a seller callback or lead submission.',
-    input_params=[
-      ToolParam(key='property_id', type='string', required=True, description='Property ID'),
-      ToolParam(key='seller_id',   type='string', required=True, description='Seller/owner ID from property details'),
-    ],
-    return_schema_summary='{ success, lead_id, message }',
-    api_backend='casa',
-    cache_ttl_seconds=0,
-    response_truncation=ResponseTruncation(),
-    requires_auth=True,
-    write_side=True,
-    llm_visible=False,   # Tier 1: orchestrator confirms + acts, no LLM
-  ),
+  # contactSeller is intentionally absent.
+  # contact_seller intent = Tier 1 template-only: BE emits 'contact_seller' template with
+  # property_id + seller_id from session. No BE API call is made.
+  # The FE handles all seller contact interaction directly (shows phone/WhatsApp, calls
+  # its own vendor APIs). Venus provides the property data (getPropertyDetail, getFloorPlans,
+  # etc.) but no Venus CRM/lead-creation call is made by the BE.
   ToolRecord(
     name='getSavedProperties',
     description="Fetch the user's saved/shortlisted properties.",

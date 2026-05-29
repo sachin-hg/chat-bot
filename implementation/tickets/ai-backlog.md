@@ -210,17 +210,28 @@ The classification pipeline: Stage 1 router → Stage 2 classifier → validatio
 
 Each node in `docs/pipeline/processing-nodes.md` and `docs/pipeline/response-nodes.md` is a separate task. @priya assigns to sub-agents or implements directly.
 
-Key implementation guidance per node:
-- `filter_apply_node`: ADD vs REPLACE semantics from FILTER_REGISTRY; CHAT-A-008 must be done first (needs session store)
-- `derive_node`: price_per_sqft → absolute range conversion; landmark anchor → lat/lng via autosuggest
-- `resolve_entities_node`: ordinal resolution (carousel_state) + autosuggest for named entities
-- `route_node`: reads from INTENT_REGISTRY `tier`, `requires_auth`, `model`; must handle all 5 tiers; `build_login_template_response(main_intent, sub_intent)` helper implemented — reads from `_LOGIN_PROMPT` dict, returns dict with text + template fields. Called by route_node when requires_auth=True and no auth_token.
-- `summary_node`: SUMMARY_BUILDERS dispatch; eagerness guard (entity confidence ≥ 0.70)
-- `build_prompt_node`: FOLLOWUP_PROMPT_BLOCKS dispatch; reads prompt files; constructs LLMContext
-- `llm_node`: AnthropicStreamingAdapter; residual tool handling; sequence number calc
-- `validate_output_node`: `validate_bot_output(text, current_intent)` with intent_allowlist for markdown_table
-- `respond_node`: `build_template_events()`; TEMPLATE_BUILDERS dispatch
-- `followup_node`: final COMPLETED event; `registry.ping_session()`; conversation summary trigger
+**Doc references (mandatory reading before implementing each node):**
+- Processing nodes spec: `docs/pipeline/processing-nodes.md`
+- Response nodes spec: `docs/pipeline/response-nodes.md`
+- Registries: `docs/registries/intent-registry.md`, `docs/registries/filter-registry.md`, `docs/registries/tool-registry.md`
+- Session state: `docs/pipeline/pipeline-preamble.md` (BotState TypedDict)
+
+**Per-node Acceptance Criteria:**
+
+| Node | Ticket | Key AC | Doc section |
+|---|---|---|---|
+| `filter_apply_node` | CHAT-P-008 | ADD vs REPLACE semantics match FILTER_REGISTRY; pivot clears correct keys; `filter_delta_applied` set in state | processing-nodes.md §filter_apply |
+| `sanitize_node` | CHAT-P-009 | Sanity flags set; no price-range inversions after sanitize | processing-nodes.md §sanitize |
+| `derive_node` | CHAT-P-010 | price_per_sqft → absolute conversion; landmark anchor → lat/lng via autosuggest; ordinal flags set | processing-nodes.md §derive |
+| `clarify_node` | CHAT-P-010 | Emits `bot_response` with nested_qna template when `clarification_needed` set; pipeline short-circuits | processing-nodes.md §clarify |
+| `resolve_entities_node` | CHAT-P-011 | Ordinal resolution reads `carousel_state`; autosuggest called for named entities; context boost (+0.15) for carousel matches; disambiguation triggers clarification at < 0.15 score delta | processing-nodes.md §resolve_entities |
+| `route_node` | CHAT-P-012 | All 5 tiers handled; `requires_auth=True` + no token → `build_login_template_response()`; `routing` dict set in state | processing-nodes.md §route |
+| `summary_node` | CHAT-P-013 | SUMMARY_BUILDERS dispatch; eagerness guard (confidence ≥ 0.70); `summary_emitted` flag set; seq 0 emitted before fetch | response-nodes.md §summary |
+| `build_prompt_node` | CHAT-P-014 | FOLLOWUP_PROMPT_BLOCKS dispatch; reads prompt files; `LLMContext` populated; `is_followup` correct | response-nodes.md §build_prompt |
+| `llm_node` | CHAT-P-015 | Streaming via `AnthropicStreamingAdapter`; residual tool call handled; sequence number = (1 if summary_emitted else 0) + template_count | response-nodes.md §llm |
+| `validate_output_node` | CHAT-P-015 | `validate_bot_output(text, current_intent)` called with intent key; markdown_table blocked except comparison intents | response-nodes.md §validate_output |
+| `respond_node` | CHAT-P-015 | TEMPLATE_BUILDERS dispatch; `build_template_events()` called; template events emitted with correct seq numbers | response-nodes.md §respond |
+| `followup_node` | CHAT-P-015 | Final COMPLETED event emitted; `registry.ping_session()` called; conversation summary triggered if needed | response-nodes.md §followup |
 
 ---
 
@@ -296,15 +307,22 @@ class SearchPropertiesExecutor(HttpToolExecutor):
 ### CHAT-P-025: Tool executors — getProjectDetail, getProjectPriceTrends
 **Sprint:** 2 | **SP:** 3 | **Status:** ⬜
 
-getProjectDetail (Venus — VENUS_BASE_URL), getProjectPriceTrends (Gandalf — GANDALF_BASE_URL)
+getProjectDetail (Venus — VENUS_BASE_URL), getProjectPriceTrends (Gandalf — GANDALF_BASE_URL).
+**Wire format:** `docs/llm/tool-contracts.md` "Orchestrator API Translation" section. **ToolRecord:** `docs/registries/tool-registry.md`.
 
 ### CHAT-P-026: Tool executors — getRecommendations, getSavedProperties, getViewedProperties
 **Sprint:** 2 | **SP:** 3 | **Status:** ⬜
+
+getRecommendations, getSavedProperties, getViewedProperties — all auth-gated (`requires_auth=True`).
+**Wire format:** `docs/llm/tool-contracts.md` "Orchestrator API Translation" section. **ToolRecord:** `docs/registries/tool-registry.md`.
+Auth token passed via `Authorization: Bearer {auth_token}` header in the upstream API call.
 
 ## CHAT-P-026b: Tool executors — missing tools
 **Sprint:** 2 | **SP:** 5 | **Status:** ⬜
 
 The following TOOL_REGISTRY tools have no executor ticket and are required for full taxonomy support:
+
+**Note on `recently_viewed_cross_session`:** `getRecentlyViewed` returns properties the user viewed across previous sessions (not just the current one). The intent `portfolio/recently_viewed_cross_session` is distinct from `portfolio/viewed_properties` (which shows properties viewed in the current session via Redis). Requires a valid `auth_token` (`requires_auth=True`). IntentRecord is in INTENT_REGISTRY under `portfolio/recently_viewed_cross_session`, Tier 2.
 
 | Tool | Backend | Base URL setting | Intents |
 |---|---|---|---|

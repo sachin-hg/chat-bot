@@ -103,6 +103,8 @@ CREATE INDEX idx_conversations_token_id
 --   Template rows: {"templateId": "property_carousel",
 --                   "data": {"properties": [...], ...}}           15–100KB
 --   user_action:   {"action": "contact_seller_confirmed", ...}    ~500B
+--   user_action:   {"action": "location_shared", ...}             ~500B
+--   user_action:   {"action": "nested_qna_selection", ...}        ~500B
 --
 -- Append-only — content never updated. Zero VACUUM overhead on content column.
 -- Monthly partitions dropped to handle 90-day retention.

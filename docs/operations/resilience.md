@@ -13,14 +13,16 @@ default per fetch. Overall per-turn target for Tier 3a: ≤ 1.5s to first LLM ch
 
 | Call | Hard Timeout | Notes |
 |---|---|---|
-| Haiku SLM (classification) | 2,000ms | Fail fast; SLM fallback fires (see below) |
+| Haiku SLM Stage 1 — domain router | 500ms | Fast 5-way classification; fallback to last_domain on timeout |
+| Haiku SLM Stage 2 — intent classifier | 2,000ms | Full intent + filter_delta; fallback to out_of_scope on timeout |
 | Khoj `searchProperties` | 1,500ms | User-blocking; fast-fail over waiting |
 | Casa `getPropertyDetail` | 2,000ms | |
 | Venus `getFloorPlans` / `getBrochure` | 2,000ms | |
 | Gandalf `getPriceTrends` | 2,000ms | |
 | Odin `getLocalityDetail` / `getRatingsReviews` | 2,000ms | |
 | Autosuggest `resolveEntity` | 500ms | Hot-path entity resolution; skip on timeout |
-| Claude stream (time-to-first-token) | 5,000ms | Abort stream if no chunk within 5s |
+| Claude stream (time-to-first-token) | 5,000ms | Abort stream if no chunk arrives within 5s; retry once |
+| Claude stream (total response) | 30,000ms | Kill the stream if total response takes > 30s (runaway generation) |
 | Redis read (cache / session load) | 50ms | Fail open — treat as cache miss, never block |
 | Redis write (session save) | 100ms | Log + continue; handled by optimistic locking |
 | Kafka publish | 500ms | Queued locally on failure; see reliability below |
@@ -63,7 +65,8 @@ TOOL_DEFAULT_TIMEOUTS: dict[str, int] = {
 ### Retry Policy
 
 Retries are allowed only for idempotent reads against transient errors.
-Write-side tools (`contactSeller`, `shortlistProperty`) must **never** be retried automatically.
+Write-side tools (`shortlistProperty`, `removeFromShortlist`, `createSearchAlert`) must **never** be retried automatically.
+`contact_seller` makes **no BE API call** — it is template-only, so this constraint does not apply to it.
 
 | Error | Retryable? | Strategy |
 |---|---|---|
@@ -82,14 +85,15 @@ The diagram below shows how each node's timeout and retry budget maps to its spe
 
 ```mermaid
 graph LR
-    REQ[Request] --> SLM[SLM Stage 1\n500ms timeout\n1 retry]
+    REQ[Request] --> SLM[SLM Stage 1\n500ms timeout · 1 retry\nfallback: last_domain]
+    SLM --> SLM2[SLM Stage 2\n2000ms timeout · 2 retries\nfallback: out_of_scope]
     SLM -->|fail after 1 retry| FB_SLM[fallback:\nuse last_domain\nor out_of_scope]
 
     REQ2[Request] --> FETCH[Tool fetch\nper-tool timeout\n1 retry]
     FETCH -->|all fetches fail| FB_ALL[short-circuit:\nemit error SSE]
     FETCH -->|partial fail| STUB[inject error stub\nLLM acknowledges partial data]
 
-    REQ3[Request] --> LLM2[LLM call\n10s timeout\n1 retry]
+    REQ3[Request] --> LLM2[LLM call\nTTFT: 5s · Total: 30s\n1 retry on TTFT fail]
     LLM2 -->|fail after retry| FB_LLM[emit error SSE\nrecoverable:true]
 ```
 

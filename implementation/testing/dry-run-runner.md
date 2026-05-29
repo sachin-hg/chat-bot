@@ -160,8 +160,9 @@ async def run_dry_pipeline(
         sse_events   = sse_events,
         tool_calls   = executor.calls_made,
         total_ms     = total_ms,
-        stage1_ms    = 0,   # populated from timing logs
-        stage2_ms    = 0,
+        stage1_ms    = 0,   # NOTE: always 0 in current implementation — timing is logged
+        stage2_ms    = 0,   # to NodeMetrics but not yet wired back into DryRunResult.
+                            # Future: instrument run_dry_pipeline() to capture these.
     )
 ```
 

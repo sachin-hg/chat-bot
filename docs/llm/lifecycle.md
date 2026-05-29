@@ -89,7 +89,8 @@ flowchart TD
    If requires_auth and no auth_token → set bot_response to login template response; emit_final_state sends text + templateId:"login"
       │
    [Tier 1 — direct action, no LLM]
-   Execute action (shortlistProperty, contactSeller, etc.) directly
+   Execute action (shortlistProperty, createSearchAlert, etc.) directly
+   contact_seller: template-only (no API call) — build_contact_seller_template(session)
    Set bot_response → short-circuits graph; emit_final_state sends chat_event
       │
    [Tier 2 — orchestrator computes, no LLM]

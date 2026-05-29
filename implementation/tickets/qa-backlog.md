@@ -363,7 +363,7 @@ These combine unit tests (shape validation) and dry run tests (full classificati
 ### Format
 `tests/model_eval/{domain}/cases.jsonl` — one JSON object per line:
 ```json
-{"id": "case_001", "input": {"message": "show me 2bhk in bandra", "history": [], "active_filters": {}, "previous_intent": null, "previous_domain": null}, "expected": {"domain": "property_search", "confidence_min": 0.85}, "calibration": {"strict_fields": ["domain"], "soft_fields": []}, "tags": ["primary"], "notes": "Basic property search"}
+{"id": "case_001", "input": {"message": "show me 2bhk in bandra", "history": [], "active_filters": {}, "previous_intent": null, "previous_domain": null}, "expected": {"domain": "property_search", "confidence_min": 0.90}, "calibration": {"strict_fields": ["domain"], "soft_fields": [], "disqualifiers": [{"field": "domain", "value": "out_of_scope"}]}, "tags": ["primary"], "notes": "Basic property search — must route to property_search"}
 ```
 
 ### Minimum counts and coverage requirements

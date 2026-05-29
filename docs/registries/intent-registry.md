@@ -21,10 +21,10 @@ graph TD
         SP[property_detail/save_property]
         RS[property_detail/remove_saved]
         CU[property_detail/convert_unit]
+        SA[property_search/save_alert]
     end
 
     subgraph T2["Tier 2 - Orchestrator Fetch"]
-        SA[property_search/save_alert]
         SV[portfolio/saved_properties]
         VW[portfolio/viewed_properties]
         RC[portfolio/recent_searches]
@@ -83,7 +83,8 @@ graph TD
 |---|---|---|---|
 | **0** | None | No | out_of_scope, safety blocks |
 | **1** | None | No | contact_seller, save_property, convert_unit |
-| **2** | None | No | save_alert, saved_properties, calculate_emi |
+| **1** | None | No | save_alert (create search alert — Tier 1 with confirmation card) |
+| **2** | None | No | saved_properties, viewed_properties, recent_searches, calculate_emi |
 | **3a** | Haiku | Yes | filter_search, property_about, locality_overview |
 | **3b** | Sonnet | Yes | compare_localities, compare_projects, multi_intent |
 
@@ -608,7 +609,8 @@ INTENT_REGISTRY: list[IntentRecord] = [
     carry_over_keys=[],
     clear_keys=[],
     pre_resolve_entities=False,
-    requires_auth=True,
+    requires_auth=False,    # works with token_id (device identifier) — no login needed
+                            # search_history is stored per token_id, not per user_id
     description='User wants to review or resume their recent search queries.',
   ),
   IntentRecord(

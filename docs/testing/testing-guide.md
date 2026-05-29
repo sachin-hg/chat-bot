@@ -386,6 +386,11 @@ def evaluate_case(actual: dict, expected: dict, calibration: CaseCalibration) ->
             failures.append(f'SOFT {soft.field} ({soft.compare}): got {act!r}, expected {exp!r}')
 
     # Disqualifiers — automatic fail regardless of other results
+    # Two forms:
+    #   {"field": "domain", "value": "out_of_scope"}         — field == value → fail
+    #   {"field": "clarification_needed", "condition": "not_null"} — field is not None → fail
+    # Supported `condition` values: "not_null", "null", "true", "false"
+    # When `condition` is absent, `value` is used for equality check.
     for disq in calibration.disqualifiers:
         act = get_nested(actual, disq.field)
         if _disqualifier_triggered(act, disq):
@@ -398,19 +403,19 @@ def evaluate_case(actual: dict, expected: dict, calibration: CaseCalibration) ->
 #### Running model evals
 
 ```bash
-# Mock mode (fast, no API cost — uses MockClassifier with cached responses)
-# Run in CI on every PR
-pytest tests/model_eval/ -v
+# Mock mode (fast, no API cost — MockClassifier returns pre-canned responses)
+# This is the RECOMMENDED CI mode. Run on every PR.
+# Enable with: pytest tests/model_eval/ (no flags) OR explicitly:
+pytest tests/model_eval/ --mock-llm
 
-# Real model mode (actual API calls — run before every deploy or model config change)
+# Real model mode (actual Anthropic API calls — run before every deploy or model change)
 pytest tests/model_eval/ --real-model
 
 # Specific domain
 pytest tests/model_eval/property_search/ --real-model -v
 
 # Run against a VARIANT model (for A/B experiment validation)
-# MODEL_VARIANT=google/gemini-2.0-flash pytest tests/model_eval/property_search/ --real-model
-MODEL_VARIANT=google/gemini-2.0-flash pytest tests/model_eval/ --real-model --domain property_search
+MODEL_VARIANT=anthropic/claude-haiku-4-5-20251001 pytest tests/model_eval/ --real-model --domain property_search
 
 # Summary report
 pytest tests/model_eval/ --real-model --report=model_eval_report.json
@@ -590,16 +595,16 @@ pip install -r requirements.txt
 # 2. Configure
 cp .env.example .env.local
 # Required:
-#   ANTHROPIC_API_KEY, GOOGLE_API_KEY
+#   ANTHROPIC_API_KEY
 #   LANGCHAIN_API_KEY, LANGCHAIN_TRACING_V2=true, LANGCHAIN_PROJECT=housing-bot-dev
-#   BOT_ENV=mock  (or llm_only, or production)
+#   BOT_ENV=mock  (or local, or production)
 
-# Mode: mock  — all adapters stubbed; no real API calls; responses from fixtures/
+# Mode: mock  — real Anthropic SLM + LLM; DryRunExecutor returns fixture responses
+# Primary AI/ML development mode. No VPN needed. Only ANTHROPIC_API_KEY required.
 BOT_ENV=mock uvicorn bot.main:app --reload
 
-# Mode: llm_only — real Gemini + Claude; MockToolExecutor for all data fetches
-# Use this when iterating on prompts (tools return fixtures, LLM is real)
-BOT_ENV=llm_only uvicorn bot.main:app --reload
+# Mode: local — real Anthropic AI + real backend APIs via HttpToolExecutor; VPN required
+BOT_ENV=local uvicorn bot.main:app --reload
 
 # Mode: production — all real adapters; needs full backend access
 BOT_ENV=production uvicorn bot.main:app --reload

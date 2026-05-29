@@ -49,6 +49,37 @@ All decisions here are final for the local MVP. Production extensions noted inli
 
 ---
 
+## Backend Data Services (External APIs)
+
+These are Housing.com internal APIs consumed via `HttpToolExecutor`. Not hosted by this service.
+
+| Service | Codename | Base URL env var | Owns |
+|---|---|---|---|
+| Property search index | **Khoj** | `KHOJ_BASE_URL` | `searchProperties`, `getFilterSuggestions`, `getCollections`, `getPriceBuckets` |
+| Property detail & media | **Casa** | `CASA_BASE_URL` | `getPropertyDetail`, `getFloorPlans`, `getBrochure`, `getSimilarProperties` |
+| Locality & project data | **Odin** | `ODIN_BASE_URL` | `getLocalityDetail`, `getTrendingLocalities`, `getRatingsReviews`, `getTopSocieties`, `getTravelTime`, `getDemandSupplyInsight`, `getPopularCityLandmarks`, `getProjectDetail` |
+| Price trends & market | **Gandalf** | `GANDALF_BASE_URL` | `getPriceTrends`, `getProjectPriceTrends`, `getTransactionHistory` |
+| New-launch project data | **Venus** | `VENUS_BASE_URL` | `getProjectDetail`, `getFloorPlans`, `getBrochure` — gallery, floor plans, amenities, highlights, sellers list. Also used when `getPropertyDetail` routes to a project (active_property_kind = "project"). |
+| Entity resolution | **Autosuggest** | `AUTOSUGGEST_BASE_URL` | `resolveEntity` (locality, project, builder name → UUID) |
+| User activity | **User Activity API** | `USER_ACTIVITY_BASE_URL` | `getRecentlyViewed`, `getSavedProperties`, `getRecentSearches`, `createSearchAlert` |
+
+In `BOT_ENV=mock` mode all of these are stubbed by `DryRunExecutor` from fixture files in `tests/fixtures/`. `KHOJ_BASE_URL` etc. do not need to be set.
+
+---
+
+## Infrastructure (Local)
+
+**Property data model — Casa vs Venus:**
+
+| Type | Service | Description |
+|---|---|---|
+| Rent/Resale listings | **Casa** | Individual units listed by brokers/owners. Can be standalone (independent colony) or inside a project. When inside a project, the response includes `region_entity` = Venus project ID. |
+| New-launch projects | **Venus** | Full project data: gallery, floor plans, brochure, highlights, pros/cons, seller contacts, amenities, overview. Linked from Casa via `region_entity`. |
+
+`getPropertyDetail` routes to Casa (rent/resale) or Venus (project). When Casa returns a `region_entity`, the orchestrator can run a parallel `getProjectDetail` (Venus) fetch to enrich the response.
+
+---
+
 ## Infrastructure (Local)
 
 | Component | Docker image | Port | Notes |

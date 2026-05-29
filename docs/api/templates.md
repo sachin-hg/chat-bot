@@ -279,14 +279,24 @@ interface ShortlistPropertyData {
 ### D7. contact_seller (Transient)
 
 **templateId:** `"contact_seller"`
-**Triggers:** Tier 1 intent `property_detail/contact_seller` (tool: `contactSeller`)
-**Visibility:** Transient — auto-executes on render.
+**Triggers:** Tier 1 intent `property_detail/contact_seller` — **no BE API call**; BE emits template from session state only.
+**Visibility:** Transient — renders a confirmation card; FE handles seller contact entirely.
 
 ```typescript
 interface ContactSellerData {
-  /* generic data object; frontend posts to /api/properties/contact-seller */
+  property_id:    string;   // from session.active_property_id
+  seller_id:      string;   // from session.active_seller_id
+  property_title: string;   // display label for the confirmation card
+  price_display:  string;   // e.g. "₹1.35 Cr"
 }
 ```
+
+**FE behaviour:**
+1. Renders a "Connect with seller for [property_title]?" confirmation card.
+2. On user confirming: FE calls its own vendor APIs to initiate contact (phone/WhatsApp/lead form). No CRM call from BE.
+3. FE also sends `contact_seller_confirmed` user_action to BE (`responseRequired: true`) so the BE can generate a follow-up suggestion.
+
+**BE follow-up on `contact_seller_confirmed`:** LLM generates a contextual next-step prompt, e.g. *"Your interest has been noted. While you wait for the seller to respond — would you like to see similar properties, read locality reviews, or check the floor plan?"*
 
 ---
 
@@ -402,7 +412,7 @@ These do not enter the LLM pipeline. Handle them directly in the HTTP layer:
 |---|---|
 | `shortlist` | Forward to `shortlistProperty` tool; return non-streaming ack |
 | `shortlisted_property` | Analytics event only; ack |
-| `contact_seller` | Forward to `contactSeller` tool; return non-streaming ack |
+| `contact_seller_confirmed` | `responseRequired: true` — FE already handled the contact; BE generates a follow-up suggestion (similar properties / locality reviews / floor plan) |
 
 ---
 

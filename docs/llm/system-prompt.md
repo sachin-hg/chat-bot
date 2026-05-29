@@ -30,7 +30,7 @@ These are the failure modes the system is explicitly designed to prevent. Every 
 |---|---|---|---|
 | Call `searchProperties` / `getPropertyDetail` / etc. at runtime | These are orchestrator-only | `llm_visible: false` — not in tool list | **No — architectural** |
 | Call `resolveEntity` to look up an ID | Orchestrator-only (EntityResolutionMiddleware) | `llm_visible: false` | **No — architectural** |
-| Call `contactSeller` or `shortlistProperty` directly | Tier 1 direct actions; orchestrator handles | `llm_visible: false` | **No — architectural** |
+| Call `shortlistProperty` or trigger contact_seller directly | Tier 1 direct actions; orchestrator handles | `llm_visible: false` | **No — architectural** |
 | Call `applyFilter` | Removed entirely; SLM `filter_delta` → `FilterApplyMiddleware` | Tool does not exist in registry | **No — removed** |
 | Fabricate a `property_id`, `locality_id`, or `project_id` | Non-existent IDs cause tool errors | System prompt: "IDs must come from pre-fetched data only" | **Yes — NLG violation** |
 | Call `getNearbyLandmarks` without having a property in session | Cannot resolve location anchor | Orchestrator injects `property_id` from session; if missing, `DataFetchMiddleware` skips | **Residual tool only** |

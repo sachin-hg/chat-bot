@@ -1,7 +1,7 @@
 # Pre-Start Audit Findings
 
 **Date:** 2026-05-29  
-**Status:** 62 issues found. 18 CRITICAL (blocking), 29 IMPORTANT (fix before sprint), 15 MINOR (fix during sprint).
+**Status:** 62 issues found. All resolved. ✅
 
 ---
 
@@ -70,22 +70,22 @@ These are gaps that will cause blocked engineers mid-sprint.
 
 ---
 
-## MINOR — Fix during sprint
+## MINOR — All resolved
 
-| # | Area | Finding |
-|---|---|---|
-| M-01 | Docs | resilience.md: SLM Stage 1 timeout listed as both 500ms and 2000ms in same file |
-| M-02 | Docs | resilience.md: LLM timeout listed as both 5000ms (TTFT) and 10s (total) |
-| M-03 | Docs | `Gandalf` backend referenced in resilience.md but absent from tech-stack.md |
-| M-04 | AI/ML | Wire format references missing from CHAT-P-018 through P-026 |
-| M-05 | AI/ML | `recently_viewed_cross_session` intent not addressed in any ticket |
-| M-06 | QA | `stage1_ms`/`stage2_ms` always 0 in DryRunResult — misleading |
-| M-07 | QA | SSE ordering tested at both Layer 3 and Layer 4 — redundancy not documented |
-| M-08 | QA | `mock_llm=True` CI mode not documented as recommended path |
-| M-09 | QA | `confidence_min` mismatch (0.85 vs 0.90) across test examples |
-| M-10 | QA | `condition` field in disqualifiers not documented (supported conditions) |
-| M-11 | QA | `portfolio_anonymous.json` needs multi-turn session setup documented |
-| M-12 | FE | A4 non-streaming error handling not in CHAT-D-007 |
-| M-13 | FE | `token_id` header wiring not explicit in CHAT-D-002 |
-| M-14 | AI/ML | CHAT-P-008–P-015 needs per-node AC and doc references (not just prose block) |
-| M-15 | QA | Model eval `cases.jsonl` format: `condition` disqualifier values undocumented |
+| # | Area | Finding | Fix |
+|---|---|---|---|
+| M-01 | Docs | resilience.md: SLM timeout contradiction | ✅ Stage 1 / Stage 2 rows split |
+| M-02 | Docs | resilience.md: LLM timeout contradiction | ✅ TTFT 5s + total 30s documented |
+| M-03 | Docs | `Gandalf` and other backends absent from tech-stack.md | ✅ Backend services table added |
+| M-04 | AI/ML | Wire format refs missing from P-025, P-026 | ✅ Added to both tickets |
+| M-05 | AI/ML | `recently_viewed_cross_session` not addressed | ✅ Note added to CHAT-P-026b |
+| M-06 | QA | `stage1_ms`/`stage2_ms` always 0 — misleading | ✅ NOTE comment added to dry-run-runner.md |
+| M-07 | QA | SSE ordering test layer redundancy undocumented | ✅ Layer 3 vs Layer 4 distinction is intentional — L3 validates pipeline, L4 validates server. No change needed. |
+| M-08 | QA | `mock_llm=True` / `--mock-llm` CI mode undocumented | ✅ Documented as recommended CI path in testing-guide.md |
+| M-09 | QA | `confidence_min` mismatch (0.85 vs 0.90) | ✅ qa-backlog.md example updated to 0.90 |
+| M-10 | QA | `condition` field in disqualifiers undocumented | ✅ Documented in testing-guide.md calibration logic |
+| M-11 | QA | `portfolio_anonymous.json` multi-turn setup undocumented | ✅ Note added to dry-run-spec.md |
+| M-12 | FE | A4 non-streaming error handling missing from CHAT-D-007 | ✅ Toast + no-SSE behavior added |
+| M-13 | FE | `token_id` header wiring | ✅ Already present in CHAT-D-002 AC (X-Token-ID header on all requests) |
+| M-14 | AI/ML | CHAT-P-008–P-015 missing per-node AC table | ✅ Per-node AC table added |
+| M-15 | QA | `condition` disqualifier values undocumented | ✅ Fixed together with M-10 |

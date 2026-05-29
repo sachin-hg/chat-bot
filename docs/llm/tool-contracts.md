@@ -585,33 +585,40 @@ LLM receives the summary and generates the markdown analysis (entry, kitchen, be
 
 ---
 
-### `contactSeller` — Tier 1 direct action
+### `contact_seller` — Tier 1 template-only action
 
-> **Orchestrator-only** (`llm_visible: false`). Not an LLM tool call — a Tier 1 direct action
-> handled entirely by `RoutingMiddleware` before any LLM call.
+> **No BE API call.** The BE emits a `contact_seller` template with the property and seller IDs
+> from session state. The FE handles all seller contact interaction directly.
 
 When `contact_seller` intent is classified:
 
-1. Orchestrator confirms `active_property_id` and `seller_id` are in session state
+1. Orchestrator confirms `active_property_id` and `active_seller_id` are in session state
 2. FE template handles login if needed — `contact_seller` FE template has its own login flow
-3. If not yet confirmed by user → emit a confirmation card ("Contact this seller?"), stop
-4. On confirmation → call `contactSeller` API directly, publish `session_state_change` event to Kafka
-5. Kafka event → gateway detects `session_state_change` → issues new `RouteResponse` pointing to `user_seller_chat` WebSocket endpoint
+3. Orchestrator calls `build_contact_seller_template(session)` — **no external API call**
+4. BE emits `contact_seller` template via `emit_final_state`; done
 
 ```json
 {
-  "name": "contactSeller",
-  "input": {
-    "property_id": "<string>",
-    "seller_id":   "<string>"
+  "templateId": "contact_seller",
+  "data": {
+    "property_id":    "<string>",
+    "seller_id":      "<string>",
+    "property_title": "<string>",
+    "price_display":  "<string>"
   }
 }
 ```
-<!-- Orchestrator executes directly — never passed to LLM.
-     property_id from session.active_property_id; seller_id from session.active_seller_id. -->
 
-The LLM is not involved. The "seamless transition" to P2P chat is a routing gateway event, not a
-bot response.
+**FE responsibility:** on user confirming the card, the FE calls its own vendor APIs to initiate
+contact (show phone number, WhatsApp, or submit a lead). No CRM call from BE.
+
+**FE also sends `contact_seller_confirmed`** (`responseRequired: true`) back to BE so the pipeline
+can generate a follow-up suggestion: *"While you wait — similar properties, locality reviews, or
+floor plan?"*. This action skips SLM; BE synthesises the intent directly and calls the LLM.
+
+**Venus note:** Venus provides the property data behind `getPropertyDetail`, `getFloorPlans`,
+`getProjectDetail`, etc. — those BE-side fetches are unchanged. Only the CRM/lead-creation
+step is absent from the BE.
 
 ---
 
@@ -799,7 +806,8 @@ Tools are split into two categories. The LLM only ever sees `llm_visible: true` 
 |---|---|---|
 | **LLM-visible — Residual** | `getNearbyLandmarks` | LLM (intent-specific, property_about only) |
 | **LLM-visible — Tier B** | `calculateEMI`, `calculateAffordability`, `convertUnit` | LLM (always injected for all Tier 3 intents except `calculator/*`; LLM calls when user states all required inputs mid-session) |
-| **Orchestrator-only** | `searchProperties`, `resolveEntity`, `getPropertyDetail`, `getFloorPlans`, `getBrochure`, `getSimilarProperties`, `getLocalityDetail`, `getPriceTrends`, `getProjectPriceTrends`, `getTransactionHistory`, `getRatingsReviews`, `getTrendingLocalities`, `getTrendingProjects`, `getProjectDetail`, `getDemandSupplyInsight`, `getTravelTime`, `getPriceBuckets`, `getFilterSuggestions`, `getCollections`, `getPopularCityLandmarks`, `getTopSocieties`, `shortlistProperty`, `removeFromShortlist`, `contactSeller`, `getSavedProperties`, `getViewedProperties`, `getRecentlyViewed`, `getRecommendations`, `createSearchAlert` | DataFetchMiddleware, RoutingMiddleware |
+| **Orchestrator-only** | `searchProperties`, `resolveEntity`, `getPropertyDetail`, `getFloorPlans`, `getBrochure`, `getSimilarProperties`, `getLocalityDetail`, `getPriceTrends`, `getProjectPriceTrends`, `getTransactionHistory`, `getRatingsReviews`, `getTrendingLocalities`, `getTrendingProjects`, `getProjectDetail`, `getDemandSupplyInsight`, `getTravelTime`, `getPriceBuckets`, `getFilterSuggestions`, `getCollections`, `getPopularCityLandmarks`, `getTopSocieties`, `shortlistProperty`, `removeFromShortlist`, `getSavedProperties`, `getViewedProperties`, `getRecentlyViewed`, `getRecommendations`, `createSearchAlert` | DataFetchMiddleware, RoutingMiddleware |
+| **Template-only (no tool)** | `contact_seller` | BE emits template from session state; FE handles seller contact |
 
 The LLM's job is **NLG** (natural language generation) over data that arrives pre-loaded in its context. It does not discover, fetch, or choose which APIs to call — the orchestrator does that based on `data_requirements` in `INTENT_REGISTRY`.
 

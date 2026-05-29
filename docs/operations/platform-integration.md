@@ -356,46 +356,50 @@ Retention: **90 days**. Rows older than 90 days are deleted by a scheduled clean
 
 ---
 
-### 6. `contact_seller` Handoff Hint
+### 6. `contact_seller` Flow
 
-When the `contact_seller` Tier 1 action completes successfully, the response payload
-includes a `handoff_hint` field. This hint signals the client that a `user_seller_chat`
-session can be opened with pre-populated entities — it is a suggestion, not a forced
-redirect.
+`contact_seller` is a **template-only** Tier 1 action. The BE emits the `contact_seller`
+template; all seller contact interaction is handled by the FE.
 
-#### Response payload shape
+#### BE response
 
-After the `contactSeller` API call succeeds, the Tier 1 response dict (which becomes
-`bot_response` and is then wrapped by `emit_final_state`) includes:
+`build_contact_seller_template(session)` returns a `bot_response` dict with:
 
 ```json
 {
-  "template_id": "contact_seller_success",
+  "template_id": "contact_seller",
   "data": {
-    "property_name":   "2BHK in Andheri West",
-    "seller_name":     "Rahul Sharma",
-    "message_preview": "Your message has been sent."
+    "property_id":    "prop_abc123",
+    "seller_id":      "seller_xyz789",
+    "property_title": "2BHK in Andheri West",
+    "price_display":  "₹1.35 Cr"
   },
-  "handoff_hint": {
-    "target": "user_seller_chat",
-    "entities": {
-      "active_property_id": "prop_abc123",
-      "active_seller_id":   "seller_xyz789"
-    }
-  }
+  "source_message_state": "COMPLETED"
 }
 ```
 
-#### Client behaviour
+No BE API call is made. No Kafka event. The data is populated entirely from session state
+(`active_property_id`, `active_seller_id` set by a prior `getPropertyDetail` fetch).
 
-1. Client renders the `contact_seller_success` template (confirmation message).
-2. Client renders a **"Chat with seller"** CTA button using `handoff_hint.target` and
-   `handoff_hint.entities`.
-3. If the user taps the CTA, the client sends a new `RouteRequest` to the gateway with
-   `handoff_hint.entities` pre-populated in `shared_entities`.
-4. If the user continues searching instead, the hint is discarded — no state change.
+#### FE responsibility
 
-The hint is **never** acted upon automatically. The user must explicitly tap the CTA.
+1. FE renders a confirmation card: *"Connect with seller for 2BHK in Andheri West?"*
+2. If user confirms:
+   - FE calls its own vendor APIs to initiate the contact (show phone/WhatsApp, submit lead form). No CRM call from BE.
+   - FE also sends `contact_seller_confirmed` user_action to BE with `responseRequired: true`
+3. If user cancels: FE dismisses the card; session is unchanged
+
+#### BE follow-up on `contact_seller_confirmed`
+
+BE receives the action, skips SLM (pre-determined intent), and generates a follow-up suggestion via LLM:
+
+> *"Your interest has been noted. While you wait for the seller to respond — would you like to see similar properties, read reviews for the locality, or take a closer look at the floor plan?"*
+
+No external API call is made. The LLM uses the current session context (`active_property_id`, `active_locality_id`) to make the suggestions relevant.
+
+**Venus note:** Venus APIs (`getPropertyDetail`, `getProjectDetail`, `getFloorPlans`, etc.) are
+still called by the BE for all data-fetching intents. Only the CRM/lead-creation step is absent
+from the BE.
 
 ---
 

@@ -120,7 +120,7 @@ When anonymous user asks "show my saved properties", the BE responds with `templ
 User actions submitted via `POST /api/v1/chat/send-message` with `responseRequired: false` (or `true` for some).
 
 **Actions to validate:**
-- `contact_seller_confirmed` — tapping Confirm on the contact_seller template → triggers BE contactSeller API call → bot responds with success text
+- `contact_seller_confirmed` — user taps Confirm on the contact_seller template → **two things happen in parallel**: (1) FE calls its own vendor APIs to initiate contact (phone/WhatsApp/lead form — no CRM call from BE), and (2) FE sends `contact_seller_confirmed` user_action to BE with `responseRequired: true` so BE can generate a follow-up suggestion ("want to see similar properties / locality reviews?").
 - `location_shared` — user grants location → sends coordinates → next turn uses location for explore_nearby
 - `nested_qna_selection` — user taps a chip → correct `filter_delta` applied in next turn
 - Quick filter chip tap → sends `nested_qna_selection` user_action with the filter value (e.g. furnishing: 'furnished') — NOT a separate applyFilter action. Validate this sends the correct action type.
@@ -129,6 +129,8 @@ User actions submitted via `POST /api/v1/chat/send-message` with `responseRequir
 **For each:**
 - [ ] Correct `ChatEventFromUser` shape sent
 - [ ] BE responds appropriately (SSE stream or 200 for non-streaming)
+- [ ] **A4 non-streaming error handling:** if A4 (`POST /chat/send-message` with `responseRequired: false`) returns 4xx or 5xx, show a toast ("Action failed — try again") and do NOT trigger an SSE read. Silent failure is not acceptable.
+- [ ] **A4 idempotency:** tapping the same quick-action button twice in < 500ms sends only one request (debounce on the FE side)
 
 ---
 
@@ -149,7 +151,8 @@ This is the riskiest integration point. The BE tool executors (CHAT-P-018 throug
 - [ ] `getPropertyDetail` — Casa property detail
 - [ ] `resolveEntity` — autosuggest response, candidate confidence scores
 - [ ] `getTrendingLocalities` / `getLocalityDetail` — Odin response shapes
-- [ ] `contactSeller` — Venus CRM lead creation response
+- [ ] `getProjectDetail` / `getFloorPlans` / `getBrochure` — Venus project data response shapes
+- [ ] `getPropertyDetail` for Casa listings that include `region_entity` — verify the field is present and is the Venus project_id
 - [ ] `getSavedProperties` / `getRecommendations` — Khoj user APIs
 
 **Output:** A `docs/api-mismatches.md` file listing any discovered discrepancies and the resolution (doc updated or code adapted).

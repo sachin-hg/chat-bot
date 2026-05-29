@@ -153,8 +153,21 @@
 
 ## Communication Protocols
 
-- **Daily standup**: Async, #chat-bot-standup. Format: `Done / Doing / Blocked`
-- **Sprint review**: Friday EOD, each lead demos their increment
-- **Architecture decision**: Both @arjun + @priya must align, @ananya documents in pm-tracking.md
-- **Production concern**: Any ticket that flags a local shortcut that doesn't extend to prod → @arjun reviews before merge
-- **Cross-team dependency**: Ticket author adds `BLOCKED BY CHAT-XX` in ticket header, pings blocking team in Slack
+Full scrum process: **`implementation/process/scrum-protocol.md`**
+
+Quick reference:
+
+| Channel | Use for | Limit |
+|---|---|---|
+| **Direct DM** | Quick clarifying questions between two agents | Max 3 exchanges; unresolved → standup |
+| **#chat-bot-standup** | Daily updates, blocker escalation | Reply by 10am; PM summarises by 10:30am |
+| **Standup ⚡ agenda** | Items unresolved after 3 DM exchanges; blockers > 2 days old | PM adds automatically |
+| **Architecture sync** | Spec-level disagreements, new design decisions | @arjun + @priya, max 1/week |
+| **Sprint planning** | Scope, capacity, cross-team dependencies | Sprint start Monday 10am |
+
+**Rules:**
+- Direct comms are for questions, not decisions. If a DM exchange produces a decision that changes a spec, @ananya must document it in `pm-tracking.md` same day.
+- Blocked items > 2 days automatically surface in standup — do not wait.
+- Ticket author adds `BLOCKED BY CHAT-XX` in the ticket header + pings the blocking agent in Slack.
+- Architecture decisions: both @arjun + @priya must align; @ananya documents in `pm-tracking.md`.
+- Production safety concern: @arjun flags immediately; all non-critical work pauses until resolved.

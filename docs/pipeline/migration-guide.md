@@ -16,7 +16,7 @@ def validate_tool_call(tool, params):
         'getPropertyDetail': ['property_id'],
         'getPriceTrends':    ['locality', 'city', 'transaction_type'],
         'resolveEntity':     ['raw_name', 'entity_type'],
-        'contactSeller':     ['property_id', 'seller_id'],
+        # contactSeller absent — contact_seller is template-only, no BE tool call
         'calculateEMI':      ['property_price'],
         # ... manually maintained list
     }
@@ -156,7 +156,8 @@ Total API wait: ~150ms + 0 tool round trips
 tools = [
     'searchProperties', 'resolveEntity', 'getPropertyDetail', 'getNearbyLandmarks',
     'getPriceTrends', 'getLocalityDetail', 'getRatingsReviews', 'calculateEMI',
-    'calculateAffordability', 'convertUnit', 'shortlistProperty', 'contactSeller', ...
+    'calculateAffordability', 'convertUnit', 'shortlistProperty', ...
+    # contactSeller absent — template-only, no BE tool call
 ]
 # Risk: LLM could call any tool; hallucinated param values; contract drift
 ```

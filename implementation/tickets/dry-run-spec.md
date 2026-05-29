@@ -135,7 +135,7 @@ QA creates the scenario JSON files. These are the "test data" for the dry run. E
 | `scenarios/property_detail.json` | property_detail/property_about | getPropertyDetail, getNearbyLandmarks |
 | `scenarios/locality_research.json` | locality_research/trending_localities | resolveEntity, getTrendingLocalities |
 | `scenarios/locality_comparison.json` | comparison/compare_localities | resolveEntity×2, getLocalityDetail×2, getPriceTrends×2, getTransactionHistory×2 |
-| `scenarios/portfolio_anonymous.json` | portfolio/recent_searches (no auth) | (no API calls — served from session) |
+| `scenarios/portfolio_anonymous.json` | portfolio/recent_searches (no auth) | (no API calls — served from session) — **Note: must be run as a 2-turn test.** Turn 1: any property_search turn that populates `session.search_history`. Turn 2: "show my recent searches". Pass the result of Turn 1's session state as `session=` arg to `run_dry_pipeline()` for Turn 2. |
 | `scenarios/portfolio_saved.json` | portfolio/saved_properties (auth) | getSavedProperties |
 | `scenarios/contact_seller.json` | property_detail/contact_seller | getPropertyDetail (already have property_id) |
 | `scenarios/clarification_flow.json` | Any intent with clarification | resolveEntity (returns 2 candidates → triggers nested_qna) |
