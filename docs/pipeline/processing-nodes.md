@@ -4,8 +4,35 @@ filter_apply_node, sanitize_node, derive_node, clarify_node, resolve_entities_no
 
 ---
 
+The diagram below shows the linear flow of all processing nodes from validated classification through to summary emission.
+
+```mermaid
+graph LR
+    VS([from validate_slm]) --> FA[filter_apply\nmerge filter_delta\nADD vs REPLACE]
+    FA --> SA[sanitize\nprice sanity\nservice conflict check]
+    SA --> DE[derive\nprice_per_sqft→abs\nlandmark anchor→lat_lng]
+    DE --> CL[clarify\nif clarification_needed:\nemit nested_qna → END]
+    CL --> RE[resolve_entities\nautosuggest API\nordinal resolution]
+    RE --> RT[route\ndetermine tier\ncheck requires_auth]
+    RT --> SU([summary_node])
+```
+
+---
+
 # ── 4. filter_apply_node ──────────────────────────────────────────────
 # Merge filter_delta into session.active_filters.
+
+# The diagram below illustrates how filter_apply_node chooses between ADD and REPLACE semantics based on the FilterRecord's default_operation.
+
+```mermaid
+graph TD
+    FD[filter_delta from SLM] --> Q{FilterRecord\ndefault_operation?}
+    Q -->|REPLACE| R[Replace entire value\nbhk: current=[2,3]\ndelta=[3] → stored=[3]]
+    Q -->|ADD| A[Merge into existing\namenities: current=[lift]\ndelta=[pool] → stored=[lift,pool]]
+    A --> G{existing is null?}
+    G -->|Yes — treat as empty list| A2[stored = delta value\nnot replace]
+    G -->|No| A3[stored = existing + new items]
+```
 # Guards: skips if clarification_needed is set (user hasn't confirmed the ambiguous intent
 # yet — applying a partial delta would corrupt session state before the user responds).
 # Amount parsing: tagged strings ("2cr", "80L") are converted here, BEFORE writing to session.
@@ -136,6 +163,25 @@ async def resolve_entities_node(state: BotState) -> dict:
 
 # ── 9. route_node ─────────────────────────────────────────────────────
 # Determines tier, model, auth check. Short-circuits tiers 0/1/2.
+
+# The flowchart below shows the tier decision tree inside route_node, including the auth check and each short-circuit exit.
+
+```mermaid
+flowchart TD
+    RN[route_node] --> A1{requires_auth=True\nno auth_token?}
+    A1 -->|Yes| SC_AUTH[bot_response = login template\nshort-circuit → END]
+    A1 -->|No| T{IntentRecord.tier}
+    T -->|0| SC0[out_of_scope response\nshort-circuit → END]
+    T -->|1| SC1[execute_tier1_action\nshort-circuit → END]
+    T -->|2| SC2[execute_tier2_action\nshort-circuit → END]
+    T -->|'3a' or '3b'| LLM[routing = tier + model\nproceed → summary_node]
+
+    style SC_AUTH fill:#6366f1,color:#fff
+    style SC0 fill:#ef4444,color:#fff
+    style SC1 fill:#f59e0b,color:#000
+    style SC2 fill:#f59e0b,color:#000
+    style LLM fill:#4a9eff,color:#fff
+```
 # validate_slm_node has already guaranteed the intent is in INTENT_REGISTRY,
 # so record is always defined here (no fallback needed for tier/model).
 # Input:  state['classification'], state['session'], INTENT_REGISTRY

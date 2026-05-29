@@ -17,6 +17,17 @@ gets the same variant across its lifetime — no statefulness needed.
 | `model_variant` | Routing tier uses a different model | Tier 3a: Haiku vs Sonnet for 10% of traffic |
 | `flow_variant` | Intent has different `data_requirements` or `residual_tools` | `compare_localities`: 4 fetches vs 6 fetches |
 
+The graph below shows what each experiment type targets and how it differs from the others.
+
+```mermaid
+graph TB
+    EXP[ExperimentConfig]
+
+    EXP --> PV["prompt_variant\nOne prompt block has two versions\ne.g. domain_router v1.2 vs v1.3\ntarget: block_id"]
+    EXP --> MV["model_variant\nA task uses a different model\ne.g. Haiku vs Gemini Flash for classifier\ntarget: task_id in MODEL_REGISTRY"]
+    EXP --> FV["flow_variant\nIntent has different data_requirements\ne.g. compare_localities: 4 fetches vs 6\ntarget: main_intent/sub_intent"]
+```
+
 ### ExperimentConfig
 
 ```python
@@ -302,6 +313,26 @@ def compute_rubric_score(text: str, state: BotState) -> float:
 The rubric score is emitted in every `llm_call` log event. Dashboard shows rolling 7-day p25/p50/p75. Alert if p50 drops below 0.70.
 
 ### Graduation Procedure (updated)
+
+The flowchart below shows the full experiment lifecycle from data collection through the guardrail and KPI gates to promotion or abort.
+
+```mermaid
+flowchart TD
+    START[Experiment running\ntraffic_pct: 0.05 → 1.0]
+    START --> COLLECT[Collect metrics\nby experiment_variant tag\nin structured logs]
+    COLLECT --> CHECK{min_sample_per_variant\nreached AND\nmin_observation_days elapsed?}
+    CHECK -->|No| COLLECT
+    CHECK -->|Yes| EVAL{All guardrails\npassing?}
+    EVAL -->|Any guardrail > 3× threshold| ABORT[Abort immediately\nset enabled:false\npage on-call]
+    EVAL -->|All guardrails OK| PRIMARY{Primary KPI\nimproved / non-inferior?}
+    PRIMARY -->|No| ABORT2[Abort\ncontrol wins]
+    PRIMARY -->|Yes| HUMAN[Human sign-off required\nfor model_variant / flow_variant]
+    HUMAN --> PROMOTE[Promote\nupdate MODEL_REGISTRY or INTENT_REGISTRY\nremove experiment entry]
+
+    style ABORT fill:#ef4444,color:#fff
+    style ABORT2 fill:#ef4444,color:#fff
+    style PROMOTE fill:#10b981,color:#fff
+```
 
 An experiment graduates when ALL gates pass:
 

@@ -4,6 +4,35 @@ safety_node, normalize_node, route_domain_node (Stage 1), classify_node (Stage 2
 
 ---
 
+The diagram below shows how a user message flows through the two-stage classification cascade, including the out_of_scope fast path that skips Stage 2 entirely.
+
+```mermaid
+graph LR
+    MSG([User Message]) --> S1
+
+    subgraph S1["Stage 1 — Domain Router\n~200 tokens · ≤40ms"]
+        DR[route_domain_node\nDomainRouterPort]
+    end
+
+    subgraph S2["Stage 2 — Intent Classifier\n~800 tokens · ≤120ms"]
+        CL[classify_node\nClassifierPort]
+    end
+
+    subgraph Fast["out_of_scope fast path"]
+        OOS[Skip Stage 2\nZero token cost]
+    end
+
+    S1 -->|domain: property_search\nconfidence: 0.97| S2
+    S1 -->|domain: out_of_scope| OOS
+    S2 --> VS[validate_slm_node]
+
+    style S1 fill:#f59e0b,color:#000
+    style S2 fill:#f59e0b,color:#000
+    style OOS fill:#ef4444,color:#fff
+```
+
+---
+
 # ── 1. safety_node ────────────────────────────────────────────────────
 # Tier 0. Regex-only — no AI.
 # Input:  state['raw_message']
@@ -168,6 +197,25 @@ async def classify_node(state: BotState, classifier: ClassifierPort) -> dict:
 
 # ── 3c. validate_slm_node ─────────────────────────────────────────────
 # Validates Stage 2 SLM JSON output before any downstream node consumes it.
+
+# The flowchart below shows the three successive guardrail checks validate_slm_node applies, with short-circuit behaviour on any failure.
+
+```mermaid
+flowchart TD
+    IN[Raw SLM output] --> V1{Required fields\npresent?}
+    V1 -->|No| ERR1[log slm_invalid_output\nshort-circuit: out_of_scope]
+    V1 -->|Yes| V2{main_intent in\nDOMAIN_MAIN_INTENTS\nfor routed domain?}
+    V2 -->|No — cross-domain hallucination| ERR2[log cross_domain_intent\nshort-circuit: out_of_scope]
+    V2 -->|Yes| V3{intent pair in\nINTENT_REGISTRY?}
+    V3 -->|No| ERR3[log unknown_intent\nshort-circuit: out_of_scope]
+    V3 -->|Yes| COERCE[type-coerce mis-shapes\ne.g. localities: str → list]
+    COERCE --> OK[Validated classification\npasses to filter_apply_node]
+
+    style ERR1 fill:#ef4444,color:#fff
+    style ERR2 fill:#ef4444,color:#fff
+    style ERR3 fill:#ef4444,color:#fff
+    style OK fill:#10b981,color:#fff
+```
 # Also cross-checks that the returned intent belongs to the domain routed
 # by Stage 1 — catches the rare case where Stage 2 hallucinates a cross-domain intent.
 # Input:  state['classification'] (raw Stage 2 SLM output), state['domain']

@@ -17,6 +17,39 @@ See [db-capacity.md](db-capacity.md) for sizing, [db-decisions.md](db-decisions.
 - No foreign key from `messages` to `conversations` across partition boundaries — enforced at application level for performance.
 - Write path is async via Kafka consumer — PostgreSQL never touches the SSE hot path.
 
+The diagram below shows the two core tables and their relationship.
+
+```mermaid
+erDiagram
+    conversations {
+        UUID conversation_id PK
+        TEXT user_id "nullable — anonymous users"
+        TEXT token_id "houzy_token cookie"
+        conversation_status status
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ updated_at
+        SMALLINT turn_count
+        TEXT last_intent
+        TEXT city
+        TEXT preview "first 120 chars of first message"
+    }
+
+    messages {
+        UUID message_id PK
+        UUID conversation_id FK
+        sender_type_enum sender_type
+        message_type_enum message_type
+        message_state_enum message_state
+        SMALLINT sequence_number
+        UUID source_message_id "links bot → user message"
+        TEXT template_id "set for template rows"
+        JSONB content "full payload, max ~100KB"
+        TIMESTAMPTZ created_at "partition key"
+    }
+
+    conversations ||--o{ messages : "has"
+```
+
 ```sql
 -- ── Extensions ────────────────────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";   -- gen_random_uuid()
@@ -103,7 +136,27 @@ UPDATE partman.part_config
    SET retention               = '90 days',
        retention_keep_table    = FALSE   -- DROP (not just detach)
  WHERE parent_table = 'public.messages';
+```
 
+The Gantt chart below illustrates how partition creation, active lifetime, and drops overlap across a rolling 90-day window.
+
+```mermaid
+gantt
+    title Monthly Partition Lifecycle (90-day retention)
+    dateFormat YYYY-MM
+    axisFormat %b %Y
+
+    section Partition lifecycle
+    messages_2026_03 (active)    : 2026-03-01, 90d
+    messages_2026_04 (active)    : 2026-04-01, 90d
+    messages_2026_05 (active)    : 2026-05-01, 90d
+    messages_2026_06 (pre-created): 2026-06-01, 30d
+
+    section Drops
+    DROP messages_2026_02         : milestone, 2026-05-29, 0d
+```
+
+```sql
 -- Indexes (inherited by all partitions)
 CREATE INDEX idx_messages_conversation_created
     ON messages (conversation_id, created_at DESC);
@@ -342,6 +395,29 @@ One consumer group, one write path, one database. No stitching, no coordination 
 
 
 ## 7. Write Path (Async via Kafka)
+
+The sequence diagram below traces a single user turn through the async write path, showing how SSE latency is fully decoupled from PostgreSQL writes.
+
+```mermaid
+sequenceDiagram
+    participant App as FastAPI Pod
+    participant RD as Redis
+    participant KF as Kafka
+    participant PG as PostgreSQL
+
+    App->>RD: load session (synchronous, ~1ms)
+    App->>KF: publish user message (fire-and-forget)
+    App->>App: run LangGraph pipeline → SSE to FE
+    App->>KF: publish bot messages (fire-and-forget)
+
+    Note over App: HTTP response closes
+
+    KF->>KF: batch 500 msgs or 100ms
+    KF->>PG: bulk INSERT messages (ON CONFLICT DO NOTHING)
+    KF->>RD: mark dedup keys (TTL 300s)
+
+    Note over PG: SSE latency is never\nblocked by DB writes
+```
 
 ```
 User message arrives (POST /chat/send-message)

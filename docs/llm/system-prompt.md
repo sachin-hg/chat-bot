@@ -295,6 +295,30 @@ If `getNearbyLandmarks` is called with invalid params, the orchestrator returns:
 
 ## System Prompt Structure
 
+The following diagram shows the block architecture and caching strategy for the assembled system prompt.
+
+```mermaid
+graph TB
+    subgraph static["Static blocks — always cached (5-minute prompt cache)"]
+        B0["[00] identity.md\nYou are Housing Assistant..."]
+        B1["[01] domain-guard.md\nOnly discuss Indian real estate..."]
+        B2["[02] safety.md\nContent filtering rules"]
+        B3["[03] factual-constraints.md\nAll claims must come from tool results"]
+        B4["[04] tool-use-rules.md\nTier B constraints, residual tool rules"]
+        B5["[05] output-format.md\nLength limits, language, is_followup handling"]
+    end
+
+    subgraph cached_per_intent["Cached per intent group"]
+        B6["[06] tool-definitions.md\nInject tool schemas for this intent\n[] for most · [getNearbyLandmarks + Tier B] for property_about"]
+    end
+
+    subgraph dynamic["Dynamic — NEVER cached (per-request)"]
+        B7["[07] session-context.md\ncity, filters, active entities, pre-fetched data, turn history"]
+    end
+
+    static --> cached_per_intent --> dynamic
+```
+
 The system prompt has four sections, assembled per request:
 
 ```

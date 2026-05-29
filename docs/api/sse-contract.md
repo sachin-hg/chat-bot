@@ -15,6 +15,38 @@ data: <JSON>\n
 
 ### C1. Turn Lifecycle
 
+The following diagram shows the full 3-phase SSE event sequence for a template intent turn.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant FE as Frontend
+    participant BE as Backend
+
+    U->>FE: types message
+    FE->>BE: POST /chat/send-message
+    BE-->>FE: connection_ack {messageId: request_id}
+
+    rect rgb(254, 243, 199)
+        Note over BE,FE: Phase 1 — summary_node (BEFORE data fetch)
+        BE-->>FE: message_delta {seq:0, chunk: "I see you're looking for..."}
+        BE-->>FE: chat_event {seq:0, type:text, state:IN_PROGRESS}
+    end
+
+    rect rgb(219, 234, 254)
+        Note over BE,FE: Phase 2 — respond_node (AFTER data fetch)
+        BE-->>FE: chat_event {seq:1, type:template, templateId:property_carousel, state:IN_PROGRESS}
+    end
+
+    rect rgb(209, 250, 229)
+        Note over BE,FE: Phase 3 — llm_node + followup_node
+        BE-->>FE: message_delta ×N {seq:2, streaming text chunks}
+        BE-->>FE: chat_event {seq:2, type:text, state:COMPLETED}
+    end
+
+    Note over FE: HTTP response closes — FE re-enables input
+```
+
 **Template intents** (property_search/*, locality_research/trending_localities, locality_research/locality_comparison, comparison/compare_localities, portfolio/recommendations, property_detail/similar_properties):
 ```
 1. connection_ack
@@ -40,6 +72,23 @@ data: <JSON>\n
 ```
 
 **Short-circuit turns** (Tier 0/1/2, clarification, auth-gated):
+
+The following diagram shows how a short-circuit turn emits a single COMPLETED event and closes immediately.
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend
+    participant BE as Backend
+
+    FE->>BE: POST /chat/send-message
+    BE-->>FE: connection_ack
+
+    Note over BE: Pipeline short-circuits\n(out_of_scope / Tier 1 / login / nested_qna)
+
+    BE-->>FE: chat_event {seq:0, state:COMPLETED}
+    Note over FE: Single event, HTTP closes immediately
+```
+
 ```
 1. connection_ack
 2. chat_event (single event via emit_final_state — sourceMessageState: "COMPLETED")
@@ -256,6 +305,19 @@ node set `bot_response` directly. `emit_final_state` is called at the HTTP handl
 exit; it does NOT fire for full-pipeline turns because `validated_text` will be non-None on those paths.
 
 **Sequence number assignment:**
+
+The following diagram shows how the sequence number for Phase 3 is derived from the outputs of Phases 1 and 2.
+
+```mermaid
+graph LR
+    SU{summary_node\nfired?}
+    SU -->|Yes| OFF1[offset = 1]
+    SU -->|No| OFF0[offset = 0]
+    OFF1 --> TC[+ template_count\nfrom respond_node]
+    OFF0 --> TC
+    TC --> SEQ["followup / llm seq = offset + template_count\n\nExample: summary fired + 1 template\n→ followup seq = 1 + 1 = 2"]
+```
+
 - `summary_node` → seq 0 (always, when emitted)
 - `respond_node` → seq_start = 1 if `summary_emitted` else 0; increments per template
 - `llm_node` message_delta → sequenceNumber = (1 if summary_emitted else 0) + template_count

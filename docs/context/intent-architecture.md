@@ -2,6 +2,29 @@
 
 ## Overview
 
+The following diagram shows the three layers of session state and how they relate to the per-request pipeline.
+
+```mermaid
+graph TB
+    subgraph redis["Redis — hot, ephemeral (TTL: 24h–7d)"]
+        SS["session:{id}\nactive_filters, entities, last_intent, city"]
+        CT["conv:turns:{id}\nlast 20 turns for LLM context"]
+        CS["conv:summary:{id}\ncompressed history > 20 turns"]
+    end
+
+    subgraph pipeline["LangGraph BotState — per request"]
+        BS["BotState TypedDict\nclassification, routing, pre_fetched_data\nsummary_emitted, template_count\ndomain, resolved_entities"]
+    end
+
+    subgraph postgres["PostgreSQL — durable"]
+        PG["conversations + messages\npersisted async via Kafka"]
+    end
+
+    redis -->|loaded at turn start| pipeline
+    pipeline -->|written back at turn end| redis
+    pipeline -->|async via Kafka| postgres
+```
+
 Every bot turn operates on a structured context object — not just a chat history. The context has six components. The LLM sees all six, assembled as its input. State evolves across turns as side effects of tool calls and FE-seeded page context.
 
 ```
@@ -31,6 +54,34 @@ Every bot turn operates on a structured context object — not just a chat histo
 **Context window split:**
 - The **SLM classifier** receives the last **3 turns** of conversation history. This is intentional — the classifier needs only the immediate context to determine intent and extract filter deltas.
 - The **LLM followup prompt** (`followup_node`) injects **last 3 turns** for Haiku (Tier 3a) and **last 10 turns** for Sonnet (Tier 3b). Redis stores up to 20 turns — injecting fewer keeps token cost bounded. Beyond the stored 20, a rolling summary replaces the oldest turns.
+
+The following diagram shows which slice of the stored turn history each consumer receives.
+
+```mermaid
+graph LR
+    subgraph stored["Redis conv:turns — stores last 20 turns"]
+        T20[Turn 1]
+        T19[Turn 2]
+        TDOT[...]
+        T1[Turn 20]
+    end
+
+    subgraph slm["SLM classifier sees\n3 most recent turns"]
+        SLM_IN[last 3 turns\n+ current message]
+    end
+
+    subgraph llm3a["LLM Tier 3a — Haiku\ninjects 3 turns"]
+        LLM3A_IN[last 3 turns\n+ session context\n+ pre-fetched data]
+    end
+
+    subgraph llm3b["LLM Tier 3b — Sonnet\ninjects 10 turns"]
+        LLM3B_IN[last 10 turns\n+ session context\n+ 6 parallel fetches]
+    end
+
+    stored --> slm
+    stored --> llm3a
+    stored --> llm3b
+```
 
 **Summarization mechanics:**
 - Trigger: when `conv:turns` LLEN would exceed 20 after the current turn
@@ -161,6 +212,32 @@ Node responsibilities:
 ---
 
 ## Routing Tiers
+
+The following decision tree shows how a classified intent is mapped to its execution tier.
+
+```mermaid
+flowchart TD
+    INTENT[main_intent + sub_intent\nfrom SLM classifier]
+
+    INTENT --> T0{Tier 0?\nout_of_scope /\nsafety}
+    T0 -->|Yes| R0[Canned response\nno AI, no data fetch]
+
+    T0 -->|No| T1{Tier 1?\ncalculator with all inputs\nor direct action}
+    T1 -->|Yes| R1[Orchestrator executes\nno LLM call]
+
+    T1 -->|No| T2{Tier 2?\ncalculator missing input\nor portfolio fetch}
+    T2 -->|Yes| R2[Orchestrator fetches + formats\nno LLM call]
+
+    T2 -->|No| T3{Tier 3a or 3b?}
+    T3 -->|3a — Haiku| R3A[Pre-fetch → Haiku\ncommentary / text response]
+    T3 -->|3b — Sonnet| R3B[Pre-fetch → Sonnet\ncomplex synthesis / comparison]
+
+    style R0 fill:#ef4444,color:#fff
+    style R1 fill:#f59e0b,color:#000
+    style R2 fill:#f59e0b,color:#000
+    style R3A fill:#4a9eff,color:#fff
+    style R3B fill:#6366f1,color:#fff
+```
 
 Every intent is assigned a tier in `INTENT_REGISTRY` (see `solid-architecture.md`). The tier determines which pipeline phases fire.
 

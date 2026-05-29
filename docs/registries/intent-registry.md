@@ -6,6 +6,29 @@ Single source of truth for all intents, their tiers, data requirements, and sess
 
 ## Part 1 — INTENT_REGISTRY
 
+The following diagram shows the fields of an `IntentRecord` and how each one drives a stage of the pipeline.
+
+```mermaid
+graph LR
+    subgraph ir["IntentRecord"]
+        MI[main_intent\nsub_intent]
+        TI["tier\n0|1|2|'3a'|'3b'"]
+        MO["model\n'haiku'|'sonnet'|None"]
+        DR["data_requirements\nDataRequirement[]\nparallel_group → asyncio.gather"]
+        RT["residual_tools\nLLM-callable tools for this intent"]
+        SI["session_inject\nkeys to include in LLM context"]
+        CO["carry_over_keys\npreserved on pivot"]
+        CL["clear_keys\ncleared on pivot"]
+    end
+
+    TI -->|drives| ROUTE[route_node\ntier decision]
+    MO -->|drives| MODEL[select_tier3_model\nHaiku vs Sonnet]
+    DR -->|drives| FETCH[fetch_data_node\nparallel API calls]
+    RT -->|drives| LLM_TOOLS[build_prompt_node\ntool_definitions]
+    SI -->|drives| CTX[build_session_state_block\nLLM context injection]
+    CO --> PIVOT[sanitize_filters_on_pivot\nwhat survives a domain switch]
+```
+
 ### Python Schema
 
 ```python

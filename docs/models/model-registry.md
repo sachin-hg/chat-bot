@@ -10,6 +10,23 @@ Every AI call in the system (SLM domain routing, SLM intent classification, LLM 
 
 **Design principle:** Graph nodes depend on `DomainRouterPort`, `ClassifierPort`, and `LLMPort` — Protocols, not concrete implementations. The MODEL_REGISTRY determines which concrete adapter backs each Protocol at startup. The pipeline is unaware of which provider or model version is running.
 
+The graph below shows every task registered in MODEL_REGISTRY and its key properties.
+
+```mermaid
+graph TB
+    MR["MODEL_REGISTRY\ndict[task_id, ModelAssignment]"]
+
+    MR --> DR["domain_router\nprovider: anthropic\nmodel: claude-haiku-4-5-20251001\n~200 tokens · ≤40ms"]
+    MR --> IPS["intent_classifier_property_search\nprovider: anthropic\nmodel: claude-haiku-4-5-20251001\n~800 tokens · ≤120ms"]
+    MR --> IPD["intent_classifier_property_detail"]
+    MR --> IL["intent_classifier_locality"]
+    MR --> IP["intent_classifier_project_research"]
+    MR --> IPO["intent_classifier_portfolio"]
+    MR --> LT3A["llm_tier3a\nprovider: anthropic\nmodel: claude-haiku-4-5-20251001\nstreaming"]
+    MR --> LT3B["llm_tier3b\nprovider: anthropic\nmodel: claude-sonnet-4-6\nstreaming · complex synthesis"]
+    MR --> SUM["conversation_summarizer\nhaiku · async · off critical path"]
+```
+
 ---
 
 ### ModelAssignment — per-task configuration
@@ -679,6 +696,21 @@ class ModelRouter:
 ```
 
 **Model experiment lifecycle:**
+
+The flowchart below traces a model experiment from configuration through monitoring to promotion or abort.
+
+```mermaid
+flowchart LR
+    A[Add ExperimentConfig\nto experiments.yaml\nno code deploy] --> B[5% traffic → variant\nmodel_variant type]
+    B --> C[Monitor metrics\naccuracy · latency · cost\nby experiment_variant tag]
+    C -->|5K calls + 7 days\nall gates pass| D[Human approval\nPR updating MODEL_REGISTRY]
+    C -->|guardrail breached| E[set enabled:false\nrevert instantly]
+    D --> F[Promote\nupdate model_id + adapter_class\nremove experiment entry]
+
+    style A fill:#10b981,color:#fff
+    style E fill:#ef4444,color:#fff
+    style F fill:#4a9eff,color:#fff
+```
 
 ```
 1. Add ExperimentConfig to experiments.yaml (no code deploy needed — hot-reloaded)

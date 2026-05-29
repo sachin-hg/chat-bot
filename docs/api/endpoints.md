@@ -30,6 +30,30 @@ accommodated is called out explicitly in [Conflicts and Design Decisions](#confl
 
 ## Part A — API Endpoints
 
+The following diagram shows the four primary endpoint interactions between the frontend and backend.
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend
+    participant BE as Backend
+
+    Note over FE,BE: Session setup (A1)
+    FE->>BE: GET /api/v1/chat/get-conversation-id
+    BE-->>FE: {conversationId, isNew}
+
+    Note over FE,BE: Chat turn (A3 — primary path)
+    FE->>BE: POST /api/v1/chat/send-message-streamed?streamingEnabled=true
+    BE-->>FE: SSE stream → see sse-contract.md
+
+    Note over FE,BE: History (A2)
+    FE->>BE: GET /api/v1/chat/get-conversation-details?pageSize=20
+    BE-->>FE: {messages: ChatEventToUser[], hasMore}
+
+    Note over FE,BE: Cancel (A5)
+    FE->>BE: POST /api/v1/chat/cancel
+    BE-->>FE: {ok: true}
+```
+
 ### A1. Get Conversation ID
 
 ```
@@ -175,6 +199,20 @@ the user from another service to the Search & Discovery bot.
 ## Part B — Message Envelopes
 
 ### B1. ChatEventToUser (Backend → Frontend)
+
+The following diagram shows all top-level fields in the `ChatEventToUser` envelope.
+
+```mermaid
+graph TB
+    EV["ChatEventToUser (every SSE chat_event + every DB row)"]
+    EV --> ID["messageId — unique row ID"]
+    EV --> SRC["sourceMessageId — the user message that triggered this"]
+    EV --> TYPE["messageType\ntext | markdown | template | user_action"]
+    EV --> STATE["messageState — IN_PROGRESS | COMPLETED"]
+    EV --> SEQ["sequenceNumber — 0-based, per turn"]
+    EV --> SENDER["sender.type — user | bot | system"]
+    EV --> CONTENT["content\n  .text — for text/markdown\n  .templateId + .data — for template\n  .derivedLabel — for user_action"]
+```
 
 Every SSE `chat_event` and every row in conversation history uses this envelope.
 

@@ -78,6 +78,21 @@ Write-side tools (`contactSeller`, `shortlistProperty`) must **never** be retrie
 Max retries: **1**. No multi-hop backoff loops — the per-turn latency budget cannot absorb them.
 Retry logic lives in the `CachedExecutorPort` implementation, using `tenacity` (`@retry`, `wait_fixed`, `stop_after_attempt`) — not in graph nodes.
 
+The diagram below shows how each node's timeout and retry budget maps to its specific fallback behaviour.
+
+```mermaid
+graph LR
+    REQ[Request] --> SLM[SLM Stage 1\n500ms timeout\n1 retry]
+    SLM -->|fail after 1 retry| FB_SLM[fallback:\nuse last_domain\nor out_of_scope]
+
+    REQ2[Request] --> FETCH[Tool fetch\nper-tool timeout\n1 retry]
+    FETCH -->|all fetches fail| FB_ALL[short-circuit:\nemit error SSE]
+    FETCH -->|partial fail| STUB[inject error stub\nLLM acknowledges partial data]
+
+    REQ3[Request] --> LLM2[LLM call\n10s timeout\n1 retry]
+    LLM2 -->|fail after retry| FB_LLM[emit error SSE\nrecoverable:true]
+```
+
 ### SLM Failure Fallback
 
 If SLM classification fails (timeout or 5xx) after 1 retry:
@@ -91,6 +106,22 @@ Do not attempt to classify with a backup model — the graph is already behind b
 
 A circuit breaker wraps each backend via the `ToolExecutorPort` implementation.
 Prevents cascading failures when a backend is degraded — fail fast instead of queue-and-wait.
+
+The state machine below shows the three states and the transitions between them.
+
+```mermaid
+stateDiagram-v2
+    [*] --> CLOSED: service healthy
+
+    CLOSED --> OPEN: failure_count >= threshold\nwithin rolling window
+    OPEN --> HALF_OPEN: after cooldown period\n(e.g. 30s for SLM)
+    HALF_OPEN --> CLOSED: probe request succeeds
+    HALF_OPEN --> OPEN: probe request fails
+
+    CLOSED: CLOSED\nAll requests pass through
+    OPEN: OPEN\nAll requests fail-fast\nReturn error immediately
+    HALF_OPEN: HALF-OPEN\nOne probe request allowed
+```
 
 ```
 CLOSED (normal)

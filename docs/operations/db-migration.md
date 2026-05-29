@@ -12,6 +12,27 @@ This is a live migration with zero downtime. All steps are reversible until Phas
 
 **Trigger condition:** One or more Q1–Q4 thresholds from Section 13 are breached.
 
+The diagram below shows the six phases in sequence, with colour coding indicating reversibility.
+
+```mermaid
+graph TD
+    P1["Phase 1\nDeploy MongoDB writer\nDual-write begins\n✅ Fully reversible"]
+    P2["Phase 2\nAdd content_ref column\nPostgres still stores content\n✅ Fully reversible"]
+    P3["Phase 3\nBackfill historical rows\ninto MongoDB\n✅ Additive only"]
+    P4["Phase 4\nSwitch reads to MongoDB\nbehind feature flag\n✅ Fully reversible"]
+    P5["Phase 5\nNull out Postgres content\n⚠️ DESTRUCTIVE — no rollback\nOnly after 30 days stable"]
+    P6["Phase 6\nCleanup\nRemove dual-write\nfinalise split"]
+
+    P1 --> P2 --> P3 --> P4 --> P5 --> P6
+
+    style P1 fill:#10b981,color:#fff
+    style P2 fill:#10b981,color:#fff
+    style P3 fill:#10b981,color:#fff
+    style P4 fill:#4a9eff,color:#fff
+    style P5 fill:#ef4444,color:#fff
+    style P6 fill:#6366f1,color:#fff
+```
+
 ---
 
 ### Phase 1 — Deploy MongoDB writer (parallel write, no read change)

@@ -13,6 +13,32 @@ Latency: ≤40ms                Latency: ≤120ms
 Node:    route_domain_node    Node: classify_node
 ```
 
+The diagram below illustrates the two-stage cascade architecture showing token budgets, output shapes, and the out_of_scope fast path that eliminates Stage 2 cost entirely.
+
+```mermaid
+graph TB
+    MSG[User message\n+ session context]
+
+    subgraph stage1["Stage 1: Domain Router — prompts/slm/domain_router.md"]
+        DR[DomainRouterPort\nclaude-haiku-4-5-20251001\n~170 cached + 30 uncached tokens]
+        OUT1["{ domain: 'property_search', confidence: 0.97 }"]
+    end
+
+    subgraph stage2["Stage 2: Domain-Scoped Classifier — prompts/slm/domains/<domain>.md"]
+        CL[ClassifierPort\nclaude-haiku-4-5-20251001\n~770 cached + 170 uncached tokens]
+        OUT2["{ main_intent, sub_intent,\nfilter_delta, entities_mentioned,\nclarification_needed, pivot }"]
+    end
+
+    MSG --> DR
+    DR --> OUT1
+    OUT1 -->|domain != out_of_scope| CL
+    OUT1 -->|domain == out_of_scope\nZERO stage 2 cost| DONE([out_of_scope fast path])
+    CL --> OUT2
+
+    style stage1 fill:#fef3c7
+    style stage2 fill:#dbeafe
+```
+
 **Why the cascade:**
 - The full INTENT_REGISTRY across all domains is ~2,500 tokens. At scale (10M calls/day) this costs ~$2,000/day in cached reads.
 - Domain-specific taxonomy files are ~800 tokens each — 68% cheaper for the same quality.
@@ -28,6 +54,41 @@ Swapping the underlying model requires only a new adapter — no pipeline change
 ---
 
 ## Domains
+
+The mindmap below shows the complete domain taxonomy with all sub-intents grouped under each of the five primary domains.
+
+```mermaid
+mindmap
+  root((Domains))
+    property_search
+      filter_search
+      explore_nearby
+      discovery_collections
+      save_alert
+    property_detail
+      property_about
+      floor_plan
+      similar_properties
+      contact_seller
+      calculate_emi
+    locality
+      trending_localities
+      locality_comparison
+      locality_overview
+      price_trends
+      commute_time
+      ratings_reviews
+    project_research
+      project_overview
+      project_price_trends
+      ratings_reviews
+      trending_projects
+    portfolio
+      saved_properties
+      viewed_properties
+      recent_searches
+      recommendations
+```
 
 ```
 property_search    browsing inventory, filter changes, collection search, save alerts
@@ -129,6 +190,20 @@ USER: "show me 2bhk in powai"
 Each domain has its own prompt file. These are generated from INTENT_REGISTRY and FILTER_REGISTRY at startup (same auto-generation as before, now domain-scoped).
 
 ### Prompt structure (per domain)
+
+The diagram below shows the five sections of a domain prompt file, highlighting which are always cached, which are cached per domain hash, and which are never cached.
+
+```mermaid
+graph TB
+    subgraph prompt["Domain Prompt File — e.g. prompts/slm/domains/property_search.md"]
+        S1["[SECTION 1]\nRole + Output Schema\nstatic — shared across all domains\nalways cached"]
+        S2["[SECTION 2]\nDomain Intent Taxonomy\nauto-generated from INTENT_REGISTRY\ncached per domain hash"]
+        S3["[SECTION 3]\nFilter Delta Rules\nauto-generated from FILTER_REGISTRY\ncached per domain hash"]
+        S4["[SECTION 4]\nDisambiguation Examples\ncurated per domain\ncached"]
+        S5["[SECTION 5]\nPer-request context\nmessage + history + active filters\nNEVER cached"]
+    end
+    S1 --> S2 --> S3 --> S4 --> S5
+```
 
 ```
 [SECTION 1: Role + Output Schema]        ← static, shared across all domain prompts

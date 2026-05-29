@@ -4,6 +4,25 @@
 
 Every bot turn is delivered as Server-Sent Events over the pipeline. For template intents there are three sequential phases; for text-only intents there is one.
 
+The following diagram shows the 3-phase SSE model from the LLM's perspective.
+
+```mermaid
+graph TB
+    subgraph phase1["Phase 1 — summary_node (BEFORE fetch)\nFor template intents only"]
+        S["Emit: 'I see you're looking for 2BHK in Powai...'\nis_followup = True for the LLM"]
+    end
+
+    subgraph phase2["Phase 2 — respond_node (AFTER fetch)\nTemplate intents only"]
+        T["Emit: property_carousel / locality_carousel / etc.\nLLM does NOT generate this — it's structured data"]
+    end
+
+    subgraph phase3["Phase 3 — llm_node + followup_node\nAll Tier 3 turns"]
+        L["LLM generates 1–3 sentence commentary\nif is_followup=True: do NOT repeat Phase 1 summary\nif text-only: full NLG response"]
+    end
+
+    phase1 --> phase2 --> phase3
+```
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  Phase 1 — summary  (summary_node)                              │
@@ -36,6 +55,20 @@ For **text-only intents** (no template), only Phase 3 fires, with `sequenceNumbe
 The LLM (Phase 3, `followup_node`) produces conversational commentary on data that has already been fetched and rendered. It should **not** repeat the Phase 1 acknowledgment. `LLMContext.is_followup` is `True` when `summary_emitted` is set, signalling the LLM that the opening acknowledgment has already been shown.
 
 ### Prompt guidance for the followup LLM
+
+The following diagram shows the behavioural difference between `is_followup = True` and `is_followup = False`.
+
+```mermaid
+graph LR
+    subgraph nofollowup["is_followup = False (text-only intent)"]
+        NF["LLM opens with a full response:\n'Mulund West scores 8.0/10 across 1,247 reviews...'"]
+    end
+
+    subgraph followup["is_followup = True (template intent)"]
+        F["Phase 1 ALREADY said: 'I see you're looking for 2BHK in Powai'\nPhase 2 ALREADY showed the property cards\n\nLLM opens with commentary:\n'47 results — good spread between ₹1.2–1.5 crore...'"]
+        WRONG["❌ WRONG: 'I see you're looking for 2BHK in Powai. Here are some options...'"]
+    end
+```
 
 The LLM in Phase 3 receives `is_followup: True` when a summary was already emitted. In this case:
 - Do **not** open with a restatement of what the user asked.

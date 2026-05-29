@@ -6,6 +6,28 @@ Schema, wire format, cache TTL, and error contract for every API tool the orches
 
 ## Part 2 — TOOL_REGISTRY
 
+The following diagram shows the fields of a `ToolRecord` and how each one drives a stage of the pipeline.
+
+```mermaid
+graph LR
+    subgraph tr["ToolRecord"]
+        TN[name\ntool identifier]
+        IP[input_params\nToolParam[]\nrequired, type, enum]
+        RS[return_schema_summary\nwhat fields LLM reads]
+        EC[error_contract\n404 / 503 / empty shapes]
+        AB[api_backend\nkhoj | casa | odin | venus | internal]
+        TTL[cache_ttl_seconds\n0 = live, 60–86400 = cached]
+        WS[write_side\nrequires confirmation card]
+        LV[llm_visible\nTrue = injected into tool_definitions]
+    end
+
+    IP -->|drives| BUILD[build_tool_definitions_block\nJSON schema for LLM]
+    EC -->|drives| ERR[fetch_data_node\nerror stub injection]
+    AB -->|drives| EXEC[CachedExecutorPort\nwhich HTTP client]
+    TTL -->|drives| CACHE[Redis cache key\nTTL strategy]
+    WS -->|drives| CONFIRM[execute_tier1_action\nconfirmation card gate]
+```
+
 ### Python Schema
 
 ```python

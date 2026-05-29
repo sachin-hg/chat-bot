@@ -6,6 +6,33 @@ System prompt file structure, cache strategy, block numbering, and LLMContext/LL
 
 ## Part 4 — Prompt Block Architecture
 
+The following diagram shows which prompt blocks are pre-rendered at startup, which are cached per intent, and which are assembled fresh on every request.
+
+```mermaid
+graph TB
+    subgraph startup["At startup — pre-rendered and cached"]
+        R["Registry hash computed\nSHA256 of INTENT_REGISTRY + FILTER_REGISTRY"]
+        T["Taxonomy block built\nfrom INTENT_REGISTRY"]
+        F["Filter delta block built\nfrom FILTER_REGISTRY"]
+    end
+
+    subgraph per_request["Per request — assembled dynamically"]
+        SP["Static blocks 00–05\n(identity, guard, safety, facts, tools, format)\nalways cache hit after first request"]
+        TD["Tool definitions block 06\ncached per sub_intent tool set\n2 variants: [] and [getNearbyLandmarks + Tier B]"]
+        SC["Session context block 07\ncity, filters, entities, pre-fetched data\nNEVER cached — changes every request"]
+    end
+
+    startup --> SP
+    startup --> TD
+    SC --> FINAL[Assembled LLM Prompt\n→ llm_node]
+    SP --> FINAL
+    TD --> FINAL
+
+    style SC fill:#ef4444,color:#fff
+    style SP fill:#10b981,color:#fff
+    style TD fill:#4a9eff,color:#fff
+```
+
 ### File Structure
 
 ```

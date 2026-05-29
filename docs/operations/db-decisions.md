@@ -74,6 +74,36 @@ The split becomes worthwhile when: content/day > ~30GB (template frequency incre
 
 ### How to think about each store's "job"
 
+The graph below maps each store to its role and shows how data flows between the application and each store.
+
+```mermaid
+graph TB
+    subgraph pg["PostgreSQL — The Ledger"]
+        PG1[conversations — one row per session]
+        PG2[messages — one row per chat event]
+        PG3["content JSONB — full payload (text + template)"]
+        PG4[Monthly partition drops for 90-day retention]
+    end
+
+    subgraph rd["Redis — Working Memory"]
+        RD1[Session state — active filters, entities]
+        RD2[Turn history — last 20 turns for LLM]
+        RD3[LLM concurrency gate]
+        RD4[Tool result cache]
+    end
+
+    subgraph kf["Kafka — The Delivery Truck"]
+        KF1[Decouples SSE path from DB writes]
+        KF2[Absorbs write bursts]
+        KF3[Ordered per conversation_id]
+    end
+
+    FE[Frontend] -->|History load: 1 query| pg
+    APP[App Pod] -->|Every turn: sub-ms reads| rd
+    APP -->|Fire-and-forget| kf
+    kf -->|Async batch INSERT| pg
+```
+
 ```
 PostgreSQL  =  The ledger
                Durable, ordered, queryable. Answers "what happened in this conversation?"
@@ -178,6 +208,31 @@ If production shows templates in < 10% of turns:
 ---
 
 ### The decision tree (compact form)
+
+The flowchart below is a visual form of the same decision tree, with colour-coded outcomes.
+
+```mermaid
+flowchart TD
+    Q1{Content/month\n> 1TB?}
+    Q1 -->|Yes| SPLIT[Trigger MongoDB split\nSee db-migration.md]
+    Q1 -->|No| Q2
+
+    Q2{Template p95 row size\n> 200KB?}
+    Q2 -->|Yes| SPLIT
+    Q2 -->|No| Q3
+
+    Q3{History load p95\n> 150ms after caching?}
+    Q3 -->|Yes| SPLIT
+    Q3 -->|No| Q4
+
+    Q4{Storage cost\n> $320/month?}
+    Q4 -->|Yes| REVIEW[Evaluate split\nat next capacity review]
+    Q4 -->|No| OK[Current architecture\ncorrect — no action]
+
+    style SPLIT fill:#ef4444,color:#fff
+    style REVIEW fill:#f59e0b,color:#000
+    style OK fill:#10b981,color:#fff
+```
 
 ```
 Is content/month > 1TB?  →  Yes → Trigger MongoDB split (Section 14)

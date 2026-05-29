@@ -6,6 +6,28 @@ Full request lifecycle pseudocode, streaming timeline, error handling table, LLM
 
 ## Bot Orchestrator: Request Lifecycle
 
+The following diagram shows the full request lifecycle from HTTP POST through the LangGraph pipeline to SSE close.
+
+```mermaid
+flowchart TD
+    POST[POST /chat/send-message] --> SESSION[Load session from Redis]
+    SESSION --> KAFKA1[Publish user message → Kafka]
+    KAFKA1 --> PIPELINE[Run LangGraph pipeline]
+
+    PIPELINE --> TIER{Tier}
+    TIER -->|0/1/2 short-circuit| SSE_FAST[emit_final_state\nSSE → COMPLETED]
+    TIER -->|3 — LLM path| PHASE1[summary_node\nPhase 1 SSE]
+    PHASE1 --> FETCH[fetch_data_node\nparallel API calls]
+    FETCH --> PHASE2[respond_node\nPhase 2 SSE templates]
+    PHASE2 --> PROMPT[build_prompt_node]
+    PROMPT --> LLM[llm_node\nstreaming Phase 3 SSE]
+    LLM --> VALIDATE[validate_output_node]
+    VALIDATE --> FOLLOWUP[followup_node\nCOMPLETED SSE]
+
+    FOLLOWUP --> KAFKA2[Publish bot messages → Kafka]
+    KAFKA2 --> CLOSE[HTTP response closes]
+```
+
 ```
 1. Receive user_message frame from WS layer
       │
@@ -206,6 +228,26 @@ This table covers the LLM-layer behaviours that follow from those failures.
 | LLM stream fails mid-response | Stream terminates before `end_turn` | Emit `error` SSE event to clear partial bubble; log with session_id for replay |
 | Context window exceeded | Claude returns `context_length_exceeded` | Drop oldest turns (keep last 3) and retry once; if still exceeds, summarise and retry |
 | SLM classifier failure | SLM timeout or 5xx after 1 retry | Route to `out_of_scope`; canned response; log `classifier_unavailable` metric |
+
+### LLM Concurrency Gate
+
+The following state diagram shows how incoming LLM requests are admitted, queued, or shed based on current concurrency.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Check: acquire_llm_slot()
+    Check --> Acquired: count < 120\nINCR counter
+    Check --> Queue: count == 120\nqueue length < 300
+    Check --> Shed: queue length >= 300\nemit error SSE 503
+
+    Acquired --> LLMCall: run LLM
+    LLMCall --> Release: DECR counter\npublish slot_available
+    Release --> [*]
+
+    Queue --> WaitSignal: BLPOP or pub/sub
+    WaitSignal --> Acquired: slot available within 8s
+    WaitSignal --> Timeout: > 8s\nemit error SSE llm_timeout
+```
 
 ### LLM Retry Policy
 

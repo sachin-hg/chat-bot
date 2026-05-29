@@ -4,6 +4,29 @@ Full tool schemas, orchestrator API translations, tool visibility, data flow pat
 
 ---
 
+The following diagram shows how tools are split across three execution paths relative to the LLM.
+
+```mermaid
+graph TB
+    subgraph pre["Pre-fetch (DataFetchMiddleware — BEFORE LLM)"]
+        TPA["Tier A tools — searchProperties, getPropertyDetail,\ngetLocalityDetail, getPriceTrends...\nOrchestrator calls these, LLM sees results in context\nllm_visible = False"]
+    end
+
+    subgraph residual["Residual tool (Mid-LLM stream — property_about only)"]
+        TR["getNearbyLandmarks\nLLM calls this when user asks 'what's nearby?'\nllm_visible = True"]
+    end
+
+    subgraph tierb["Tier B tools (LLM-callable — all Tier 3 except calculator/*)"]
+        TB["calculateEMI · calculateAffordability · convertUnit\nLLM calls when all inputs explicitly stated by user\nllm_visible = True"]
+    end
+
+    pre --> LLM[LLM sees results\nas inline context]
+    residual --> LLM
+    tierb --> LLM
+```
+
+---
+
 ## Tool Schemas (Full Definitions)
 
 ### `searchProperties`
@@ -745,6 +768,30 @@ Cap enforcement: 400 → "You have reached the max limit of 5 alerts."
 ---
 
 ## Tool Visibility
+
+The following diagram maps every tool to whether it is callable by the LLM or orchestrator-only.
+
+```mermaid
+graph LR
+    subgraph orchestrator["Orchestrator-only\nllm_visible = False"]
+        O1[searchProperties]
+        O2[getPropertyDetail]
+        O3[getLocalityDetail]
+        O4[getPriceTrends]
+        O5[resolveEntity]
+        O6["... all Tier A tools"]
+    end
+
+    subgraph llmvisible["LLM-visible\nllm_visible = True"]
+        L1["getNearbyLandmarks\n(residual — property_about only)"]
+        L2["calculateEMI\n(Tier B)"]
+        L3["calculateAffordability\n(Tier B)"]
+        L4["convertUnit\n(Tier B)"]
+    end
+
+    LLM[LLM] -->|can call| llmvisible
+    LLM -.->|cannot see| orchestrator
+```
 
 Tools are split into two categories. The LLM only ever sees `llm_visible: true` tools.
 
