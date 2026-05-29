@@ -24,13 +24,13 @@ The diagram below shows how the routing gateway directs each service to its prot
 graph LR
     GW[Routing Gateway]
 
-    subgraph SSE["AI Bots — SSE (stateless per turn)"]
+    subgraph SSE["AI Bots - SSE (stateless per turn)"]
         SD[Search & Discovery]
         SM[Seller Management]
         SA[Support Agent]
     end
 
-    subgraph WS["Relay — WebSocket (persistent connection)"]
+    subgraph WS["Relay - WebSocket (persistent connection)"]
         SH[Support Human Chat]
         US[User-Seller Chat]
     end
@@ -224,10 +224,10 @@ The state machine below formalises the client connection lifecycle — the clien
 ```mermaid
 stateDiagram-v2
     [*] --> IDLE
-    IDLE --> SSE_CONNECTED : gateway returns SSE endpoint\n(search_discovery / seller_mgmt / support_agent)
-    SSE_CONNECTED --> SSE_CONNECTED : turn completes, new POST for next message
-    SSE_CONNECTED --> IDLE : mode switch → query gateway
-    IDLE --> WS_CONNECTED : gateway returns WS endpoint\n(user_seller_chat / support_human)
+    IDLE --> SSE_CONNECTED : SSE endpoint returned (AI bots)
+    SSE_CONNECTED --> SSE_CONNECTED : new turn starts
+    SSE_CONNECTED --> IDLE : mode switch
+    IDLE --> WS_CONNECTED : WS endpoint returned (relay)
     WS_CONNECTED --> IDLE : session ends
     IDLE --> [*]
 ```
@@ -388,7 +388,7 @@ sequenceDiagram
     U->>A: "I bought Housing Premium but my RM hasn't called"
     A->>A: out_of_scope signal (support topic)
     A->>G: out_of_scope + HandoffContext{summary, entities}
-    G->>G: SLM routes → support_agent
+    G->>G: SLM routes --> support_agent
     G->>B: RouteResponse{endpoint, session_token, handoff_context}
     B-->>U: "I see you recently purchased Premium. Are you following up on RM assignment?"
 ```

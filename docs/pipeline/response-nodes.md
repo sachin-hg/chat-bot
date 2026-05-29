@@ -33,6 +33,7 @@ sequenceDiagram
 
 ---
 
+```python
 # ── 10. fetch_data_node ───────────────────────────────────────────────
 # Pre-fetches all data the LLM needs BEFORE the LLM call.
 # Uses asyncio.gather(return_exceptions=True) — one slow/failed fetch never kills the group.
@@ -277,6 +278,7 @@ async def respond_node(state: BotState, emit_sse: Callable) -> dict:
 # Emits the LLM-generated text as the FINAL message in this turn.
 
 # The diagram below shows how the final sequence number for followup and llm events is calculated from the summary and template offsets.
+```
 
 ```mermaid
 graph LR
@@ -298,6 +300,7 @@ graph LR
 # Input:  state['validated_text'], state['summary_emitted'], state['template_count'],
 #         state['llm_response']['text_message_id']
 # Output: state['bot_response']; emits final chat_event (text/markdown); persists session
+```python
 async def followup_node(state: BotState, emit_sse: Callable) -> dict:
     c               = state['classification']
     source_msg_id   = state['request_id']
@@ -355,6 +358,8 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
     return {'bot_response': bot_response}
 ```
 
+```
+
 ### Pipeline Helper Definitions
 
 ```python
@@ -362,6 +367,7 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
 # Pre-fetched data is always authoritative. Residual tool results (get_nearby_landmarks)
 # are merged in for any tool key not already present in pre_fetched_data.
 # This ensures a residual call can never silently override a pre-fetched result.
+```python
 def merge_pre_fetched_and_residual(
     pre_fetched: dict[str, Any] | None,
     residual_results: list[dict],
@@ -379,11 +385,14 @@ def merge_pre_fetched_and_residual(
 # caught by asyncio.gather(return_exceptions=True) in fetch_data_node).
 ```
 
+```
+
 ### Helper Function Contracts
 
 These functions are called by graph nodes. Their contracts are defined here once; implementations
 live in their respective modules. This prevents nodes from needing to know implementation details.
 
+```python
 ```python
 # ── compact_filters ───────────────────────────────────────────────────
 # Strips None values and removes internal-only keys before the SLM sees session state.
@@ -561,6 +570,7 @@ def build_login_template_response(main_intent: str, sub_intent: str) -> dict:
 # One entry per (main_intent, sub_intent) that warrants a pre-fetch summary.
 
 # The diagram below shows how both registries dispatch from the same intent_key, with SUMMARY_BUILDERS controlling Phase 1 emission and FOLLOWUP_PROMPT_BLOCKS selecting the LLM prompt file.
+```
 
 ```mermaid
 graph TD
@@ -572,7 +582,7 @@ graph TD
     IN --> FPB{FOLLOWUP_PROMPT_BLOCKS\nlookup}
     FPB -->|Found| PROMPT[load domain-specific\nprompt file]
     FPB -->|Not found| GENERIC[fallback:\nprompts/llm/main/generic.md]
-    PROMPT --> LLM[build_prompt_node\n→ llm_node]
+    PROMPT --> LLM[build_prompt_node\n--> llm_node]
     GENERIC --> LLM
 ```
 # Each value is a pure function: (classification, session, resolved_entities) → str.
@@ -586,6 +596,7 @@ graph TD
 # MUST use resolved entity display_name (not raw user text) — the DB entity must be
 # confirmed before naming it, otherwise the eagerness guard already skipped us.
 
+```python
 def _resolved_name(resolved: dict, entity_type: str) -> str | None:
     for v in resolved.values():
         if v.get('entity_type') == entity_type:
@@ -719,11 +730,14 @@ FOLLOWUP_PROMPT_BLOCKS: dict[tuple[str, str], str] = {
 # Testing: pass a MockToolExecutor / MockLLM / MockClassifier in place of real adapters.
 ```
 
+```
+
 ### LangGraph Wiring
 
 ```python
 from langgraph.graph import StateGraph, END
 
+```python
 def should_continue(state: BotState) -> str:
     """Conditional edge: if bot_response is set, stop (go to END); else continue."""
     return END if state.get('bot_response') else 'continue'
@@ -781,6 +795,8 @@ for src, dst in [
 graph.add_edge('followup', END)
 
 bot_pipeline = graph.compile()
+```
+
 ```
 
 ### Graph Node Invariants

@@ -11,11 +11,11 @@ The following diagram shows the full request lifecycle from HTTP POST through th
 ```mermaid
 flowchart TD
     POST[POST /chat/send-message] --> SESSION[Load session from Redis]
-    SESSION --> KAFKA1[Publish user message → Kafka]
+    SESSION --> KAFKA1[Publish user message --> Kafka]
     KAFKA1 --> PIPELINE[Run LangGraph pipeline]
 
     PIPELINE --> TIER{Tier}
-    TIER -->|0/1/2 short-circuit| SSE_FAST[emit_final_state\nSSE → COMPLETED]
+    TIER -->|0/1/2 short-circuit| SSE_FAST[emit_final_state\nSSE --> COMPLETED]
     TIER -->|3 — LLM path| PHASE1[summary_node\nPhase 1 SSE]
     PHASE1 --> FETCH[fetch_data_node\nparallel API calls]
     FETCH --> PHASE2[respond_node\nPhase 2 SSE templates]
@@ -24,7 +24,7 @@ flowchart TD
     LLM --> VALIDATE[validate_output_node]
     VALIDATE --> FOLLOWUP[followup_node\nCOMPLETED SSE]
 
-    FOLLOWUP --> KAFKA2[Publish bot messages → Kafka]
+    FOLLOWUP --> KAFKA2[Publish bot messages --> Kafka]
     KAFKA2 --> CLOSE[HTTP response closes]
 ```
 

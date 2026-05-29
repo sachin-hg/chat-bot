@@ -24,7 +24,7 @@ graph TB
 
     startup --> SP
     startup --> TD
-    SC --> FINAL[Assembled LLM Prompt\n→ llm_node]
+    SC --> FINAL[Assembled LLM Prompt\n--> llm_node]
     SP --> FINAL
     TD --> FINAL
 

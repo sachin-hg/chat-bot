@@ -10,8 +10,8 @@ The diagram below shows the linear flow of all processing nodes from validated c
 graph LR
     VS([from validate_slm]) --> FA[filter_apply\nmerge filter_delta\nADD vs REPLACE]
     FA --> SA[sanitize\nprice sanity\nservice conflict check]
-    SA --> DE[derive\nprice_per_sqft→abs\nlandmark anchor→lat_lng]
-    DE --> CL[clarify\nif clarification_needed:\nemit nested_qna → END]
+    SA --> DE[derive\nprice_per_sqft-->abs\nlandmark anchor-->lat_lng]
+    DE --> CL[clarify\nif clarification_needed:\nemit nested_qna --> END]
     CL --> RE[resolve_entities\nautosuggest API\nordinal resolution]
     RE --> RT[route\ndetermine tier\ncheck requires_auth]
     RT --> SU([summary_node])
@@ -19,16 +19,19 @@ graph LR
 
 ---
 
+```python
 # ── 4. filter_apply_node ──────────────────────────────────────────────
 # Merge filter_delta into session.active_filters.
+
+```
 
 # The diagram below illustrates how filter_apply_node chooses between ADD and REPLACE semantics based on the FilterRecord's default_operation.
 
 ```mermaid
 graph TD
     FD[filter_delta from SLM] --> Q{FilterRecord\ndefault_operation?}
-    Q -->|REPLACE| R[Replace entire value\nbhk: current=[2,3]\ndelta=[3] → stored=[3]]
-    Q -->|ADD| A[Merge into existing\namenities: current=[lift]\ndelta=[pool] → stored=[lift,pool]]
+    Q -->|REPLACE| R[Replace entire value\nbhk: current=[2,3]\ndelta=[3] --> stored=[3]]
+    Q -->|ADD| A[Merge into existing\namenities: current=[lift]\ndelta=[pool] --> stored=[lift,pool]]
     A --> G{existing is null?}
     G -->|Yes — treat as empty list| A2[stored = delta value\nnot replace]
     G -->|No| A3[stored = existing + new items]
@@ -40,6 +43,7 @@ graph TD
 # absolute range, search_anchor → lat/lng). It no longer needs to re-parse amounts.
 # Input:  state['classification']['filter_delta'], state['session']['active_filters']
 # Output: updated session['active_filters']; state['filter_delta_applied']
+```python
 async def filter_apply_node(state: BotState) -> dict:
     c = state.get('classification') or {}
     filter_delta = c.get('filter_delta')
@@ -56,7 +60,9 @@ async def filter_apply_node(state: BotState) -> dict:
         session = apply_filter_delta(session, filter_delta)
         return {'session': session, 'filter_delta_applied': True}
     return {}
+```
 
+```python
 # ── 5. sanitize_node ──────────────────────────────────────────────────
 # Runs sanitize_filters_on_pivot() when the intent changed.
 # Input:  state['classification']['pivot'], state['session']
@@ -165,16 +171,17 @@ async def resolve_entities_node(state: BotState) -> dict:
 # Determines tier, model, auth check. Short-circuits tiers 0/1/2.
 
 # The flowchart below shows the tier decision tree inside route_node, including the auth check and each short-circuit exit.
+```
 
 ```mermaid
 flowchart TD
     RN[route_node] --> A1{requires_auth=True\nno auth_token?}
-    A1 -->|Yes| SC_AUTH[bot_response = login template\nshort-circuit → END]
+    A1 -->|Yes| SC_AUTH[bot_response = login template\nshort-circuit --> END]
     A1 -->|No| T{IntentRecord.tier}
-    T -->|0| SC0[out_of_scope response\nshort-circuit → END]
-    T -->|1| SC1[execute_tier1_action\nshort-circuit → END]
-    T -->|2| SC2[execute_tier2_action\nshort-circuit → END]
-    T -->|'3a' or '3b'| LLM[routing = tier + model\nproceed → summary_node]
+    T -->|0| SC0[out_of_scope response\nshort-circuit --> END]
+    T -->|1| SC1[execute_tier1_action\nshort-circuit --> END]
+    T -->|2| SC2[execute_tier2_action\nshort-circuit --> END]
+    T -->|'3a' or '3b'| LLM[routing = tier + model\nproceed --> summary_node]
 
     style SC_AUTH fill:#6366f1,color:#fff
     style SC0 fill:#ef4444,color:#fff
@@ -186,6 +193,7 @@ flowchart TD
 # so record is always defined here (no fallback needed for tier/model).
 # Input:  state['classification'], state['session'], INTENT_REGISTRY
 # Output: state['routing']
+```python
 async def route_node(state: BotState) -> dict:
     c            = state['classification']
     main_intent  = c['main_intent']
@@ -214,7 +222,9 @@ async def route_node(state: BotState) -> dict:
         return {'routing': routing, 'bot_response': await execute_tier2_action(state)}
 
     return {'routing': routing}
+```
 
+```python
 # ── 9b. summary_node ───────────────────────────────────────────────────
 # Emits a SHORT, deterministic summary message BEFORE data fetching begins.
 # Goal: user sees a "what I understood" confirmation immediately after entity resolution —
@@ -348,3 +358,4 @@ async def execute_prefetch(
     key = req.fetch_key or req.tool
     return key, data
 
+```

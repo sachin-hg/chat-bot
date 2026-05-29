@@ -111,7 +111,7 @@ graph TD
     RT -->|Tier 0 out_of_scope| SC0[emit_final_state\ncanned response]
     RT -->|Tier 1 direct action| SC1[emit_final_state\nexecute + respond]
     RT -->|Tier 2 orchestrator| SC2[emit_final_state\nfetch + format]
-    RT -->|Tier 3a/3b LLM| LLM[summary → experiment\n→ fetch_data → respond\n→ build_prompt → llm\n→ validate_output → followup]
+    RT -->|Tier 3a/3b LLM| LLM[summary --> experiment\n--> fetch_data --> respond\n--> build_prompt --> llm\n--> validate_output --> followup]
 
     style SC0 fill:#ef4444,color:#fff
     style SC1 fill:#f59e0b,color:#000

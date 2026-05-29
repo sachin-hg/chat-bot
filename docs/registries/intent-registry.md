@@ -4,6 +4,91 @@ Single source of truth for all intents, their tiers, data requirements, and sess
 
 ---
 
+## Intent Taxonomy Overview
+
+The full intent hierarchy grouped by domain and tier. Each domain maps to a Stage 2 SLM prompt file; each sub-intent maps to one `IntentRecord` in the registry below.
+
+```mermaid
+graph TD
+    subgraph T0["Tier 0 - No AI"]
+        OOS[out_of_scope/out_of_scope_query]
+        INS[out_of_scope/insufficient_info]
+        SOC[out_of_scope/social_pleasantry]
+    end
+
+    subgraph T1["Tier 1 - Direct Action"]
+        CS[property_detail/contact_seller]
+        SP[property_detail/save_property]
+        RS[property_detail/remove_saved]
+        CU[property_detail/convert_unit]
+    end
+
+    subgraph T2["Tier 2 - Orchestrator Fetch"]
+        SA[property_search/save_alert]
+        SV[portfolio/saved_properties]
+        VW[portfolio/viewed_properties]
+        RC[portfolio/recent_searches]
+        CE[property_detail/calculate_emi]
+        CA[calculator/calculate_affordability]
+    end
+
+    subgraph T3A["Tier 3a - Haiku LLM"]
+        subgraph PS["property_search"]
+            FS[filter_search]
+            EN[explore_nearby]
+            DC[discovery_collections]
+        end
+        subgraph PD["property_detail"]
+            PA[property_about]
+            FP[floor_plan]
+            SP2[similar_properties]
+            NL[nearby_landmarks]
+        end
+        subgraph LR["locality_research"]
+            TL[trending_localities]
+            LC[locality_comparison]
+            LO[locality_overview]
+            PT[price_trends]
+            CT[commute_time]
+            RR[ratings_reviews]
+            MI[market_insight]
+            PF[price_fairness]
+            FS2[filter_suggestions]
+            TS[top_societies]
+            CO2[city_orientation]
+        end
+        subgraph PR["project_research"]
+            PO[project_overview]
+            PPT[project_price_trends]
+            PRR[ratings_reviews]
+            TP[trending_projects]
+        end
+        subgraph PF2["portfolio"]
+            REC[recommendations]
+        end
+    end
+
+    subgraph T3B["Tier 3b - Sonnet LLM"]
+        CL[comparison/compare_localities]
+        CP[comparison/compare_projects]
+        MD[multi_intent/decompose]
+    end
+```
+
+---
+
+## Tier Reference
+
+| Tier | Model | Reaches LLM? | Example intents |
+|---|---|---|---|
+| **0** | None | No | out_of_scope, safety blocks |
+| **1** | None | No | contact_seller, save_property, convert_unit |
+| **2** | None | No | save_alert, saved_properties, calculate_emi |
+| **3a** | Haiku | Yes | filter_search, property_about, locality_overview |
+| **3b** | Sonnet | Yes | compare_localities, compare_projects, multi_intent |
+
+---
+
 ## Part 1 — INTENT_REGISTRY
 
 The following diagram shows the fields of an `IntentRecord` and how each one drives a stage of the pipeline.
@@ -14,7 +99,7 @@ graph LR
         MI[main_intent\nsub_intent]
         TI["tier\n0|1|2|'3a'|'3b'"]
         MO["model\n'haiku'|'sonnet'|None"]
-        DR["data_requirements\nDataRequirement[]\nparallel_group → asyncio.gather"]
+        DR["data_requirements\nDataRequirement[]\nparallel_group --> asyncio.gather"]
         RT["residual_tools\nLLM-callable tools for this intent"]
         SI["session_inject\nkeys to include in LLM context"]
         CO["carry_over_keys\npreserved on pivot"]

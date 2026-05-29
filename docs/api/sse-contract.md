@@ -315,7 +315,7 @@ graph LR
     SU -->|No| OFF0[offset = 0]
     OFF1 --> TC[+ template_count\nfrom respond_node]
     OFF0 --> TC
-    TC --> SEQ["followup / llm seq = offset + template_count\n\nExample: summary fired + 1 template\n→ followup seq = 1 + 1 = 2"]
+    TC --> SEQ["followup / llm seq = offset + template_count\n\nExample: summary fired + 1 template\n--> followup seq = 1 + 1 = 2"]
 ```
 
 - `summary_node` → seq 0 (always, when emitted)

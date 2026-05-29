@@ -318,7 +318,7 @@ The flowchart below shows the full experiment lifecycle from data collection thr
 
 ```mermaid
 flowchart TD
-    START[Experiment running\ntraffic_pct: 0.05 → 1.0]
+    START[Experiment running\ntraffic_pct: 0.05 --> 1.0]
     START --> COLLECT[Collect metrics\nby experiment_variant tag\nin structured logs]
     COLLECT --> CHECK{min_sample_per_variant\nreached AND\nmin_observation_days elapsed?}
     CHECK -->|No| COLLECT

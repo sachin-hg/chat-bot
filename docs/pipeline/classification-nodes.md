@@ -33,6 +33,7 @@ graph LR
 
 ---
 
+```python
 # ── 1. safety_node ────────────────────────────────────────────────────
 # Tier 0. Regex-only — no AI.
 # Input:  state['raw_message']
@@ -202,19 +203,22 @@ async def classify_node(state: BotState, classifier: ClassifierPort) -> dict:
 
 ```mermaid
 flowchart TD
+```python
     IN[Raw SLM output] --> V1{Required fields\npresent?}
     V1 -->|No| ERR1[log slm_invalid_output\nshort-circuit: out_of_scope]
     V1 -->|Yes| V2{main_intent in\nDOMAIN_MAIN_INTENTS\nfor routed domain?}
     V2 -->|No — cross-domain hallucination| ERR2[log cross_domain_intent\nshort-circuit: out_of_scope]
     V2 -->|Yes| V3{intent pair in\nINTENT_REGISTRY?}
     V3 -->|No| ERR3[log unknown_intent\nshort-circuit: out_of_scope]
-    V3 -->|Yes| COERCE[type-coerce mis-shapes\ne.g. localities: str → list]
+    V3 -->|Yes| COERCE[type-coerce mis-shapes\ne.g. localities: str --> list]
     COERCE --> OK[Validated classification\npasses to filter_apply_node]
 
     style ERR1 fill:#ef4444,color:#fff
     style ERR2 fill:#ef4444,color:#fff
     style ERR3 fill:#ef4444,color:#fff
     style OK fill:#10b981,color:#fff
+```
+
 ```
 # Also cross-checks that the returned intent belongs to the domain routed
 # by Stage 1 — catches the rare case where Stage 2 hallucinates a cross-domain intent.

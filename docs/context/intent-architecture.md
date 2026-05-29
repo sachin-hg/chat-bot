@@ -229,8 +229,8 @@ flowchart TD
     T2 -->|Yes| R2[Orchestrator fetches + formats\nno LLM call]
 
     T2 -->|No| T3{Tier 3a or 3b?}
-    T3 -->|3a — Haiku| R3A[Pre-fetch → Haiku\ncommentary / text response]
-    T3 -->|3b — Sonnet| R3B[Pre-fetch → Sonnet\ncomplex synthesis / comparison]
+    T3 -->|3a — Haiku| R3A[Pre-fetch --> Haiku\ncommentary / text response]
+    T3 -->|3b — Sonnet| R3B[Pre-fetch --> Sonnet\ncomplex synthesis / comparison]
 
     style R0 fill:#ef4444,color:#fff
     style R1 fill:#f59e0b,color:#000

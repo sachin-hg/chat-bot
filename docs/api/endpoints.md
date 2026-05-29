@@ -43,7 +43,7 @@ sequenceDiagram
 
     Note over FE,BE: Chat turn (A3 — primary path)
     FE->>BE: POST /api/v1/chat/send-message-streamed?streamingEnabled=true
-    BE-->>FE: SSE stream → see sse-contract.md
+    BE-->>FE: SSE stream --> see sse-contract.md
 
     Note over FE,BE: History (A2)
     FE->>BE: GET /api/v1/chat/get-conversation-details?pageSize=20

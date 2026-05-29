@@ -41,7 +41,7 @@ erDiagram
         message_type_enum message_type
         message_state_enum message_state
         SMALLINT sequence_number
-        UUID source_message_id "links bot → user message"
+        UUID source_message_id "links bot --> user message"
         TEXT template_id "set for template rows"
         JSONB content "full payload, max ~100KB"
         TIMESTAMPTZ created_at "partition key"
@@ -407,7 +407,7 @@ sequenceDiagram
 
     App->>RD: load session (synchronous, ~1ms)
     App->>KF: publish user message (fire-and-forget)
-    App->>App: run LangGraph pipeline → SSE to FE
+    App->>App: run LangGraph pipeline --> SSE to FE
     App->>KF: publish bot messages (fire-and-forget)
 
     Note over App: HTTP response closes

@@ -701,7 +701,7 @@ The flowchart below traces a model experiment from configuration through monitor
 
 ```mermaid
 flowchart LR
-    A[Add ExperimentConfig\nto experiments.yaml\nno code deploy] --> B[5% traffic → variant\nmodel_variant type]
+    A[Add ExperimentConfig\nto experiments.yaml\nno code deploy] --> B[5% traffic --> variant\nmodel_variant type]
     B --> C[Monitor metrics\naccuracy · latency · cost\nby experiment_variant tag]
     C -->|5K calls + 7 days\nall gates pass| D[Human approval\nPR updating MODEL_REGISTRY]
     C -->|guardrail breached| E[set enabled:false\nrevert instantly]

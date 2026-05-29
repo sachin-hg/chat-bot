@@ -371,6 +371,15 @@ user_message:        The new query to classify.
 
 ## System Prompt
 
+> **This is NOT hardcoded.** The full prompt shown below is **assembled at startup** by composing multiple registries:
+> - **Section 1 (rules + output schema):** static file `prompts/slm/domains/<domain>.md`, authored once per domain
+> - **Section 2 (intent taxonomy):** auto-generated from `INTENT_REGISTRY` via `build_intent_taxonomy_block()` — edit the registry, not this file
+> - **Section 3 (filter delta rules):** auto-generated from `FILTER_REGISTRY` via `build_filter_delta_block()` — same principle
+> - **Section 4 (examples):** curated per-domain example file `slm/examples/<domain>/`
+> - **Section 5 (per-request context):** injected at runtime (message + history + active filters)
+>
+> Adding a new intent = add an `IntentRecord` to `INTENT_REGISTRY`. The prompt updates automatically on next startup. See the [Taxonomy Update Checklist](slm-classifier.md#taxonomy-update-checklist).
+
 ```
 You are a strict intent classification engine for Housing.com's real estate assistant bot.
 Your ONLY job is to analyze user messages — with conversation history for context — and

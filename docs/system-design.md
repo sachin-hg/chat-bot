@@ -23,25 +23,24 @@ graph TB
     end
 
     subgraph Gateway
-        GW[Routing Gateway\nConnection Broker]
+        GW["Routing Gateway<br/>Connection Broker"]
     end
 
-    subgraph AI Bots — SSE
-        SD[Search & Discovery Bot\nLangGraph Pipeline]
+    subgraph aibots["AI Bots - SSE"]
+        SD["Search & Discovery Bot<br/>LangGraph Pipeline"]
         SM[Seller Management Bot]
         SA[Support Agent Bot]
     end
 
-    subgraph Relay Services — WebSocket
+    subgraph relayws["Relay Services - WebSocket"]
         SH[Support Human Chat]
         US[User-Seller Chat]
     end
 
-    subgraph Shared Infrastructure
-        PG[(PostgreSQL\nChat History)]
-        RD[(Redis Cluster\nSession State)]
-        KF[(Kafka\nAsync Writes)]
-        MG[(MongoDB\nif migrated)]
+    subgraph infra["Shared Infrastructure"]
+        PG[("PostgreSQL<br/>Chat History")]
+        RD[("Redis Cluster<br/>Session State")]
+        KF[("Kafka<br/>Async Writes")]
     end
 
     FE -->|1 handshake per session| GW
@@ -178,7 +177,7 @@ sequenceDiagram
     App->>RD: load session (~1ms)
     App->>KF: publish user message (fire-and-forget)
     App->>App: run LangGraph pipeline
-    App-->>FE: SSE stream (connection_ack → events → COMPLETED)
+    App-->>FE: SSE stream (connection_ack --> events --> COMPLETED)
     App->>KF: publish bot messages (fire-and-forget)
     Note over App,FE: HTTP response closes after COMPLETED
     KF->>PG: batch INSERT messages (async, ~100ms delay)
