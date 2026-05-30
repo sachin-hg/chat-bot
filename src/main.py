@@ -4,8 +4,9 @@ from contextlib import asynccontextmanager
 import structlog.contextvars
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-from src.api import chat, health
+from src.api import chat, health, playground
 from src.config import get_settings
 from src.db.engine import close_engine, get_engine
 from src.kafka.producer import init_producer, stop_producer
@@ -91,3 +92,5 @@ async def request_id_middleware(request: Request, call_next):
 
 app.include_router(health.router)
 app.include_router(chat.router)
+app.include_router(playground.router)
+app.mount("/static", StaticFiles(directory="src/static"), name="static")

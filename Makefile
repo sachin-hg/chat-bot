@@ -1,5 +1,6 @@
 .PHONY: setup up down logs migrate seed test test-unit test-int eval \
-        health clean shell redis-cli logs-pretty logs-errors logs-cost dry-run \
+        health clean shell redis-cli logs-pretty logs-errors logs-cost logs-pipeline \
+        dry-run setup-local check-deps \
         agents agents-resume agents-standup agents-bus agents-agent
 
 # ── Python env ────────────────────────────────────────────────────────────
@@ -78,6 +79,43 @@ logs-errors:
 logs-cost:
 	@command -v jq >/dev/null || (echo "jq not installed: brew install jq" && exit 1)
 	uvicorn src.main:app 2>&1 | jq -r 'select(.event=="llm_call") | "\(.ts)  model=\(.model)  cost_usd=\(.cost_usd)  latency_ms=\(.latency_ms)"'
+
+# Tail structlog output and filter to pipeline node events only (requires jq)
+logs-pipeline:
+	@command -v jq >/dev/null || (echo "jq not installed: brew install jq" && exit 1)
+	uvicorn src.main:app 2>&1 | jq -r 'select(.node != null or .event == "pipeline_start" or .event == "pipeline_end") | "\(.ts) [\(.node // "pipeline")] \(.event) \(if .latency_ms then "latency=\(.latency_ms)ms" else "" end)"'
+
+# ── One-shot local bootstrap ───────────────────────────────────────────────
+# Brings up infrastructure, waits for Postgres to be healthy, runs migrations,
+# and creates Kafka topics. Safe to re-run — all steps are idempotent.
+setup-local:
+	@echo "→ Starting infrastructure..."
+	docker compose up -d
+	@echo "→ Waiting for PostgreSQL to be healthy..."
+	@until docker compose exec -T postgres pg_isready -U chatbot -d chatbot >/dev/null 2>&1; do \
+		printf '.'; sleep 2; \
+	done && echo " ready."
+	@echo "→ Running migrations..."
+	.venv/bin/python -m alembic upgrade head
+	@echo "→ Creating Kafka topics..."
+	@until docker compose exec -T kafka kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1; do \
+		printf '.'; sleep 2; \
+	done && echo " ready."
+	@./scripts/create_kafka_topics.sh || echo "  [warn] Could not create topics — check Kafka logs"
+	@echo "→ Local setup complete. Run: uvicorn src.main:app --reload"
+
+# Verify Python version, Docker daemon, .env file, and virtualenv existence.
+check-deps:
+	@echo "→ Checking Python version..."
+	@python3 -c "import sys; v=sys.version_info; assert v>=(3,9), f'Python 3.9+ required, got {v.major}.{v.minor}'" \
+		&& echo "  Python OK: $$(python3 --version)"
+	@echo "→ Checking Docker..."
+	@docker info >/dev/null 2>&1 && echo "  Docker OK" || (echo "  [FAIL] Docker is not running — start Docker Desktop" && exit 1)
+	@echo "→ Checking .env..."
+	@test -f .env && echo "  .env OK" || (echo "  [FAIL] .env not found — run: cp .env.example .env" && exit 1)
+	@echo "→ Checking virtualenv..."
+	@test -d .venv && echo "  .venv OK" || (echo "  [FAIL] .venv not found — run: python3 -m venv .venv && pip install -r requirements-dev.txt" && exit 1)
+	@echo "→ All dependencies OK."
 
 # ── Shell helpers ─────────────────────────────────────────────────────────
 shell:

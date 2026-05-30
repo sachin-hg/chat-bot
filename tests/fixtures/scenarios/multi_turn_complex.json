@@ -1,0 +1,82 @@
+{
+  "searchProperties": {
+    "total_count": 47,
+    "srset_id": "sr_complex_001",
+    "hits": [
+      {"property_id": "prop_001", "title": "3BHK in Bandra West", "price": 18500000, "area_sqft": 1200, "bhk": 3, "locality": "Bandra West", "highlights": ["Sea View", "Gated"]},
+      {"property_id": "prop_002", "title": "3BHK in Bandra East", "price": 15800000, "area_sqft": 1050, "bhk": 3, "locality": "Bandra East", "highlights": ["Metro 200m"]},
+      {"property_id": "prop_003", "title": "3BHK in Khar West", "price": 17200000, "area_sqft": 1150, "bhk": 3, "locality": "Khar West", "highlights": ["School Nearby"]}
+    ],
+    "facets": {"bhk": {"3": 47}}
+  },
+  "getPropertyDetail": {
+    "property_id": "prop_001",
+    "title": "3BHK in Bandra West",
+    "price": 18500000,
+    "price_display": "₹1.85 Cr",
+    "bhk": 3,
+    "carpet_area": 1200,
+    "locality": {"name": "Bandra West", "city": "Mumbai"},
+    "seller": {"name": "ABC Realty", "phone": "XXXX"},
+    "amenities": ["Gym", "Swimming Pool", "Security", "Lift"],
+    "images": [{"url": "img1.jpg"}, {"url": "img2.jpg"}],
+    "floor_plans": [{"bhk": 3, "url": "fp.jpg"}]
+  },
+  "getLocalityDetail": {
+    "locality_id": "loc_bandra_w",
+    "display_name": "Bandra West",
+    "city": "Mumbai",
+    "overview": "Bandra West is Mumbai's most cosmopolitan suburb with excellent connectivity.",
+    "avg_price_sqft": 35000,
+    "price_trend": {"direction": "up", "yoy_change_pct": 8.5},
+    "ratings": {"overall": 4.6, "connectivity": 4.8, "amenities": 4.5, "safety": 4.3},
+    "connectivity": ["Bandra Station (W. Rly)", "Bandra-Kurla Complex 10min", "Linking Road"]
+  },
+  "getTrendingLocalities": {
+    "localities": [
+      {"uuid": "loc_ban_w", "display_name": "Bandra West", "city": "Mumbai", "avg_price": 35000, "trend_score": 94},
+      {"uuid": "loc_pow", "display_name": "Powai", "city": "Mumbai", "avg_price": 19000, "trend_score": 88},
+      {"uuid": "loc_wor", "display_name": "Worli", "city": "Mumbai", "avg_price": 42000, "trend_score": 85}
+    ]
+  },
+  "resolveEntity": {
+    "candidates": [{"uuid": "loc_ban_w", "display_name": "Bandra West", "entity_type": "locality", "city": "Mumbai", "confidence": 0.97}],
+    "resolved": {"uuid": "loc_ban_w", "display_name": "Bandra West", "entity_type": "locality", "confidence": 0.97},
+    "confidence": 0.97,
+    "uuid": "loc_ban_w",
+    "display_name": "Bandra West"
+  },
+  "getPriceTrends": {
+    "locality_id": "loc_ban_w",
+    "data_points": [
+      {"month": "2024-01", "avg_price_sqft": 32000},
+      {"month": "2024-06", "avg_price_sqft": 33500},
+      {"month": "2024-12", "avg_price_sqft": 35000}
+    ],
+    "current_price": 35000,
+    "yoy_change_pct": 8.5,
+    "trend_direction": "up"
+  },
+  "getNearbyLandmarks": {
+    "landmarks": [
+      {"name": "Bandra Station", "type": "transit", "distance_m": 400},
+      {"name": "Lilavati Hospital", "type": "hospital", "distance_m": 1200},
+      {"name": "American School", "type": "school", "distance_m": 800},
+      {"name": "D-Mart Bandra", "type": "supermarket", "distance_m": 600},
+      {"name": "Band Stand", "type": "landmark", "distance_m": 1500}
+    ]
+  },
+  "getRatingsReviews": {
+    "locality_id": "loc_bandra_w",
+    "overall_rating": 4.6,
+    "review_count": 342,
+    "top_tags": ["connectivity", "nightlife", "schools", "safety"]
+  },
+  "calculateEMI": {
+    "monthly_emi": 130526,
+    "loan_amount": 15000000,
+    "rate": 8.5,
+    "tenure_years": 20,
+    "total_payable": 31326240
+  }
+}
