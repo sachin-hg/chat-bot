@@ -1,0 +1,35 @@
+{
+  "getLocalityDetail": {
+    "locality_id": "loc_and_001",
+    "display_name": "Andheri West",
+    "city": "Mumbai",
+    "overview": "Andheri West is a bustling suburb with excellent connectivity.",
+    "avg_price_sqft": 22000,
+    "price_trend": {"direction": "stable", "yoy_change_pct": 3.2},
+    "ratings": {"overall": 4.1, "connectivity": 4.5, "amenities": 3.9},
+    "connectivity": ["Metro Line 1", "Western Railway", "JVLR"],
+    "nearby_schools": ["St. Joseph's High School", "Ryan International"],
+    "nearby_hospitals": ["Kokilaben Hospital", "Holy Family Hospital"]
+  },
+  "getTrendingLocalities": {
+    "localities": [
+      {"uuid": "loc_and_w_001", "display_name": "Andheri West", "city": "Mumbai", "avg_price": 22000, "trend_score": 87},
+      {"uuid": "loc_and_e_001", "display_name": "Andheri East", "city": "Mumbai", "avg_price": 18500, "trend_score": 82},
+      {"uuid": "loc_pow_001", "display_name": "Powai", "city": "Mumbai", "avg_price": 19000, "trend_score": 79}
+    ]
+  },
+  "resolveEntity": {
+    "candidates": [{"uuid": "loc_and_w_001", "display_name": "Andheri West", "entity_type": "locality", "city": "Mumbai", "confidence": 0.88}],
+    "resolved": {"uuid": "loc_and_w_001", "display_name": "Andheri West", "entity_type": "locality", "confidence": 0.88},
+    "confidence": 0.88,
+    "uuid": "loc_and_w_001",
+    "display_name": "Andheri West"
+  },
+  "searchProperties": {
+    "total_count": 0,
+    "hits": [],
+    "srset_id": null,
+    "facets": {}
+  },
+  "getPropertyDetail": {}
+}

@@ -54,19 +54,34 @@ async def run_dry_pipeline(
     router=None,
     classifier=None,
     llm=None,
+    use_real_slm: bool = False,
+    use_real_llm: bool = False,
 ) -> DryRunResult:
     """Run the full pipeline with DryRunExecutor (no real HTTP calls).
 
     Args:
-        message:    User message text
-        scenario:   Fixture scenario name (tests/fixtures/scenarios/{name}.json)
-        session:    Pre-built session state dict (for Turn 2+ multi-turn tests).
-                    Keys accepted: session_id, turn_count, active_filters,
-                    turn_history, and any other BotState session fields.
-        router:     DomainRouterPort mock (if None, uses a stub that returns out_of_scope)
-        classifier: ClassifierPort mock (if None, uses a stub that returns out_of_scope)
-        llm:        LLMPort mock (if None, uses a stub that returns empty text)
+        message:      User message text
+        scenario:     Fixture scenario name (tests/fixtures/scenarios/{name}.json)
+        session:      Pre-built session state dict (for Turn 2+ multi-turn tests).
+                      Keys accepted: session_id, turn_count, active_filters,
+                      turn_history, and any other BotState session fields.
+        router:       DomainRouterPort mock (if None, uses a stub that returns out_of_scope)
+        classifier:   ClassifierPort mock (if None, uses a stub that returns out_of_scope)
+        llm:          LLMPort mock (if None, uses a stub that returns empty text)
+        use_real_slm: Use real AnthropicDomainRouter + AnthropicClassifier (requires ANTHROPIC_API_KEY)
+        use_real_llm: Use real AnthropicLLM streaming adapter (requires ANTHROPIC_API_KEY)
     """
+    # If use_real_slm and no explicit router/classifier passed, build real adapters
+    if use_real_slm and router is None:
+        from src.adapters.domain_router import AnthropicDomainRouter
+        router = AnthropicDomainRouter()
+    if use_real_slm and classifier is None:
+        from src.adapters.classifier import AnthropicClassifier
+        classifier = AnthropicClassifier()
+    if use_real_llm and llm is None:
+        from src.adapters.llm import AnthropicLLM
+        llm = AnthropicLLM()
+
     from src.tools.dry_run_executor import DryRunExecutor
     executor = DryRunExecutor(scenario)
 
