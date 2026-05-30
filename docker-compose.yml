@@ -1,0 +1,104 @@
+services:
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB:       chatbot
+      POSTGRES_USER:     chatbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # pg_cron requires this
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    command: >
+      postgres
+        -c shared_preload_libraries=pg_cron
+        -c cron.database_name=chatbot
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatbot -d chatbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pgbouncer:
+    image: pgbouncer/pgbouncer:1.22.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASES_HOST:         postgres
+      DATABASES_PORT:         "5432"
+      DATABASES_DBNAME:       chatbot
+      DATABASES_USER:         chatbot
+      DATABASES_PASSWORD:     ${POSTGRES_PASSWORD}
+      PGBOUNCER_POOL_MODE:    transaction
+      PGBOUNCER_MAX_CLIENT_CONN: "200"
+      PGBOUNCER_DEFAULT_POOL_SIZE: "20"
+      PGBOUNCER_SERVER_RESET_QUERY: DISCARD ALL
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U chatbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --save ""
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.3
+    environment:
+      KAFKA_NODE_ID:                         "1"
+      KAFKA_PROCESS_ROLES:                   "broker,controller"
+      KAFKA_LISTENERS:                       "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS:            "PLAINTEXT://localhost:9092"
+      KAFKA_CONTROLLER_QUORUM_VOTERS:        "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES:       "CONTROLLER"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP:  "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE:       "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_LOG_DIRS:                        "/var/lib/kafka/data"
+      CLUSTER_ID:                            "MkU3OEVBNTcwNTJENDM2Qg"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERCONNECT: kafka:9092
+    ports:
+      - "9000:9000"
+    profiles:
+      - dev  # only starts with: docker compose --profile dev up
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:

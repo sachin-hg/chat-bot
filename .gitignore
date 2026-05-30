@@ -1,0 +1,16 @@
+.env
+.env.local
+.env.staging
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+htmlcov/
+.coverage
+*.log
+.DS_Store
