@@ -9,6 +9,7 @@ Implements:
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import unicodedata
 from pathlib import Path
@@ -249,11 +250,20 @@ async def route_domain_node(state: BotState, router: object) -> dict:
     Output: state['domain']
     """
     session: dict = state.get("session") or {}
-    result: dict = await router.route({   # type: ignore[attr-defined]
-        "message":         state.get("normalized_message", ""),
-        "previous_domain": session.get("last_domain"),
-        "last_intent":     session.get("last_intent"),
-    })
+
+    try:
+        result: dict = await router.route({   # type: ignore[attr-defined]
+            "message":         state.get("normalized_message", ""),
+            "previous_domain": session.get("last_domain"),
+            "last_intent":     session.get("last_intent"),
+        })
+    except asyncio.TimeoutError:
+        log.warn("domain_router_timeout", session_id=session.get("session_id"))
+        fallback_domain: str = session.get("last_domain") or "out_of_scope"
+        return {
+            "domain": fallback_domain,
+            "classification": {"timeout_fallback": True, "confidence": 0.0},
+        }
 
     domain: str = result.get("domain", "out_of_scope")
     confidence: float = result.get("confidence", 0.0)
@@ -438,5 +448,11 @@ async def validate_slm_node(state: BotState) -> dict:
             request_id=state.get("request_id"),
         )
         c["entities_mentioned"] = entities
+
+    # Trim reasoning to ≤30 words to keep logs compact
+    if c.get('reasoning'):
+        words = c['reasoning'].split()
+        if len(words) > 30:
+            c['reasoning'] = ' '.join(words[:30])
 
     return {"classification": c}

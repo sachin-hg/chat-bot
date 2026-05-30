@@ -515,3 +515,73 @@ class TestValidateSlmNodeCoercions:
         result = await validate_slm_node(state)
 
         assert result["classification"]["entities_mentioned"] == entities
+
+
+# ---------------------------------------------------------------------------
+# Tests: REQ-CLS-012 through REQ-CLS-015 (CHAT-Q-DRY-005b)
+# ---------------------------------------------------------------------------
+
+class TestValidateSlmNodeDry005b:
+    """Additional requirement tests appended in CHAT-Q-DRY-005b."""
+
+    @pytest.mark.asyncio
+    async def test_validate_slm_empty_clarification_coerced_to_none(self):
+        """REQ-CLS-012: clarification_needed="" must be coerced to None."""
+        cls   = _make_classification(clarification_needed="")
+        state = make_test_state(domain="property_search", classification=cls)
+        result = await validate_slm_node(state)
+
+        assert result.get("bot_response") is None, \
+            'Empty clarification_needed must not short-circuit to bot_response'
+        cn = result["classification"]["clarification_needed"]
+        assert not cn, \
+            f'clarification_needed="" must be coerced to None/falsy, got {cn!r} (REQ-CLS-012)'
+
+    @pytest.mark.asyncio
+    async def test_validate_slm_reasoning_trimmed_to_30_words(self):
+        """REQ-CLS-013: reasoning field with >30 words must be trimmed to ≤30 words."""
+        long_reasoning = " ".join([f"word{i}" for i in range(50)])  # exactly 50 words
+        cls   = _make_classification(reasoning=long_reasoning)
+        state = make_test_state(domain="property_search", classification=cls)
+        result = await validate_slm_node(state)
+
+        assert result.get("bot_response") is None, \
+            'Overlong reasoning must not short-circuit to bot_response'
+        trimmed = result["classification"].get("reasoning", "")
+        word_count = len(trimmed.split())
+        assert word_count <= 30, \
+            f'reasoning must be trimmed to ≤30 words, got {word_count} words (REQ-CLS-013)'
+
+    @pytest.mark.asyncio
+    async def test_validate_slm_calculator_accepted_in_property_detail_domain(self):
+        """REQ-CLS-014: calculator main_intent must be accepted in property_detail domain."""
+        cls   = _make_classification(
+            main_intent="calculator",
+            sub_intent="calculate_emi",
+        )
+        state = make_test_state(domain="property_detail", classification=cls)
+        result = await validate_slm_node(state)
+
+        assert result.get("bot_response") is None, \
+            'calculator/calculate_emi must not be rejected as cross-domain in property_detail (REQ-CLS-014)'
+        # Also assert classification domain is not out_of_scope (no cross-domain rejection)
+        classification = result.get("classification", {})
+        assert classification.get("main_intent") != "out_of_scope", \
+            'calculator intent must not be silently rewritten to out_of_scope (REQ-CLS-014)'
+
+    @pytest.mark.asyncio
+    async def test_validate_slm_multi_intent_bypasses_domain_guard(self):
+        """REQ-CLS-015: multi_intent must bypass the domain guard check entirely."""
+        cls   = _make_classification(
+            main_intent="multi_intent",
+            sub_intent="multi_intent",
+        )
+        state = make_test_state(domain="property_search", classification=cls)
+        result = await validate_slm_node(state)
+
+        assert result.get("bot_response") is None, \
+            'multi_intent must bypass the cross-domain guard and not produce bot_response (REQ-CLS-015)'
+        # Confirm classification is returned, not converted to out_of_scope
+        classification = result.get("classification", {})
+        assert classification.get("main_intent") != "out_of_scope", \
+            'multi_intent must not be converted to out_of_scope (REQ-CLS-015)'

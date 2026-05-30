@@ -830,6 +830,15 @@ INTENT_REGISTRY: list[IntentRecord] = [
 ]
 
 
+def get_data_fetch_plan(main_intent: str, sub_intent: str) -> list[DataRequirement]:
+    """Return the data_requirements list for the given intent pair.
+
+    Returns an empty list when the intent is not found or has no requirements.
+    """
+    r = get_intent_record(main_intent, sub_intent)
+    return r.data_requirements if r else []
+
+
 def get_intent_record(main_intent: str, sub_intent: str) -> Optional[IntentRecord]:
     for r in INTENT_REGISTRY:
         if r.main_intent == main_intent and r.sub_intent == sub_intent:
