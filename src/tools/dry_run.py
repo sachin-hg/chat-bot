@@ -3,6 +3,73 @@ import argparse, asyncio, json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+def _infer_mock_intent(message: str) -> tuple:
+    """Keyword-based intent inference for mock SLM — good enough for CLI dry runs."""
+    m = message.lower()
+
+    # Out of scope
+    if any(k in m for k in ['joke', 'weather', 'recipe', 'cricket', 'movie']):
+        return 'out_of_scope', 'out_of_scope', 'out_of_scope_query', {}, []
+
+    # Comparison
+    if 'compare' in m or ('vs' in m and ('bhk' in m or 'locality' in m or 'area' in m)):
+        return 'locality', 'comparison', 'compare_localities', {}, []
+
+    # Locality research — "tell me about X", "how is X", "X area"
+    if any(k in m for k in ['tell me about', 'how is', 'locality', 'area', 'neighbourhood',
+                             'location', 'infrastructure', 'connectivity', 'schools', 'hospitals']):
+        # Extract entity
+        for word in ['andheri', 'bandra', 'powai', 'juhu', 'worli', 'kurla', 'thane',
+                     'malad', 'goregaon', 'borivali', 'kandivali', 'dahisar']:
+            if word in m:
+                return ('locality', 'locality_research', 'locality_overview',
+                        {'localities': [word.title()]},
+                        [{'name': word.title(), 'inferred_type': 'locality'}])
+        return 'locality', 'locality_research', 'locality_overview', {}, []
+
+    # Portfolio
+    if any(k in m for k in ['saved', 'shortlisted', 'my properties', 'viewed', 'recommendations']):
+        return 'portfolio', 'portfolio', 'saved_properties', {}, []
+
+    # Project research
+    if any(k in m for k in ['project', 'builder', 'lodha', 'godrej', 'prestige', 'sobha']):
+        return 'project_research', 'project_research', 'project_overview', {}, []
+
+    # EMI / calculator
+    if any(k in m for k in ['emi', 'loan', 'interest', 'afford']):
+        return 'property_detail', 'calculator', 'calculate_emi', {}, []
+
+    # Property search — default
+    bhk = []
+    for n, word in [(1, '1bhk'), (2, '2bhk'), (3, '3bhk'), (4, '4bhk'),
+                    (1, '1 bhk'), (2, '2 bhk'), (3, '3 bhk'), (1, '1 bedroom'),
+                    (2, '2 bedroom'), (3, '3 bedroom')]:
+        if word in m:
+            bhk = [n]
+            break
+    price_max = None
+    if '80 lakh' in m or '80l' in m:
+        price_max = 8_000_000
+    elif '1 crore' in m or '1cr' in m or '1 cr' in m:
+        price_max = 10_000_000
+    elif '50 lakh' in m or '50l' in m:
+        price_max = 5_000_000
+    txn = 'rent' if any(k in m for k in ['rent', 'rental', 'lease']) else 'buy'
+    entities = []
+    filter_delta: dict = {'transaction_type': txn}
+    if bhk:
+        filter_delta['bhk'] = bhk
+    if price_max:
+        filter_delta['price_max'] = price_max
+    for loc in ['bandra', 'andheri', 'powai', 'juhu', 'worli', 'kurla', 'thane',
+                'malad', 'goregaon', 'borivali', 'kandivali', 'mumbai', 'delhi',
+                'bangalore', 'pune', 'hyderabad', 'chennai', 'kolkata']:
+        if loc in m:
+            filter_delta.setdefault('localities', []).append(loc.title())
+            entities.append({'name': loc.title(), 'inferred_type': 'locality'})
+    return 'property_search', 'property_search', 'filter_search', filter_delta, entities
+
+
 async def main(message: str, scenario: str, mock_slm: bool, mock_llm: bool) -> None:
     import os
     # Patch session + Kafka persistence so dry-run CLI works without .env
@@ -42,14 +109,15 @@ async def main(message: str, scenario: str, mock_slm: bool, mock_llm: bool) -> N
 
     if mock_slm:
         from unittest.mock import AsyncMock, MagicMock
+        domain, main_intent, sub_intent, filter_delta, entities = _infer_mock_intent(message)
         router = MagicMock()
-        router.route = AsyncMock(return_value={'domain': 'property_search', 'confidence': 0.95})
+        router.route = AsyncMock(return_value={'domain': domain, 'confidence': 0.95})
         classifier = MagicMock()
         classifier.classify = AsyncMock(return_value={
-            'domain': 'property_search', 'main_intent': 'property_search',
-            'sub_intent': 'filter_search', 'filter_delta': {},
-            'entities_mentioned': [], 'clarification_needed': None,
-            'pivot': False, 'multi_intent': False, 'confidence': 0.95, 'reasoning': 'mock',
+            'domain': domain, 'main_intent': main_intent, 'sub_intent': sub_intent,
+            'filter_delta': filter_delta, 'entities_mentioned': entities,
+            'clarification_needed': None, 'pivot': False, 'multi_intent': False,
+            'confidence': 0.95, 'reasoning': 'mock keyword routing',
         })
     else:
         from src.adapters.domain_router import AnthropicDomainRouter
