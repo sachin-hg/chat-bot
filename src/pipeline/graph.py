@@ -78,7 +78,7 @@ def build_graph(
     graph.add_node('sanitize',         sanitize_node)
     graph.add_node('derive',           derive_node)
     graph.add_node('clarify',          clarify_node)
-    graph.add_node('resolve_entities', resolve_entities_node)
+    graph.add_node('resolve_entities', partial(resolve_entities_node, executor=executor))
     graph.add_node('route',            route_node)
     graph.add_node('summary',          partial(summary_node,        emit_sse=emit_sse))
     graph.add_node('experiment',       experiment_node)

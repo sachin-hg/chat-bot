@@ -149,13 +149,14 @@ async def summary_node(state: BotState, emit_sse: Callable) -> dict:
 
 
 async def _execute_prefetch_stub(req, state: BotState, executor) -> tuple:
-    """Sprint 1 stub — real executor (HttpToolExecutor) is Sprint 2 (CHAT-P-016).
-
-    Returns empty data for all fetches so the pipeline can run end-to-end.
-    """
-    # TODO CHAT-P-016: replace with real execute_prefetch from processing-nodes.md
     key = req.fetch_key or req.tool
-    log.info('prefetch_stub', {'tool': req.tool, 'key': key})
+    if executor is not None:
+        # Real executor available (Sprint 2+): use it
+        from src.tools.executor import get_tool_cache_ttl
+        ttl = get_tool_cache_ttl(req.tool)
+        data = await executor.execute(req.tool, {}, ttl)
+        return key, data
+    log.info('prefetch_stub_no_executor', tool=req.tool, key=key)
     return key, {}
 
 
@@ -268,7 +269,7 @@ class StubPromptComposer:
         if prompt_path.exists():
             system_text = prompt_path.read_text(encoding='utf-8')
         else:
-            log.warn('prompt_file_not_found', {'path': str(ctx.prompt_block)})
+            log.warn('prompt_file_not_found', path=str(ctx.prompt_block))
             system_text = f'You are a helpful Housing.com real estate assistant. Intent: {ctx.main_intent}/{ctx.sub_intent}.'
         return PromptResult(system=system_text)
 
@@ -446,7 +447,7 @@ def build_missing_param_error(validation: dict) -> dict:
 async def execute_tool_with_cache(tool: str, params: dict) -> Any:
     """Sprint 1 stub — returns {} for all tool calls.
     # TODO CHAT-P-016: replace with real HttpToolExecutor calls."""
-    log.info('tool_call_stub', {'tool': tool})
+    log.info('tool_call_stub', tool=tool)
     return {}
 
 
@@ -466,7 +467,7 @@ async def stream_llm(llm: LLMPort, model: str, system: str, messages: list,
         )
         return result
     except Exception as exc:
-        log.error('llm_stream_error', {'error': str(exc), 'model': model})
+        log.error('llm_stream_error', error=str(exc), model=model)
         return {'response': {'text': ''}, 'tool_results': []}
 
 
@@ -493,7 +494,7 @@ async def llm_node(state: BotState, llm: LLMPort, emit_sse: Callable) -> dict:
     try:
         model_id = MODEL_REGISTRY[task_key].model_id
     except (KeyError, AttributeError):
-        log.warn('model_registry_key_missing', {'task_key': task_key})
+        log.warn('model_registry_key_missing', task_key=task_key)
         model_id = 'claude-haiku-4-5-20251001'
 
     text_message_id = str(uuid.uuid4())
@@ -571,10 +572,9 @@ async def validate_output_node(state: BotState) -> dict:
             validation.violations.remove('markdown_table_detected')  # allowed
 
     if validation.violations:
-        log.warn('output_validation_violations', {
-            'violations': validation.violations,
-            'request_id': state.get('request_id'),
-        })
+        log.warn('output_validation_violations',
+                 violations=validation.violations,
+                 request_id=state.get('request_id'))
     return {'validated_text': cleaned_text}
 
 
@@ -590,20 +590,17 @@ def is_markdown(text: str) -> bool:
 
 
 async def persist_to_kafka(conversation_id: str, events: list[dict]) -> None:
-    """Async fire-and-forget: publishes message events to Kafka.
-    Sprint 1 stub — logs only; real Kafka producer wired in CHAT-A-010."""
-    log.info('kafka_persist_stub', {
-        'conversation_id': conversation_id,
-        'event_count': len(events),
-    })
-    # TODO CHAT-A-010: replace with real Kafka producer publish
+    """Async fire-and-forget: publishes message events to Kafka."""
+    from src.kafka.producer import publish
+    for event in events:
+        await publish('chat.messages', {'conversation_id': conversation_id, 'event': event})
 
 
 async def update_session_state(session: dict, classification: dict, tool_results: list) -> bool:
     """Persists session to Redis after the turn completes.
     Sprint 1 stub — returns True (success) without real Redis write.
     # TODO CHAT-A-008: replace with real RedisSessionStore.save() call."""
-    log.info('session_update_stub', {'session_id': session.get('session_id')})
+    log.info('session_update_stub', session_id=session.get('session_id'))
     return True
 
 
@@ -611,7 +608,7 @@ async def reconcile_session_conflict(session: dict, bot_response: dict | None) -
     """Called when optimistic locking fails (update_session_state returns False).
     Sprint 1 stub — logs the conflict.
     # TODO CHAT-A-008: implement retry with re-loaded session state."""
-    log.warn('session_conflict_stub', {'session_id': session.get('session_id')})
+    log.warn('session_conflict_stub', session_id=session.get('session_id'))
 
 
 def build_template_events(

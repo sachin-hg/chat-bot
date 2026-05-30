@@ -23,6 +23,7 @@ from src.observability.logging import get_logger
 from src.pipeline.state import BotState
 from src.registries.filter_registry import FILTER_REGISTRY, get_filter_record
 from src.registries.intent_registry import get_intent_record
+from src.tools.executor import TOOL_DEFAULT_TIMEOUTS, get_tool_cache_ttl  # noqa: F401
 
 log = get_logger(__name__)
 
@@ -319,16 +320,43 @@ async def pre_resolve_entities(entities: list[dict], session: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Node: resolve_entities_node  (CHAT-P-011)
+# Node: resolve_entities_node  (CHAT-P-011 / CHAT-P-017)
 # ---------------------------------------------------------------------------
 
-async def resolve_entities_node(state: BotState) -> dict:
+async def _resolve_entities_real(entities: list, session: dict, executor) -> dict:
+    """Resolve entities via the real resolveEntity executor (CHAT-P-017)."""
+    resolved = {}
+    for entity in entities:
+        name = entity.get('name', '')
+        params = {
+            'query':       name,
+            'entity_type': entity.get('type', 'locality'),
+            'city':        session.get('city', ''),
+        }
+        try:
+            from src.tools.executor import get_tool_cache_ttl
+            ttl = get_tool_cache_ttl('resolveEntity')
+            result = await executor.execute('resolveEntity', params, ttl)
+            resolved[name] = result
+        except Exception as exc:
+            log.warn('entity_resolution_failed', name=name, error=str(exc))
+            resolved[name] = {
+                'uuid':         None,
+                'display_name': name,
+                'entity_type':  entity.get('type', 'locality'),
+                'confidence':   0.0,
+            }
+    return resolved
+
+
+async def resolve_entities_node(state: BotState, executor=None) -> dict:
     """Pre-resolve locality/project entities before the LLM call.
 
     Reads entities from state['classification']['entities_mentioned'] and
     resolves them to UUIDs when the intent warrants pre-resolution.
 
-    Sprint 1: uses stub implementation — no real HTTP calls.
+    When executor is provided (Sprint 2+), calls the real resolveEntity API.
+    When executor is None (Sprint 1 stub), falls back to pre_resolve_entities.
 
     Input:  state['classification'], state['session']
     Output: state['resolved_entities']  (resolved entity map)
@@ -341,7 +369,10 @@ async def resolve_entities_node(state: BotState) -> dict:
     session     = dict(state["session"])
 
     if requires_pre_resolution(main_intent, sub_intent) and entities:
-        resolved = await pre_resolve_entities(entities, session)
+        if executor is not None:
+            resolved = await _resolve_entities_real(entities, session, executor)
+        else:
+            resolved = await pre_resolve_entities(entities, session)
         session.setdefault("resolved_entity_map", {}).update(resolved)
         return {"resolved_entities": resolved, "session": session}
     return {}

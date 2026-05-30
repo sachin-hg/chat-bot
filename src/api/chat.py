@@ -1,11 +1,11 @@
-"""Chat endpoints — CHAT-A-007 (get-conversation-id) and CHAT-A-006 (SSE streaming)."""
+"""Chat endpoints — CHAT-A-007 (get-conversation-id), CHAT-A-006 (SSE streaming), CHAT-A-024 (send-message)."""
 import uuid
 from datetime import datetime
 from typing import AsyncGenerator
 
 import structlog.contextvars
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from src.api.models import (
     ChatEventFromUser,
@@ -13,6 +13,7 @@ from src.api.models import (
     MessageContent,
 )
 from src.api.sse import sse_frame
+from src.pipeline.graph import build_graph
 from src.pipeline.state import make_base_state
 from src.session.redis import get_redis
 
@@ -164,4 +165,76 @@ async def send_message_streamed(
     return StreamingResponse(
         content=event_generator(),
         media_type="text/event-stream",
+    )
+
+
+# ---------------------------------------------------------------------------
+# CHAT-A-024: Send message (non-streaming, synchronous)
+# Handles silent Tier 1 user actions: shortlistProperty, removeFromShortlist
+# ---------------------------------------------------------------------------
+
+@router.post("/send-message")
+async def send_message(
+    body: ChatEventFromUser,
+    request: Request,
+) -> Response:
+    """
+    Non-streaming synchronous endpoint for silent user actions
+    (responseRequired: false).  Returns a JSON confirmation once the
+    pipeline has completed.
+
+    Returns 429 with Retry-After: 3 if the LLM rate-limit gate rejects
+    the request.
+    """
+    # 1. Check LLM gate if it is wired up on app.state (optional — skip if absent)
+    llm_gate = getattr(getattr(request, "app", None), "state", None)
+    llm_gate = getattr(llm_gate, "llm_gate", None) if llm_gate is not None else None
+    if llm_gate is not None:
+        allowed = await llm_gate() if callable(llm_gate) else llm_gate
+        if not allowed:
+            return Response(
+                content='{"error": "rate_limited"}',
+                status_code=429,
+                headers={"Retry-After": "3"},
+                media_type="application/json",
+            )
+
+    # 2. Resolve request_id
+    ctx = structlog.contextvars.get_contextvars()
+    request_id: str = ctx.get("request_id") or str(uuid.uuid4())
+
+    # 3. Extract conversation_id and build raw_message
+    conversation_id: str = body.conversation_id
+
+    if body.message_type == "user_action":
+        action = (body.content.data or {}).get("action", "")
+        raw_message = f"user_action:{action}"
+    elif body.message_type == "text":
+        raw_message = body.content.text or ""
+    else:
+        raw_message = body.content.text or ""
+
+    # 4. Build initial BotState
+    state = make_base_state(
+        request_id=request_id,
+        session_id=conversation_id,
+        raw_message=raw_message,
+    )
+
+    # 5. Run the pipeline graph synchronously with a noop SSE emitter
+    noop_emit = lambda *args, **kwargs: None  # silent — no SSE stream needed
+    graph = build_graph(emit_sse=noop_emit)
+    await graph.ainvoke(state)
+
+    # 6. Return JSON confirmation
+    message_id = str(uuid.uuid4())
+    return JSONResponse(
+        content={
+            "statusCode": "2XX",
+            "responseCode": "SUCCESS",
+            "data": {
+                "messageId": message_id,
+                "messageState": "COMPLETED",
+            },
+        }
     )
