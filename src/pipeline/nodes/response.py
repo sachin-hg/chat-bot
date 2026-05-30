@@ -790,6 +790,12 @@ async def respond_node(state: BotState, emit_sse: Callable) -> dict:
 # ---------------------------------------------------------------------------
 
 
+async def _trigger_conversation_summary(session_id: str) -> None:
+    """Publish summary request to Kafka. Consumer calls Haiku off critical path."""
+    await persist_to_kafka(session_id, [{'type': 'summarize_request', 'session_id': session_id}])
+    log.info('conversation_summary_triggered', session_id=session_id)
+
+
 async def followup_node(state: BotState, emit_sse: Callable) -> dict:
     """Emit the final text ChatEventToUser SSE event and persist session state.
 
@@ -848,15 +854,47 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
     if not saved:
         await reconcile_session_conflict(session, bot_response)
 
+    # Trigger async conversation summarization every 20 turns (fire-and-forget)
+    turn_count = session.get('turn_count', 0) + 1
+    if turn_count >= 20 and turn_count % 20 == 0:
+        asyncio.create_task(
+            _trigger_conversation_summary(session['session_id'])
+        )
+
     return {'bot_response': bot_response}
 
 
 # ---------------------------------------------------------------------------
-# Node: experiment_node  (CHAT-P-015b stub)
+# Node: experiment_node  (CHAT-P-036)
 # ---------------------------------------------------------------------------
 
 
 async def experiment_node(state: BotState) -> dict:
-    """A/B experiment resolution. Sprint 1 stub — no active experiments.
-    # TODO CHAT-P-036: load experiments.yaml, resolve active experiment for session."""
-    return {"experiment_id": None}
+    """Resolve active A/B experiment for this session. Hot-reloads config/experiments.yaml every 60s."""
+    from src.pipeline.experiment_loader import resolve_experiment_for_session
+
+    experiment = resolve_experiment_for_session(
+        state['session'], state.get('classification') or {}
+    )
+
+    if experiment is None:
+        return {'experiment_id': None}
+
+    result = {
+        'experiment_id': experiment['experiment_id'],
+        'experiment_variant': experiment['variant']['id'],
+    }
+
+    # If variant has a model override, inject into routing
+    model_override = experiment['variant'].get('model_override_task')
+    if model_override:
+        routing = dict(state.get('routing') or {})
+        routing['model_override_task'] = model_override
+        result['routing'] = routing
+
+    log.info('experiment_resolved',
+             session_id=state['session'].get('session_id'),
+             experiment_id=experiment['experiment_id'],
+             variant=experiment['variant']['id'])
+
+    return result

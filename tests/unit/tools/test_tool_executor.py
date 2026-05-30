@@ -197,23 +197,12 @@ class TestContactSellerNoApiCall:
 # ---------------------------------------------------------------------------
 
 class TestNearbyLandmarksTruncation:
-    """REQ-TOOL-008: getNearbyLandmarks executor truncation — pending Sprint 3."""
+    """REQ-TOOL-008: getNearbyLandmarks executor truncation."""
 
-    @pytest.mark.xfail(
-        reason="CHAT-P-018+: getNearbyLandmarks executor not implemented",
-        strict=False,
-    )
     @pytest.mark.asyncio
     async def test_nearby_landmarks_truncation_xfail(self):
-        """REQ-TOOL-008: getNearbyLandmarks response must be truncated to max_items=10.
-
-        This test is marked xfail because the getNearbyLandmarks executor subclass
-        (which enforces ResponseTruncation(max_items=10)) is not yet implemented.
-        Sprint 3 ticket CHAT-P-018+ covers this.
-        """
-        # Importing the executor subclass will raise ImportError or AttributeError
-        # until Sprint 3 delivers it.
-        from src.tools.executor import HttpToolExecutor  # noqa: F401
+        """REQ-TOOL-008: getNearbyLandmarks response must be truncated to max 5 landmarks."""
+        from src.tools.search import GetNearbyLandmarksExecutor
 
         # Simulate an oversized response (20 landmarks)
         oversized_response = {
@@ -223,12 +212,20 @@ class TestNearbyLandmarksTruncation:
             ]
         }
 
-        # The executor is expected to truncate to 10; raise NotImplementedError until then.
-        mock_redis = AsyncMock()
-        executor = HttpToolExecutor(redis_pool=mock_redis)
+        mock_http_response = MagicMock()
+        mock_http_response.raise_for_status = MagicMock()
+        mock_http_response.json = MagicMock(return_value=oversized_response)
 
-        # This call is expected to fail until the truncation feature is implemented.
-        result = await executor.execute("getNearbyLandmarks", {}, ttl=86400)
-        assert len(result.get("landmarks", [])) <= 10, (
-            "getNearbyLandmarks response must be truncated to max_items=10"
+        mock_redis = AsyncMock()
+        executor = GetNearbyLandmarksExecutor(redis_pool=mock_redis, odin_base_url="http://odin.test")
+        executor._http = AsyncMock()
+        executor._http.get = AsyncMock(return_value=mock_http_response)
+
+        result = await executor.call("getNearbyLandmarks", {"lat": 19.07, "lng": 72.87})
+
+        assert len(result.get("landmarks", [])) <= 5, (
+            "REQ-TOOL-008: getNearbyLandmarks response must be truncated to max 5 landmarks"
+        )
+        assert result["total"] == 20, (
+            "REQ-TOOL-008: total must reflect the full untruncated count"
         )

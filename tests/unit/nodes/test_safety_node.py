@@ -192,14 +192,6 @@ class TestSafetyNodeBlocks:
             f"Expected injection-related reason, got: {reason!r}"
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=(
-            "REQ-CLS: safety_node should block empty messages. "
-            "Production implementation does not yet check for empty/whitespace input — "
-            "xfail until _check_content_safety adds empty guard."
-        ),
-        strict=False,
-    )
     async def test_empty_message_is_blocked(self):
         """Empty message must be blocked and return bot_response."""
         state  = make_test_state(raw_message="")
@@ -210,13 +202,6 @@ class TestSafetyNodeBlocks:
         assert result["safety_result"]["blocked"] is True
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=(
-            "REQ-CLS: safety_node should block whitespace-only messages. "
-            "Production implementation does not yet check for empty/whitespace input."
-        ),
-        strict=False,
-    )
     async def test_whitespace_only_message_is_blocked(self):
         """Whitespace-only message is treated the same as empty."""
         state  = make_test_state(raw_message="   \t\n  ")
@@ -226,13 +211,6 @@ class TestSafetyNodeBlocks:
         assert result["safety_result"]["blocked"] is True
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=(
-            "REQ-CLS: safety_node should block messages >5000 chars. "
-            "Production implementation does not yet enforce a length limit."
-        ),
-        strict=False,
-    )
     async def test_very_long_message_is_flagged(self):
         """Messages exceeding 5 000 characters must be blocked."""
         long_msg = "show me flats " * 400   # ~5 600 chars
@@ -258,13 +236,6 @@ class TestSafetyNodeBlocks:
                 "Exactly 5 000-char message must not trigger too_long block"
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=(
-            "Depends on empty-message guard being implemented in production. "
-            "Will pass automatically once the guard is added."
-        ),
-        strict=False,
-    )
     async def test_bot_response_present_on_block(self):
         """Every blocked message must produce a non-empty bot_response string."""
         state  = make_test_state(raw_message="")

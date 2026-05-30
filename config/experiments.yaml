@@ -1,0 +1,19 @@
+# config/experiments.yaml
+# Experiments are git-tracked (no credentials). Hot-reloads every 60s.
+# Format: each experiment has id, description, variants with weights, and optional model override.
+
+experiments: []   # empty = no active experiments (normal flow)
+
+# Example (uncomment to activate):
+# - id: "exp_001_sonnet_for_search"
+#   description: "Test Sonnet model for property_search intents"
+#   enabled: true
+#   targeting:
+#     intent: "property_search/filter_search"
+#     rollout_pct: 10
+#   variants:
+#     - id: "control"
+#       weight: 90
+#     - id: "sonnet"
+#       weight: 10
+#       model_override_task: "llm_tier3b"

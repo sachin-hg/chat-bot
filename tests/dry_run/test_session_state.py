@@ -215,29 +215,29 @@ class TestRecentSearchesRequiresNoAuth:
 class TestRedisSessionStoreSaveVersionConflict:
     """REQ-SESS-008: RedisSessionStore.save() with an expected_version must return
     False when a concurrent write has already incremented the version.
-
-    src/session/redis.py currently contains only connection-pool helpers and does
-    not implement RedisSessionStore with an optimistic-lock save(). This test is
-    marked xfail until the class is implemented (CHAT-P-028).
     """
 
-    @pytest.mark.xfail(
-        reason=(
-            "REQ-SESS-008: RedisSessionStore.save(expected_version=N) not yet "
-            "implemented — will be wired in CHAT-P-028 (Sprint 3)"
-        ),
-        strict=True,
-    )
     @pytest.mark.asyncio
     async def test_redis_session_store_save_returns_false_on_version_conflict(self):
-        # TODO CHAT-P-028: implement RedisSessionStore with optimistic locking.
-        # When implemented, replace this with:
-        #   store = RedisSessionStore(redis_client=mock_redis)
-        #   mock Redis WATCH + MULTI/EXEC to simulate concurrent write
-        #   result = await store.save(session, expected_version=3)
-        #   assert result is False
-        from src.session.redis import RedisSessionStore  # noqa: F401 — not yet defined
-        raise AssertionError("RedisSessionStore not implemented yet")
+        """REQ-SESS-008: save() returns False when Redis Lua script returns 0 (version conflict)."""
+        from src.session.store import RedisSessionStore
+
+        mock_redis = AsyncMock()
+        # Simulate a version conflict: Lua eval returns 0
+        mock_redis.eval = AsyncMock(return_value=0)
+
+        store = RedisSessionStore(redis_pool=mock_redis)
+        result = await store.save(
+            session_id="sess-dry-s008",
+            state={"user_id": "u1", "version": 3},
+            expected_version=3,
+        )
+
+        assert result is False, (
+            "REQ-SESS-008: save() must return False when Lua eval returns 0 "
+            "(optimistic lock version conflict)"
+        )
+        mock_redis.eval.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -247,29 +247,33 @@ class TestRedisSessionStoreSaveVersionConflict:
 class TestRedisSessionStorePushTurnTrimsAt20:
     """REQ-SESS-009: push_turn must keep at most 20 conversation turns in Redis,
     trimming the oldest entry when the 21st is pushed.
-
-    src/session/redis.py does not yet implement push_turn / LTRIM. This test is
-    marked xfail until the method is added (CHAT-P-028).
     """
 
-    @pytest.mark.xfail(
-        reason=(
-            "REQ-SESS-009: RedisSessionStore.push_turn() not yet implemented — "
-            "LTRIM(0, 19) wired in CHAT-P-028 (Sprint 3)"
-        ),
-        strict=True,
-    )
     @pytest.mark.asyncio
     async def test_redis_session_store_push_turn_trims_at_20(self):
-        # TODO CHAT-P-028: when push_turn is implemented, replace with:
-        #   mock_pipe = MagicMock()
-        #   mock_redis = AsyncMock()
-        #   mock_redis.pipeline.return_value.__aenter__.return_value = mock_pipe
-        #   store = RedisSessionStore(redis_client=mock_redis)
-        #   await store.push_turn(session_id="s1", turn={...})
-        #   mock_pipe.ltrim.assert_called_once_with(<turns_key>, 0, 19)
-        from src.session.redis import RedisSessionStore  # noqa: F401 — not yet defined
-        raise AssertionError("RedisSessionStore.push_turn not implemented yet")
+        """REQ-SESS-009: push_turn calls ltrim(key, 0, 19) via pipeline."""
+        from src.session.store import RedisSessionStore
+
+        mock_pipe = MagicMock()
+        mock_pipe.lpush = MagicMock()
+        mock_pipe.ltrim = MagicMock()
+        mock_pipe.expire = MagicMock()
+        mock_pipe.execute = AsyncMock(return_value=[1, True, True])
+
+        mock_redis = MagicMock()
+        mock_redis.pipeline = MagicMock(return_value=mock_pipe)
+
+        store = RedisSessionStore(redis_pool=mock_redis)
+        await store.push_turn(
+            conversation_id="conv-dry-s009",
+            turn={"role": "user", "content": "hello"},
+        )
+
+        expected_key = "conv:turns:conv-dry-s009"
+        mock_pipe.ltrim.assert_called_once_with(expected_key, 0, 19), (
+            "REQ-SESS-009: push_turn must trim the turns list to indices 0..19 "
+            "(keeping at most 20 entries)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -280,39 +284,87 @@ class TestSummaryTriggeredAfterTurn20:
     """REQ-SESS-010: The conversation summariser must be triggered once turn_count
     reaches 20, compressing older turns to prevent context-window bloat.
 
-    The summariser (CHAT-P-035) is scheduled for Sprint 4. This test is marked
-    xfail until the summariser is implemented.
-
-    # Full summarizer implemented in Sprint 4 (CHAT-P-035)
+    CHAT-P-035 (Sprint 4): summarize_conversation implemented in
+    src/pipeline/summarizer.py. followup_node fires it via asyncio.create_task
+    when turn_count % 20 == 0.
     """
 
-    @pytest.mark.xfail(
-        reason=(
-            "REQ-SESS-010: conversation summarizer not yet implemented — "
-            "scheduled for Sprint 4 (CHAT-P-035)"
-        ),
-        strict=True,
-    )
     @pytest.mark.asyncio
     async def test_summary_triggered_after_turn_20(self):
-        # TODO CHAT-P-035: when followup_node (or a dedicated summarize_node) has
-        # "turn >= 20" logic, replace with:
-        #   state = make_test_state(session={..., 'turn_count': 20}, ...)
-        #   with patch('...summarize_conversation') as mock_summarize:
-        #       await followup_node(state, emit_sse)
-        #   mock_summarize.assert_awaited_once()
-        #
-        # For now verify the mechanism doesn't already exist so strict=True is valid.
-        import inspect
-        from src.pipeline.nodes import processing
-        source = inspect.getsource(processing)
-        # If "turn >= 20" or "turn_count >= 20" appears, this xfail will be promoted
-        # to a proper passing test — flip strict=True and implement the real assertion.
-        assert "turn >= 20" not in source and "turn_count >= 20" not in source, (
-            "REQ-SESS-010: summariser trigger found in processing.py — "
-            "update this test to assert the summarizer is called correctly"
+        """REQ-SESS-010: summarize_conversation returns a non-None summary when turns exist.
+
+        Uses a mocked redis pool so no real Redis connection is needed.
+        No llm_adapter -> falls back to extractive stub summary.
+        """
+        import json
+        from unittest.mock import AsyncMock
+        from src.pipeline.summarizer import summarize_conversation
+
+        session_id = 'sess-dry-s010'
+
+        # Build fake turns as JSON-encoded bytes (as Redis lrange returns them)
+        fake_turns = [
+            json.dumps({'role': 'user', 'content': 'Show me 2BHK in Bandra'}).encode(),
+            json.dumps({'role': 'assistant', 'content': 'Here are some options in Bandra.'}).encode(),
+        ]
+
+        mock_redis = AsyncMock()
+        # load_turns calls r.lrange — return the fake turns
+        mock_redis.lrange = AsyncMock(return_value=fake_turns)
+        # load (session) calls r.get — return session with active_filters
+        mock_redis.get = AsyncMock(return_value=json.dumps({
+            'session_id': session_id,
+            'active_filters': {'bhk': [2], 'city': 'Mumbai', 'localities': ['Bandra']},
+        }).encode())
+        # save_summary calls r.setex
+        mock_redis.setex = AsyncMock(return_value=True)
+
+        summary = await summarize_conversation(session_id, redis_pool=mock_redis)
+
+        assert summary is not None, (
+            "REQ-SESS-010: summarize_conversation must return a non-None summary "
+            "when turns exist in Redis"
         )
-        # The summarizer is not yet here; raise to keep xfail satisfied.
-        raise AssertionError(
-            "REQ-SESS-010: summarizer trigger not yet implemented (expected — Sprint 4)"
+        assert len(summary) > 0, (
+            "REQ-SESS-010: summary must be a non-empty string"
+        )
+
+    @pytest.mark.asyncio
+    async def test_followup_node_triggers_summary_at_turn_20(self):
+        """REQ-SESS-010: followup_node schedules _trigger_conversation_summary when
+        turn_count + 1 reaches a multiple of 20 (fire-and-forget via asyncio.create_task).
+        """
+        from unittest.mock import AsyncMock, patch, MagicMock
+        from src.pipeline.nodes.response import followup_node
+
+        session_id = 'sess-dry-s010b'
+        state = make_test_state(
+            request_id='req-dry-s010b',
+            session=_make_session(
+                session_id=session_id,
+                turn_count=19,  # next turn is 20 -> triggers summarization
+            ),
+            classification={
+                'main_intent': 'property_search',
+                'sub_intent': 'filter_search',
+                'filter_delta': {},
+                'clarification_needed': None,
+                'pivot': False,
+            },
+        )
+        state['validated_text'] = 'Here are some properties.'
+        state['llm_response'] = {'text': 'Here are some properties.', 'text_message_id': 'msg-1'}
+        state['tool_results'] = []
+
+        emit_sse = MagicMock()
+        tasks_created = []
+
+        with patch('src.pipeline.nodes.response.update_session_state', new=AsyncMock(return_value=True)), \
+             patch('src.pipeline.nodes.response.persist_to_kafka', new=AsyncMock(return_value=None)), \
+             patch('asyncio.create_task', side_effect=lambda coro: tasks_created.append(coro) or MagicMock()):
+            await followup_node(state, emit_sse)
+
+        assert len(tasks_created) == 1, (
+            "REQ-SESS-010: followup_node must schedule exactly one summarization task "
+            "when turn_count reaches a multiple of 20"
         )

@@ -28,3 +28,4 @@ structlog==24.4.0
 
 # Utils
 python-multipart==0.0.12
+pyyaml>=6.0

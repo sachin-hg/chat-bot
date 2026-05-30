@@ -78,3 +78,22 @@ class GetPropertyDetailExecutor(HttpToolExecutor):
             'floor_plans':   prop.get('floor_plans') or [],
             'rera_id':       prop.get('rera_id'),
         }
+
+
+class GetNearbyLandmarksExecutor(HttpToolExecutor):
+    """getNearbyLandmarks — Odin API. Returns nearby landmarks truncated to 5."""
+
+    def __init__(self, redis_pool, odin_base_url: str):
+        super().__init__(redis_pool)
+        self._base_url = odin_base_url.rstrip('/')
+
+    async def call(self, tool: str, params: dict) -> Any:
+        resp = await self._http.get(
+            f'{self._base_url}/api/v1/nearby/landmarks',
+            params={k: v for k, v in params.items() if v is not None},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        landmarks = data.get('landmarks') or data.get('data') or []
+        # Truncation: max 5 landmarks per REQ-TOOL-008
+        return {'landmarks': landmarks[:5], 'total': len(landmarks)}

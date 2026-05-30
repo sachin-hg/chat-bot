@@ -51,12 +51,21 @@ _BLOCKED_PATTERNS = [
 _CANNED_SAFETY_RESPONSES: dict = {
     "prompt_injection": "I'm here to help you find properties. I can't respond to that kind of request.",
     "profanity":        "Let's keep things respectful. How can I help you with your property search?",
+    "empty_message":    "Please type a message so I can help you.",
+    "message_too_long": "Your message is too long. Please keep it under 5 000 characters.",
     "default":          "I'm unable to process that request. How can I help you find a property?",
 }
 
 
+_MAX_MESSAGE_LENGTH = 5000
+
+
 def _check_content_safety(message: str) -> dict:
     """Regex-only safety check. Returns ContentCheckResult dict."""
+    if not message or not message.strip():
+        return {"blocked": True, "reason": "empty_message"}
+    if len(message) > _MAX_MESSAGE_LENGTH:
+        return {"blocked": True, "reason": "message_too_long"}
     for pattern in _BLOCKED_PATTERNS:
         if pattern.search(message):
             return {"blocked": True, "reason": "prompt_injection"}
@@ -74,8 +83,8 @@ def _canned_safety_response(reason: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def _normalize_text(text: str) -> str:
-    """Unicode NFC normalisation and strip.  Does NOT touch prices or amounts."""
-    normalized = unicodedata.normalize("NFC", text)
+    """Unicode NFKC normalisation and strip.  Does NOT touch prices or amounts."""
+    normalized = unicodedata.normalize("NFKC", text)
     return normalized.strip()
 
 

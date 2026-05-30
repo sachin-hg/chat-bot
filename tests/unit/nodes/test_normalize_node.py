@@ -150,14 +150,6 @@ class TestNormalizeNodeUnicode:
     """REQ-CLS-004 — Unicode normalization must be applied (NFC minimum; NFKC preferred)."""
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=(
-            "REQ-CLS-004 (preferred): NFKC normalization converts full-width characters "
-            "to ASCII equivalents.  Current production uses NFC which does NOT decompose "
-            "full-width characters.  Mark xfail until normalization is upgraded to NFKC."
-        ),
-        strict=False,
-    )
     async def test_nfkc_fullwidth_digits_normalized(self):
         """Full-width digits (U+FF12 etc.) are converted to ASCII under NFKC."""
         # "２BHK" in full-width — NFKC normalizes to "2BHK", NFC leaves it as "２BHK"
@@ -169,14 +161,6 @@ class TestNormalizeNodeUnicode:
             f"Full-width '２' was not NFKC-normalized to '2'. Got: {nm!r}"
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=(
-            "REQ-CLS-004 (preferred): NFKC normalization expands ligatures. "
-            "Current production uses NFC which does NOT expand the fi ligature. "
-            "Mark xfail until normalization is upgraded to NFKC."
-        ),
-        strict=False,
-    )
     async def test_nfkc_ligature_normalized(self):
         """Ligature fi (U+FB01) is normalized to 'fi' under NFKC."""
         state  = make_test_state(raw_message="ﬁlter search in mumbai")
