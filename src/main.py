@@ -16,10 +16,29 @@ from src.session.redis import close_redis, get_redis, init_redis
 log = get_logger(__name__)
 
 
+def _configure_langsmith(settings) -> None:
+    """Export LangSmith env vars so LangGraph picks them up automatically."""
+    import os
+    from pydantic import SecretStr
+    try:
+        api_key = settings.langchain_api_key
+        key_str = api_key.get_secret_value() if isinstance(api_key, SecretStr) else str(api_key or '')
+        if settings.langchain_tracing_v2 and key_str:
+            os.environ["LANGCHAIN_TRACING_V2"] = "true"
+            os.environ["LANGCHAIN_API_KEY"] = key_str
+            os.environ["LANGCHAIN_PROJECT"] = str(settings.langchain_project)
+            log.info("langsmith_enabled", project=settings.langchain_project)
+        else:
+            os.environ["LANGCHAIN_TRACING_V2"] = "false"
+    except Exception:
+        os.environ["LANGCHAIN_TRACING_V2"] = "false"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
+    _configure_langsmith(settings)
     log.info("startup", bot_env=settings.bot_env)
 
     # Warm up connections — all are fail-soft (log + continue if unavailable)

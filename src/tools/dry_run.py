@@ -70,8 +70,30 @@ def _infer_mock_intent(message: str) -> tuple:
     return 'property_search', 'property_search', 'filter_search', filter_delta, entities
 
 
+def _configure_langsmith() -> None:
+    """Enable LangSmith tracing if LANGCHAIN_API_KEY is set in env / .env."""
+    import os
+    from pathlib import Path
+    # Load .env manually so the CLI works without pydantic Settings
+    env_file = Path(__file__).parent.parent.parent / '.env'
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, _, v = line.partition('=')
+                os.environ.setdefault(k.strip(), v.strip())
+    api_key = os.environ.get('LANGCHAIN_API_KEY', '')
+    tracing = os.environ.get('LANGCHAIN_TRACING_V2', 'false').lower() == 'true'
+    if tracing and api_key:
+        project = os.environ.get('LANGCHAIN_PROJECT', 'housing-bot-dry-run')
+        print(f"  LangSmith: enabled  project={project}")
+    else:
+        os.environ['LANGCHAIN_TRACING_V2'] = 'false'
+
+
 async def main(message: str, scenario: str, mock_slm: bool, mock_llm: bool) -> None:
     import os
+    _configure_langsmith()
     # Patch session + Kafka persistence so dry-run CLI works without .env
     os.environ.setdefault('BOT_ENV', 'mock')
     import unittest.mock as _mock
