@@ -52,8 +52,12 @@ eval:
 
 # Dry-run a single pipeline turn without a running server (BOT_ENV=mock)
 dry-run:
-	@test -n "$(MSG)" || (echo "Usage: make dry-run MSG='show me 2bhk in powai' [SCENARIO=2bhk_bandra_search]" && exit 1)
-	BOT_ENV=mock python -m src.tools.dry_run --message "$(MSG)" $(if $(SCENARIO),--scenario $(SCENARIO),)
+	@test -n "$(MSG)" || (echo "Usage: make dry-run MSG='show me 2bhk in powai' [SCENARIO=2bhk_bandra_search] [SLM=real] [LLM=real]" && exit 1)
+	BOT_ENV=mock .venv/bin/python -m src.tools.dry_run \
+		--message "$(MSG)" \
+		$(if $(SCENARIO),--scenario $(SCENARIO),) \
+		$(if $(filter real,$(SLM)),,--mock-slm) \
+		$(if $(filter real,$(LLM)),,--mock-llm)
 
 # ── Health check ──────────────────────────────────────────────────────────
 health:
