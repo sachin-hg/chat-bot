@@ -1,7 +1,10 @@
 .PHONY: setup up down logs migrate seed test test-unit test-int eval \
         health clean shell redis-cli logs-pretty logs-errors logs-cost logs-pipeline \
-        dry-run setup-local check-deps \
+        dry-run setup-local check-deps run \
         agents agents-resume agents-standup agents-bus agents-agent
+
+# Read APP_PORT from .env if present, default to 8001
+APP_PORT ?= $(shell grep -m1 '^APP_PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d ' ' || echo 8001)
 
 # ── Python env ────────────────────────────────────────────────────────────
 setup:
@@ -60,30 +63,34 @@ dry-run:
 		$(if $(filter real,$(SLM)),,--mock-slm) \
 		$(if $(filter real,$(LLM)),,--mock-llm)
 
+# ── Run server ────────────────────────────────────────────────────────────
+run:
+	.venv/bin/uvicorn src.main:app --reload --port $(APP_PORT)
+
 # ── Health check ──────────────────────────────────────────────────────────
 health:
 	@echo "→ Checking services..."
-	@curl -sf http://localhost:8000/health | python3 -m json.tool || echo "  [down] FastAPI not running"
+	@curl -sf http://localhost:$(APP_PORT)/health | python3 -m json.tool || echo "  [down] FastAPI not running on :$(APP_PORT)"
 	@docker compose ps --format "table {{.Name}}\t{{.Status}}" 2>/dev/null || true
 
 # ── Log inspection ────────────────────────────────────────────────────────
 # Requires the FastAPI app to be running and jq to be installed
 logs-pretty:
 	@command -v jq >/dev/null || (echo "jq not installed: brew install jq" && exit 1)
-	uvicorn src.main:app 2>&1 | jq -r '"\(.ts) [\(.level | ascii_upcase)] \(.event)"'
+	.venv/bin/uvicorn src.main:app --port $(APP_PORT) 2>&1 | jq -r '"\(.ts) [\(.level | ascii_upcase)] \(.event)"'
 
 logs-errors:
 	@command -v jq >/dev/null || (echo "jq not installed: brew install jq" && exit 1)
-	uvicorn src.main:app 2>&1 | jq -r 'select(.level=="error") | "\(.ts) \(.event) \(.error // "")"'
+	.venv/bin/uvicorn src.main:app --port $(APP_PORT) 2>&1 | jq -r 'select(.level=="error") | "\(.ts) \(.event) \(.error // "")"'
 
 logs-cost:
 	@command -v jq >/dev/null || (echo "jq not installed: brew install jq" && exit 1)
-	uvicorn src.main:app 2>&1 | jq -r 'select(.event=="llm_call") | "\(.ts)  model=\(.model)  cost_usd=\(.cost_usd)  latency_ms=\(.latency_ms)"'
+	.venv/bin/uvicorn src.main:app --port $(APP_PORT) 2>&1 | jq -r 'select(.event=="llm_call") | "\(.ts)  model=\(.model)  cost_usd=\(.cost_usd)  latency_ms=\(.latency_ms)"'
 
 # Tail structlog output and filter to pipeline node events only (requires jq)
 logs-pipeline:
 	@command -v jq >/dev/null || (echo "jq not installed: brew install jq" && exit 1)
-	uvicorn src.main:app 2>&1 | jq -r 'select(.node != null or .event == "pipeline_start" or .event == "pipeline_end") | "\(.ts) [\(.node // "pipeline")] \(.event) \(if .latency_ms then "latency=\(.latency_ms)ms" else "" end)"'
+	.venv/bin/uvicorn src.main:app --port $(APP_PORT) 2>&1 | jq -r 'select(.node != null or .event == "pipeline_start" or .event == "pipeline_end") | "\(.ts) [\(.node // "pipeline")] \(.event) \(if .latency_ms then "latency=\(.latency_ms)ms" else "" end)"'
 
 # ── One-shot local bootstrap ───────────────────────────────────────────────
 # Brings up infrastructure, waits for Postgres to be healthy, runs migrations,
@@ -102,7 +109,7 @@ setup-local:
 		printf '.'; sleep 2; \
 	done && echo " ready."
 	@./scripts/create_kafka_topics.sh || echo "  [warn] Could not create topics — check Kafka logs"
-	@echo "→ Local setup complete. Run: uvicorn src.main:app --reload"
+	@echo "→ Local setup complete. Run: make run   (starts on port $(APP_PORT))"
 
 # Verify Python version, Docker daemon, .env file, and virtualenv existence.
 check-deps:
