@@ -1,10 +1,10 @@
-"""Chat endpoints — CHAT-A-007 (get-conversation-id), CHAT-A-006 (SSE streaming), CHAT-A-024 (send-message)."""
+"""Chat endpoints — CHAT-A-007 (get-conversation-id), CHAT-A-006 (SSE streaming), CHAT-A-024 (send-message), CHAT-A-018 (migrate-chat)."""
 import uuid
 from datetime import datetime
 from typing import AsyncGenerator
 
 import structlog.contextvars
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from src.api.models import (
@@ -13,6 +13,7 @@ from src.api.models import (
     MessageContent,
 )
 from src.api.sse import sse_frame
+from src.config import Settings, get_settings
 from src.pipeline.graph import build_graph
 from src.pipeline.state import make_base_state
 from src.session.redis import get_redis
@@ -21,6 +22,33 @@ router = APIRouter(prefix="/api/v1/chat")
 
 # Redis key TTL for conversation IDs: 365 days
 CONVERSATION_TTL = 365 * 24 * 3600
+
+
+# ---------------------------------------------------------------------------
+# Internal helper — shared by get-conversation-id and migrate-chat
+# ---------------------------------------------------------------------------
+
+async def _validate_login_token(token: str, settings: Settings) -> "str | None":
+    """Validate Login-Auth-Token with the housing login service.
+
+    Returns the userId string on success, None on failure or timeout.
+    Sprint 3: if login_service_url is not configured the call is skipped and
+    None is returned (callers treat this as an auth failure).
+    """
+    if not settings.login_service_url:
+        return None
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(
+                f"{settings.login_service_url}/validate",
+                headers={"Login-Auth-Token": token},
+            )
+            if resp.status_code == 200:
+                return resp.json().get("userId")
+    except Exception:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +107,56 @@ async def get_conversation_id(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# CHAT-A-018: Migrate a guest conversation to a logged-in user
+# ---------------------------------------------------------------------------
+
+@router.post("/migrate-chat")
+async def migrate_chat(
+    request: Request,
+    current_conversation_id: str = Query(alias="currentConversationId"),
+    settings: Settings = Depends(get_settings),
+) -> JSONResponse:
+    """
+    POST /api/v1/chat/migrate-chat?currentConversationId=<id>
+
+    Validates Login-Auth-Token, then associates the conversation with the
+    authenticated user.
+
+    Sprint 3 scope:
+      - Validate token via login service.
+      - Update Redis session key to store user_id.
+      - Return { conversationId, migrated: true, userId }.
+    Sprint 4 (CHAT-A-010): Kafka consumer will persist to DB.
+    """
+    login_auth_token = request.headers.get("Login-Auth-Token")
+    if not login_auth_token:
+        return JSONResponse({"error": "Login-Auth-Token required"}, status_code=401)
+
+    user_id = await _validate_login_token(login_auth_token, settings)
+    if not user_id:
+        return JSONResponse({"error": "Invalid or expired login token"}, status_code=401)
+
+    # Associate user_id with the session in Redis
+    redis = get_redis()
+    session_key = f"session:{current_conversation_id}"
+    session_raw = await redis.get(session_key)
+    if session_raw is not None:
+        import json as _json
+        try:
+            session_data = _json.loads(session_raw)
+        except Exception:
+            session_data = {}
+        session_data["user_id"] = user_id
+        await redis.set(session_key, _json.dumps(session_data), ex=CONVERSATION_TTL)
+
+    return JSONResponse({
+        "conversationId": current_conversation_id,
+        "migrated": True,
+        "userId": user_id,
+    })
+
+
+# ---------------------------------------------------------------------------
 # A3 — CHAT-A-006: Send message (SSE streaming)
 # ---------------------------------------------------------------------------
 
@@ -126,11 +204,13 @@ async def send_message_streamed(
     else:
         raw_message = body.content.text or ""
 
-    # 5. Build initial BotState
+    # 5. Build initial BotState (seed with gateway handoff context on Turn 1)
+    handoff = body.handoff_context.model_dump(by_alias=False) if body.handoff_context else None
     state = make_base_state(
-        request_id=request_id,
-        session_id=conversation_id,
         raw_message=raw_message,
+        session_id=conversation_id,
+        request_id=request_id,
+        handoff_context=handoff,
     )
 
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -216,9 +296,9 @@ async def send_message(
 
     # 4. Build initial BotState
     state = make_base_state(
-        request_id=request_id,
-        session_id=conversation_id,
         raw_message=raw_message,
+        session_id=conversation_id,
+        request_id=request_id,
     )
 
     # 5. Run the pipeline graph synchronously with a noop SSE emitter

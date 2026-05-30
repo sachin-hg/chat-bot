@@ -597,18 +597,116 @@ async def persist_to_kafka(conversation_id: str, events: list[dict]) -> None:
 
 
 async def update_session_state(session: dict, classification: dict, tool_results: list) -> bool:
-    """Persists session to Redis after the turn completes.
-    Sprint 1 stub — returns True (success) without real Redis write.
-    # TODO CHAT-A-008: replace with real RedisSessionStore.save() call."""
-    log.info('session_update_stub', session_id=session.get('session_id'))
-    return True
+    """Persist session to Redis after turn completes using optimistic locking."""
+    from src.session.store import RedisSessionStore
+    from src.session.redis import get_redis
+    try:
+        redis = get_redis()
+        store = RedisSessionStore(redis)
+        session_id = session.get('session_id', '')
+        version = session.get('version', 0)
+        return await store.save(session_id, session, version)
+    except Exception as exc:
+        log.warn('session_update_failed', error=str(exc))
+        # Non-fatal: return True so pipeline doesn't enter conflict path
+        return True
 
 
 async def reconcile_session_conflict(session: dict, bot_response: dict | None) -> None:
-    """Called when optimistic locking fails (update_session_state returns False).
-    Sprint 1 stub — logs the conflict.
-    # TODO CHAT-A-008: implement retry with re-loaded session state."""
-    log.warn('session_conflict_stub', session_id=session.get('session_id'))
+    """Called when optimistic locking fails (save returns False).
+    Sprint 3: log and continue. Full retry in Sprint 4."""
+    log.warn('session_conflict_unresolved', session_id=session.get('session_id'))
+
+
+def _make_chat_event(
+    template_id: str, data: dict,
+    conversation_id: str, source_msg_id: str,
+    seq: int, now: str,
+) -> 'ChatEventToUser':
+    from src.api.models import ChatEventToUser, MessageContent
+    return ChatEventToUser(
+        conversation_id      = conversation_id,
+        message_id           = str(uuid.uuid4()),
+        source_message_id    = source_msg_id,
+        message_type         = 'template',
+        message_state        = 'COMPLETED',
+        source_message_state = 'IN_PROGRESS',
+        created_at           = now,
+        sequence_number      = seq,
+        sender               = {'type': 'bot'},
+        content              = MessageContent(
+            template_id=template_id,
+            data=data,
+        ),
+    )
+
+
+def _build_property_carousel(
+    classification: dict, pre_fetched_data: dict, tool_results: list,
+    session: dict, source_msg_id: str, conversation_id: str, seq: int, now: str,
+) -> list:
+    """Build property_carousel template event from searchProperties result."""
+    search_data = (
+        pre_fetched_data.get('searchProperties') or
+        pre_fetched_data.get('filter_search') or
+        {}
+    )
+    hits = search_data.get('hits') or []
+    if not hits:
+        return []
+    return [_make_chat_event(
+        template_id     = 'property_carousel',
+        data            = {
+            'properties':   hits[:10],
+            'totalCount':   search_data.get('total_count', len(hits)),
+            'srsetId':      search_data.get('srset_id'),
+            'filters':      session.get('active_filters', {}),
+        },
+        conversation_id = conversation_id,
+        source_msg_id   = source_msg_id,
+        seq             = seq,
+        now             = now,
+    )]
+
+
+def _build_locality_carousel(
+    classification: dict, pre_fetched_data: dict, tool_results: list,
+    session: dict, source_msg_id: str, conversation_id: str, seq: int, now: str,
+) -> list:
+    """Build locality_carousel template event from getTrendingLocalities result."""
+    locality_data = (
+        pre_fetched_data.get('getTrendingLocalities') or
+        pre_fetched_data.get('trending_localities') or
+        {}
+    )
+    localities = locality_data.get('localities') or []
+    if not localities:
+        return []
+    return [_make_chat_event(
+        template_id     = 'locality_carousel',
+        data            = {
+            'localities':   localities[:8],
+            'city':         session.get('city', ''),
+        },
+        conversation_id = conversation_id,
+        source_msg_id   = source_msg_id,
+        seq             = seq,
+        now             = now,
+    )]
+
+
+# Registry: (main_intent, sub_intent) → builder function
+TEMPLATE_BUILDERS: dict[tuple, Callable] = {
+    ('property_search', 'filter_search'):          _build_property_carousel,
+    ('property_search', 'explore_nearby'):          _build_property_carousel,
+    ('property_search', 'discovery_collections'):  _build_property_carousel,
+    ('property_detail', 'similar_properties'):     _build_property_carousel,
+    ('locality_research', 'trending_localities'):  _build_locality_carousel,
+    ('comparison', 'compare_localities'):          _build_locality_carousel,
+    ('portfolio', 'saved_properties'):             _build_property_carousel,
+    ('portfolio', 'viewed_properties'):            _build_property_carousel,
+    ('portfolio', 'recommendations'):              _build_property_carousel,
+}
 
 
 def build_template_events(
@@ -622,9 +720,25 @@ def build_template_events(
     now: str,
 ) -> list:
     """Builds ChatEventToUser objects for template responses (carousels etc.).
-    Sprint 1 stub — returns [] so the pipeline runs end-to-end without real data.
-    # TODO CHAT-P-016: implement TEMPLATE_BUILDERS dispatch for each intent."""
-    return []
+
+    Dispatches to the appropriate builder based on (main_intent, sub_intent).
+    Returns [] when no builder is registered for the intent or data is absent.
+    """
+    c = classification
+    intent_key = (c.get('main_intent', ''), c.get('sub_intent', ''))
+    builder = TEMPLATE_BUILDERS.get(intent_key)
+    if not builder:
+        return []
+    return builder(
+        classification   = c,
+        pre_fetched_data = pre_fetched_data,
+        tool_results     = tool_results,
+        session          = session,
+        source_msg_id    = source_msg_id,
+        conversation_id  = conversation_id,
+        seq              = seq_start,
+        now              = now,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -745,4 +859,4 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
 async def experiment_node(state: BotState) -> dict:
     """A/B experiment resolution. Sprint 1 stub — no active experiments.
     # TODO CHAT-P-036: load experiments.yaml, resolve active experiment for session."""
-    return {}
+    return {"experiment_id": None}

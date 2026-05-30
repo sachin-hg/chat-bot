@@ -73,14 +73,27 @@ class OutOfScopeEvent(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class HandoffContext(BaseModel):
+    source:              str                = ''
+    active_property_id:  Optional[str]      = Field(None, alias="activePropertyId")
+    active_project_id:   Optional[str]      = Field(None, alias="activeProjectId")
+    active_locality:     Optional[str]      = Field(None, alias="activeLocality")
+    city:                Optional[str]      = None
+    transaction_type:    Optional[str]      = Field(None, alias="transactionType")
+    handoff_summary:     Optional[str]      = Field(None, alias="handoffSummary")
+    shared_entities:     dict               = Field(default_factory=dict, alias="sharedEntities")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class ChatEventFromUser(BaseModel):
-    conversation_id:  str           = Field(..., alias="conversationId")
-    sender:           Dict[str, Any] = Field(...)
-    message_type:     MessageType   = Field(..., alias="messageType")
-    content:          MessageContent = Field(...)
-    response_required: bool         = Field(..., alias="responseRequired")
-    is_visible:       Optional[bool] = Field(None, alias="isVisible")
-    handoff_context:  Optional[Dict[str, Any]] = Field(None, alias="handoffContext")
+    conversation_id:  str                      = Field(..., alias="conversationId")
+    sender:           Dict[str, Any]            = Field(...)
+    message_type:     MessageType              = Field(..., alias="messageType")
+    content:          MessageContent            = Field(...)
+    response_required: bool                    = Field(..., alias="responseRequired")
+    is_visible:       Optional[bool]            = Field(None, alias="isVisible")
+    handoff_context:  Optional[HandoffContext]  = Field(None, alias="handoffContext")
 
     model_config = ConfigDict(populate_by_name=True)
 

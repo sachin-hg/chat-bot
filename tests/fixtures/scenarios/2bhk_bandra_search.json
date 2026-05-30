@@ -17,7 +17,42 @@
         "price": 6800000,
         "area_sqft": 680,
         "highlights": ["Gated Community"]
+      },
+      {
+        "property_id": "prop_ban_003",
+        "title": "Spacious 2BHK near Bandra Station",
+        "price": 8200000,
+        "area_sqft": 820,
+        "highlights": ["Sea View", "Verified", "Ready to Move"]
       }
-    ]
+    ],
+    "facets": {
+      "bhk": {"2": 23},
+      "locality": {"Bandra West": 14, "Bandra East": 9}
+    }
+  },
+  "getPropertyDetail": {
+    "property_id": "prop_ban_001",
+    "title": "2BHK in Bandra West",
+    "price": 7500000,
+    "area_sqft": 750,
+    "bedrooms": 2,
+    "bathrooms": 2,
+    "floor": 4,
+    "total_floors": 12,
+    "locality": "Bandra West",
+    "city": "Mumbai",
+    "amenities": ["Lift", "Parking", "Security", "Power Backup"],
+    "seller_id": "seller_ban_001",
+    "listed_at": "2024-01-15T10:00:00Z",
+    "highlights": ["Verified", "Metro 400m"]
+  },
+  "resolveEntity": {
+    "candidates": [
+      {"id": "loc_bandra_west_001", "name": "Bandra West", "type": "locality", "city": "Mumbai", "score": 0.97},
+      {"id": "loc_bandra_east_001", "name": "Bandra East",  "type": "locality", "city": "Mumbai", "score": 0.82}
+    ],
+    "resolved": {"id": "loc_bandra_west_001", "name": "Bandra West", "type": "locality", "city": "Mumbai"},
+    "confidence": 0.97
   }
 }

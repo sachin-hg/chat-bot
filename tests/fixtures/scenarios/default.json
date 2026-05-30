@@ -1,1 +1,14 @@
-{}
+{
+  "searchProperties": {
+    "total_count": 0,
+    "hits": [],
+    "srset_id": null,
+    "facets": {}
+  },
+  "getPropertyDetail": {},
+  "resolveEntity": {
+    "candidates": [],
+    "resolved": null,
+    "confidence": 0.0
+  }
+}

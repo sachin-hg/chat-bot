@@ -1,0 +1,33 @@
+{
+  "searchProperties": {
+    "total_count": 0,
+    "hits": [],
+    "srset_id": null,
+    "facets": {}
+  },
+  "getPropertyDetail": {},
+  "resolveEntity": {
+    "candidates": [],
+    "resolved": null,
+    "confidence": 0.0
+  },
+  "getLocalityDetail": {
+    "locality_id": "stub-locality-001",
+    "name": "Stub Locality",
+    "city": "Mumbai",
+    "description": "A well-connected residential locality.",
+    "amenities": []
+  },
+  "getPriceTrends": {
+    "locality_id": "stub-locality-001",
+    "avg_price_per_sqft": 15000,
+    "price_change_1y_pct": 8.5,
+    "trend": "rising"
+  },
+  "getRatingsReviews": {
+    "locality_id": "stub-locality-001",
+    "overall_rating": 4.2,
+    "review_count": 120,
+    "top_tags": ["connectivity", "schools", "greenery"]
+  }
+}

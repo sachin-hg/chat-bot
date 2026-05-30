@@ -19,9 +19,9 @@ def make_test_state(
     try:
         from src.pipeline.state import make_base_state
         state = make_base_state(
-            request_id=request_id,
-            session_id=session_id,
             raw_message=raw_message,
+            session_id=session_id,
+            request_id=request_id,
         )
     except ImportError:
         # Stub: mirrors BotState fields exactly for use before state.py exists

@@ -68,15 +68,33 @@ class BotState(TypedDict):
 
 
 def make_base_state(
-    request_id: str,
-    session_id: str,
-    raw_message: str,
+    raw_message: str = '',
+    session_id: str = '',
+    session: Optional[Dict[str, Any]] = None,
+    request_id: Optional[str] = None,
+    handoff_context: Optional[Dict[str, Any]] = None,
 ) -> BotState:
-    """Returns a BotState with all fields initialised to documented defaults."""
-    return BotState(
-        raw_message=raw_message,
-        request_id=request_id,
-        session={
+    """Returns a BotState with all fields initialised to documented defaults.
+
+    Parameters
+    ----------
+    raw_message:      The user's raw input text.
+    session_id:       Convenience shorthand — used to build a fresh session dict
+                      when *session* is not provided.
+    session:          Pre-loaded session dict (e.g. from Redis).  Takes precedence
+                      over session_id when supplied.
+    request_id:       UUID4 trace identifier; auto-generated when omitted.
+    handoff_context:  Optional gateway handoff payload.  Applied to the session on
+                      Turn 1 (turn_count == 0) to seed active context fields.
+    """
+    if request_id is None:
+        request_id = str(uuid.uuid4())
+
+    # Build or reuse the session dict
+    if session is not None:
+        session_dict = session
+    else:
+        session_dict = {
             "session_id":          session_id,
             "conversation_id":     "",
             "user_id":             None,
@@ -96,7 +114,26 @@ def make_base_state(
             "srset_id":            None,
             "search_history":      [],
             "carousel_state":      {},
-        },
+        }
+
+    # Apply handoff context on Turn 1
+    if handoff_context and session_dict.get('turn_count', 0) == 0:
+        hc = handoff_context if isinstance(handoff_context, dict) else {}
+        if hc.get('active_property_id'):
+            session_dict['active_property_id'] = hc['active_property_id']
+        if hc.get('active_project_id'):
+            session_dict['active_project_id'] = hc['active_project_id']
+        if hc.get('city'):
+            session_dict.setdefault('active_filters', {})['city'] = hc['city']
+        if hc.get('transaction_type'):
+            session_dict['transaction_type'] = hc['transaction_type']
+        if hc.get('handoff_summary'):
+            session_dict['handoff_summary'] = hc['handoff_summary']
+
+    return BotState(
+        raw_message=raw_message,
+        request_id=request_id,
+        session=session_dict,
         safety_result=None,
         normalized_message=None,
         domain=None,
