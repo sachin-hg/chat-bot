@@ -1,0 +1,23 @@
+{
+  "searchProperties": {
+    "total_count": 23,
+    "is_last_page": false,
+    "srset_id": "sr_test_001",
+    "hits": [
+      {
+        "property_id": "prop_ban_001",
+        "title": "2BHK in Bandra West",
+        "price": 7500000,
+        "area_sqft": 750,
+        "highlights": ["Verified", "Metro 400m"]
+      },
+      {
+        "property_id": "prop_ban_002",
+        "title": "2BHK in Bandra East",
+        "price": 6800000,
+        "area_sqft": 680,
+        "highlights": ["Gated Community"]
+      }
+    ]
+  }
+}
