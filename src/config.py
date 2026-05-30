@@ -7,11 +7,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # PostgreSQL (via PgBouncer)
-    postgres_host:     str       = "localhost"
-    postgres_port:     int       = 5433
-    postgres_db:       str       = "chatbot"
-    postgres_user:     str       = "chatbot"
-    postgres_password: SecretStr
+    postgres_host:     str              = "localhost"
+    postgres_port:     int              = 5433
+    postgres_db:       str              = "chatbot"
+    postgres_user:     str              = "chatbot"
+    postgres_password: Optional[SecretStr] = None   # required in local/staging/prod
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     kafka_consumer_group:    str = "chat-db-writer"
 
     # Anthropic
-    anthropic_api_key: SecretStr
+    anthropic_api_key: Optional[SecretStr] = None   # required when using real SLM/LLM
 
     # External APIs
     khoj_base_url:          str = ""
@@ -37,8 +37,8 @@ class Settings(BaseSettings):
 
     # Application
     bot_env:    Literal["mock", "local", "staging", "production"] = "local"
-    log_level:  str       = "INFO"
-    secret_key: SecretStr
+    log_level:  str              = "INFO"
+    secret_key: Optional[SecretStr] = None          # required in local/staging/prod
 
     # Housing login service
     login_service_url: str = ""
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        pwd = self.postgres_password.get_secret_value()
+        pwd = self.postgres_password.get_secret_value() if self.postgres_password else ""
         return (
             f"postgresql+asyncpg://{self.postgres_user}:{pwd}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
