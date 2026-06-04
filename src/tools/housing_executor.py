@@ -21,48 +21,69 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 def _calculate_emi(params: dict) -> dict:
-    loan_amount = float(params.get("loan_amount", 0) or 0)
-    rate        = float(params.get("rate", 8.5) or 8.5)
-    tenure_years = int(params.get("tenure_years", 20) or 20)
+    # Accept both TOOL_REGISTRY param names (property_price / loan_tenure_years /
+    # interest_rate_annual) and direct executor names (loan_amount / tenure_years / rate).
+    if "property_price" in params:
+        down_pct     = float(params.get("down_payment_pct", 20) or 20) / 100
+        loan_amount  = float(params["property_price"]) * (1 - down_pct)
+        rate         = float(params.get("interest_rate_annual", 8.5) or 8.5)
+        tenure_years = int(params.get("loan_tenure_years", 20) or 20)
+    else:
+        loan_amount  = float(params.get("loan_amount", 0) or 0)
+        rate         = float(params.get("rate", 8.5) or 8.5)
+        tenure_years = int(params.get("tenure_years", 20) or 20)
+
     if loan_amount <= 0:
         return {"error": "loan_amount required"}
     r = rate / 1200
     n = tenure_years * 12
     emi = int(loan_amount * r * (1 + r) ** n / ((1 + r) ** n - 1)) if r > 0 else int(loan_amount / n)
     return {
-        "monthly_emi":   emi,
-        "loan_amount":   loan_amount,
-        "rate":          rate,
-        "tenure_years":  tenure_years,
-        "total_amount":  emi * n,
-        "total_interest": emi * n - loan_amount,
+        "monthly_emi":    emi,
+        "loan_amount":    int(loan_amount),
+        "rate":           rate,
+        "tenure_years":   tenure_years,
+        "total_amount":   emi * n,
+        "total_interest": int(emi * n - loan_amount),
+        "total_payment":  emi * n,   # alias used by tool_registry return_schema_summary
     }
 
 
 def _calculate_affordability(params: dict) -> dict:
-    monthly_income = float(params.get("monthly_income", 0) or 0)
+    # Accept monthly_salary (TOOL_REGISTRY name) OR monthly_income (executor name).
+    # Also accept annual_salary fallback.
+    monthly_income = (
+        float(params.get("monthly_salary") or 0) or
+        float(params.get("monthly_income") or 0) or
+        float(params.get("annual_salary") or 0) / 12
+    )
     if monthly_income <= 0:
-        return {"error": "monthly_income required"}
-    # Standard 40% EMI rule, 20-year loan at 8.5%
-    max_emi     = monthly_income * 0.40
-    r, n        = 8.5 / 1200, 240
-    max_loan    = int(max_emi * ((1 + r) ** n - 1) / (r * (1 + r) ** n))
-    down_payment = int(max_loan * 0.20)  # typical 20% down payment
+        return {"error": "monthly_salary or annual_salary required"}
+    existing_emi = float(params.get("existing_emi", 0) or 0)
+    # Standard 40% FOIR rule, 20-year loan at 8.5%
+    max_emi      = monthly_income * 0.40 - existing_emi
+    r, n         = 8.5 / 1200, 240
+    max_loan     = int(max_emi * ((1 + r) ** n - 1) / (r * (1 + r) ** n))
+    down_pct     = float(params.get("down_payment_pct", 20) or 20) / 100
+    down_payment = int(max_loan * down_pct)
     return {
-        "monthly_income":       monthly_income,
-        "max_emi":              int(max_emi),
-        "max_loan":             max_loan,
-        "recommended_budget":   max_loan + down_payment,
-        "min_down_payment":     down_payment,
-        "assumed_rate_percent": 8.5,
-        "assumed_tenure_years": 20,
+        "monthly_income":          int(monthly_income),
+        "max_emi":                 int(max_emi),
+        "max_loan":                max_loan,
+        "affordable_property_price": max_loan + down_payment,
+        "recommended_budget":      max_loan + down_payment,
+        "min_down_payment":        down_payment,
+        "foir_pct":                40,
+        "assumed_rate_percent":    8.5,
+        "assumed_tenure_years":    20,
     }
 
 
 def _convert_unit(params: dict) -> dict:
     value     = float(params.get("value", 0) or 0)
-    from_unit = (params.get("from_unit") or "sqft").lower()
-    to_unit   = (params.get("to_unit")   or "sqm").lower()
+    # Accept 'from'/'to' (TOOL_REGISTRY schema) OR 'from_unit'/'to_unit' (executor)
+    from_unit = (params.get("from") or params.get("from_unit") or "sqft").lower()
+    to_unit   = (params.get("to")   or params.get("to_unit")   or "sqm").lower()
     _factors: dict[tuple, float] = {
         ("sqft",   "sqm"):     0.092903,
         ("sqm",    "sqft"):    10.7639,

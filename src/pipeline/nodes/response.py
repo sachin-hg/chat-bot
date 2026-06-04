@@ -946,14 +946,41 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
         }
         await persist_to_kafka(conversation_id, [user_event])
 
-    session = state['session']
-    saved   = await update_session_state(session, c, state.get('tool_results') or [])
+    # ── Persist session context so the next turn has full history ──────────
+    session = dict(state['session'])   # work on a mutable copy
+
+    # last_intent / last_domain — feeds Stage 1 and Stage 2 SLM routing context
+    session['last_intent'] = {
+        'main_intent': c.get('main_intent', ''),
+        'sub_intent':  c.get('sub_intent', ''),
+    }
+    session['last_domain'] = state.get('domain', '')
+
+    # turn_count — persisted (was computed locally and never written back)
+    session['turn_count'] = session.get('turn_count', 0) + 1
+
+    # Anthropic-format turn_history — passed verbatim as `messages` to llm_node
+    # newest message first; capped at 20 messages (~10 turns)
+    new_llm_messages: list = [{'role': 'user', 'content': state.get('raw_message', '')}]
+    if validated_text:
+        new_llm_messages.append({'role': 'assistant', 'content': validated_text})
+    prior_history: list = list(session.get('turn_history') or [])
+    session['turn_history'] = (new_llm_messages + prior_history)[:20]
+
+    # last_3_turns — condensed for Stage 2 classifier context (user message + intent tag)
+    prior_turns: list = list(session.get('last_3_turns') or [])
+    session['last_3_turns'] = ([{
+        'user':        state.get('raw_message', ''),
+        'main_intent': c.get('main_intent', ''),
+        'sub_intent':  c.get('sub_intent', ''),
+    }] + prior_turns)[:3]
+
+    saved = await update_session_state(session, c, state.get('tool_results') or [])
     if not saved:
         await reconcile_session_conflict(session, bot_response)
 
     # Trigger async conversation summarization every 20 turns (fire-and-forget)
-    turn_count = session.get('turn_count', 0) + 1
-    if turn_count >= 20 and turn_count % 20 == 0:
+    if session['turn_count'] >= 20 and session['turn_count'] % 20 == 0:
         asyncio.create_task(
             _trigger_conversation_summary(session['session_id'])
         )

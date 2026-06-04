@@ -681,6 +681,23 @@ async def derive_node(state: BotState) -> dict:
         del filters["search_anchor"]
         derived.update(anchor)
 
+    # Apply resolved entity UUIDs to active_filters.localities
+    # resolve_entities_node stores UUIDs in state['resolved_entities'], but the
+    # searchProperties tool call needs UUIDs not display names for accurate results.
+    resolved_entities = state.get("resolved_entities") or {}
+    if resolved_entities and filters.get("localities"):
+        upgraded = []
+        for name_or_id in filters["localities"]:
+            entity = resolved_entities.get(name_or_id) or {}
+            uuid_val = entity.get("uuid") or entity.get("resolved", {}).get("uuid") if isinstance(entity.get("resolved"), dict) else None
+            confidence = float(entity.get("confidence", 0.0))
+            if uuid_val and confidence >= 0.70:
+                upgraded.append(uuid_val)
+                derived[f"locality_resolved_{name_or_id}"] = uuid_val
+            else:
+                upgraded.append(name_or_id)   # keep display name if unresolved
+        filters["localities"] = upgraded
+
     session["active_filters"] = filters
     return {"session": session, "derived_filters": derived}
 

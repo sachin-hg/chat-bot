@@ -228,11 +228,10 @@ def _handle_get_locality_detail(params: dict) -> dict:
     locality_id = params.get("locality_id") or params.get("id") or ""
     city = params.get("city", "Mumbai")
 
-    # Try to find by slug-style ID
     loc_info = None
     for locs in _CITY_LOCALITIES.values():
         for loc in locs:
-            if _stable_id(loc["slug"]) == locality_id or loc["slug"] in locality_id:
+            if _stable_id(loc["slug"]) == locality_id or loc["slug"] in locality_id.lower():
                 loc_info = loc
                 break
         if loc_info:
@@ -242,29 +241,32 @@ def _handle_get_locality_detail(params: dict) -> dict:
         loc_info = locs[0] if locs else {"name": "Bandra West", "slug": "bandra-west", "avg_psf": 35000, "rating": 4.5, "yoy": 8.2}
 
     name = loc_info["name"]
-    psf = loc_info["avg_psf"]
+    psf  = loc_info["avg_psf"]
     return {
-        "locality_id": locality_id or _stable_id(loc_info["slug"]),
-        "name": name,
-        "city": city,
-        "avg_price_per_sqft": psf,
-        "avg_price_2bhk": psf * 900,
-        "avg_price_3bhk": psf * 1300,
-        "yoy_growth_percent": loc_info["yoy"],
-        "rating": loc_info["rating"],
-        "total_listings": 1200 + int(psf / 100),
-        "connectivity": {
-            "metro": f"{name} Metro Station — 0.8 km",
-            "highway": "Western Express Highway — 2.1 km",
-            "airport": "Chhatrapati Shivaji Maharaj International Airport — 12 km",
-        },
-        "top_amenities": ["Schools", "Hospitals", "Malls", "Parks", "IT Parks"],
-        "description": (
-            f"{name} is a well-developed residential locality in {city}. "
-            f"With an average price of ₹{psf:,}/sqft and a {loc_info['yoy']}% YoY growth, "
-            f"it is considered a {('premium' if psf > 20000 else 'mid-range')} neighbourhood. "
-            f"The area offers excellent connectivity and is close to major employment hubs."
+        # Field names match GetLocalityDetailExecutor output + LLM prompt context
+        "locality_id":    locality_id or _stable_id(loc_info["slug"]),
+        "display_name":   name,          # ← was "name"; match executor output
+        "city":           city,
+        "overview": (
+            f"{name} is a {('premium' if psf > 20000 else 'mid-range')} residential locality in {city}. "
+            f"Average price ₹{psf:,}/sqft. {loc_info['yoy']}% YoY growth. "
+            f"Well-connected with schools, hospitals, and malls nearby."
         ),
+        "avg_price_sqft":  psf,           # ← was "avg_price_per_sqft"; match executor
+        "price_trend":     {"yoy_change_percent": loc_info["yoy"], "direction": "rising" if loc_info["yoy"] > 8 else "stable"},
+        "ratings": {
+            "overall": loc_info["rating"],
+            "connectivity": min(loc_info["rating"] + 0.1, 5.0),
+            "safety": loc_info["rating"] - 0.1,
+            "amenities": loc_info["rating"],
+        },
+        "connectivity": [
+            f"{name} Metro Station — 0.8 km",
+            "Western Express Highway — 2.1 km",
+        ],
+        "nearby_schools":   ["Ryan International School", "St. Xavier's High School"],
+        "nearby_hospitals": ["Holy Family Hospital", "Lilavati Hospital"],
+        "total_listings":   1200 + int(psf / 100),
     }
 
 
@@ -291,10 +293,9 @@ def _handle_get_trending_localities(params: dict) -> dict:
 
 
 def _handle_get_price_trends(params: dict) -> dict:
-    locality_id = params.get("locality_id") or ""
+    locality_id = params.get("locality_id") or params.get("project_id") or ""
     city = params.get("city", "Mumbai")
 
-    # Find locality
     loc_info = None
     for locs in _CITY_LOCALITIES.values():
         for loc in locs:
@@ -302,23 +303,28 @@ def _handle_get_price_trends(params: dict) -> dict:
                 loc_info = loc
                 break
     base_psf = (loc_info or {}).get("avg_psf", 15000)
-    yoy = (loc_info or {}).get("yoy", 9.0)
+    yoy      = (loc_info or {}).get("yoy", 9.0)
     monthly_growth = yoy / 12.0
 
     months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    trends = []
+    data_points = []
     current_psf = base_psf * (1 - yoy / 100)
     for i, month in enumerate(months):
         current_psf = current_psf * (1 + monthly_growth / 100)
-        trends.append({"month": f"{month} 2026", "avg_price_per_sqft": int(current_psf), "transactions": 45 + i * 3})
+        data_points.append({                       # ← field names match real executor
+            "month":           f"{month} 2026",
+            "avg_price_sqft":  int(current_psf),   # ← was "avg_price_per_sqft"
+            "transactions":    45 + i * 3,
+        })
 
     return {
-        "locality_id": locality_id,
-        "locality_name": (loc_info or {}).get("name", "Unknown"),
+        "locality_id":      locality_id,
+        "locality_name":    (loc_info or {}).get("name", "Unknown"),
         "transaction_type": params.get("transaction_type", "buy"),
-        "monthly_trends": trends,
-        "yoy_growth_percent": yoy,
-        "current_avg_psf": base_psf,
+        "data_points":      data_points,           # ← was "monthly_trends"
+        "current_price":    base_psf,              # ← was "current_avg_psf"
+        "yoy_change_pct":   yoy,                   # ← was "yoy_growth_percent"
+        "trend_direction":  "rising" if yoy > 8 else "stable",
     }
 
 
@@ -379,15 +385,14 @@ def _handle_get_brochure(params: dict) -> dict:
 
 
 def _handle_get_nearby_landmarks(params: dict) -> dict:
-    lat = params.get("lat", 19.0596)
-    lng = params.get("lng", 72.8295)
     return {
         "landmarks": [
-            {"name": "Holy Family Hospital",        "type": "hospital",   "distance_km": 0.4},
-            {"name": "Linking Road Market",          "type": "mall",       "distance_km": 0.7},
-            {"name": "Bandra Kurla Complex",         "type": "it_hub",     "distance_km": 2.1},
-            {"name": "Bandstand Promenade",          "type": "park",       "distance_km": 1.2},
-            {"name": "St. Stanislaus High School",   "type": "school",     "distance_km": 0.5},
+            # Field names match tool_registry schema: category, distance_metres, walk_minutes
+            {"name": "Holy Family Hospital",       "category": "hospital",  "distance_metres": 400,  "walk_minutes": 5},
+            {"name": "Linking Road Market",         "category": "mall",      "distance_metres": 700,  "walk_minutes": 9},
+            {"name": "Bandra Kurla Complex",        "category": "it_hub",    "distance_metres": 2100, "walk_minutes": 26},
+            {"name": "Bandstand Promenade",         "category": "park",      "distance_metres": 1200, "walk_minutes": 15},
+            {"name": "St. Stanislaus High School",  "category": "school",    "distance_metres": 500,  "walk_minutes": 6},
         ][:5],
         "total": 5,
     }
@@ -427,32 +432,89 @@ def _handle_get_recommendations(params: dict) -> dict:
 
 
 def _handle_calculate_emi(params: dict) -> dict:
-    loan_amount = params.get("loan_amount", 5_000_000)
-    rate = params.get("rate", 8.5)
-    tenure_years = params.get("tenure_years", 20)
+    # Accept both property_price (TOOL_REGISTRY schema) and loan_amount (executor name)
+    if "property_price" in params:
+        down_pct    = float(params.get("down_payment_pct", 20) or 20) / 100
+        loan_amount = float(params["property_price"]) * (1 - down_pct)
+        rate         = float(params.get("interest_rate_annual", 8.5) or 8.5)
+        tenure_years = int(params.get("loan_tenure_years", 20) or 20)
+    else:
+        loan_amount  = float(params.get("loan_amount", 5_000_000) or 5_000_000)
+        rate         = float(params.get("rate", 8.5) or 8.5)
+        tenure_years = int(params.get("tenure_years", 20) or 20)
     r = rate / 1200
     n = tenure_years * 12
-    emi = int(loan_amount * r * (1 + r) ** n / ((1 + r) ** n - 1)) if r > 0 else loan_amount // n
-    return {"monthly_emi": emi, "loan_amount": loan_amount, "rate": rate, "tenure_years": tenure_years, "total_amount": emi * n}
+    emi = int(loan_amount * r * (1 + r) ** n / ((1 + r) ** n - 1)) if r > 0 else int(loan_amount / n)
+    return {"monthly_emi": emi, "loan_amount": int(loan_amount), "rate": rate,
+            "tenure_years": tenure_years, "total_amount": emi * n, "total_payment": emi * n,
+            "total_interest": int(emi * n - loan_amount)}
 
 
 def _handle_calculate_affordability(params: dict) -> dict:
-    monthly_income = params.get("monthly_income", 200_000)
-    budget = int(monthly_income * 60 * 0.4)  # 40% EMI rule, 5-yr tenure proxy
-    return {"max_loan": budget * 12, "recommended_budget": int(budget * 12 * 1.2), "monthly_income": monthly_income}
+    monthly_income = (
+        float(params.get("monthly_salary") or 0) or
+        float(params.get("monthly_income") or 0) or
+        float(params.get("annual_salary") or 0) / 12 or
+        200_000
+    )
+    max_emi  = monthly_income * 0.40
+    r, n     = 8.5 / 1200, 240
+    max_loan = int(max_emi * ((1 + r) ** n - 1) / (r * (1 + r) ** n))
+    down     = int(max_loan * 0.20)
+    return {"monthly_income": int(monthly_income), "max_emi": int(max_emi), "max_loan": max_loan,
+            "affordable_property_price": max_loan + down, "recommended_budget": max_loan + down,
+            "min_down_payment": down, "foir_pct": 40}
 
 
 def _handle_convert_unit(params: dict) -> dict:
-    value = params.get("value", 1)
-    from_unit = params.get("from_unit", "sqft")
-    to_unit = params.get("to_unit", "sqm")
-    conversions = {("sqft", "sqm"): 0.0929, ("sqm", "sqft"): 10.764, ("sqft", "sqyard"): 0.1111, ("sqyard", "sqft"): 9.0}
+    value     = float(params.get("value", 1) or 1)
+    from_unit = (params.get("from") or params.get("from_unit") or "sqft").lower()
+    to_unit   = (params.get("to")   or params.get("to_unit")   or "sqm").lower()
+    conversions = {("sqft", "sqm"): 0.092903, ("sqm", "sqft"): 10.7639,
+                   ("sqft", "sqyard"): 0.111111, ("sqyard", "sqft"): 9.0,
+                   ("sqft", "acre"): 0.0000229568, ("acre", "sqft"): 43560.0,
+                   ("sqm", "sqyard"): 1.19599, ("sqyard", "sqm"): 0.836127,
+                   ("sqft", "bigha"): 0.0000826446, ("bigha", "sqft"): 12100.0}
     factor = conversions.get((from_unit, to_unit), 1.0)
-    return {"result": round(value * factor, 2), "from_unit": from_unit, "to_unit": to_unit, "value": value}
+    return {"result": round(value * factor, 4), "from_unit": from_unit, "to_unit": to_unit, "value": value}
+
+
+def _handle_get_floor_plans(params: dict) -> dict:
+    prop_id = params.get("property_id") or params.get("project_id") or _stable_id("fp")
+    return {
+        "floor_plans": [
+            {"type": "2BHK-A", "carpet_area": 900,  "url": f"https://img.housing.com/dev-mock/{prop_id}/fp1.jpg"},
+            {"type": "2BHK-B", "carpet_area": 950,  "url": f"https://img.housing.com/dev-mock/{prop_id}/fp2.jpg"},
+            {"type": "3BHK-A", "carpet_area": 1300, "url": f"https://img.housing.com/dev-mock/{prop_id}/fp3.jpg"},
+        ],
+        "total": 3,
+    }
+
+
+def _handle_get_trending_projects(params: dict) -> dict:
+    city = params.get("city", "Mumbai")
+    locs = _top_localities(city, 3)
+    return {
+        "projects": [
+            {
+                "project_id":   _stable_id(f"proj-{i}-{city}"),
+                "name":         f"{_BUILDERS[i % len(_BUILDERS)]} {locs[i % len(locs)]['name'].split()[0]} Signature",
+                "builder":      _BUILDERS[i % len(_BUILDERS)],
+                "locality":     {"name": locs[i % len(locs)]["name"], "city": city},
+                "price_range":  f"₹{locs[i % len(locs)]['avg_psf'] * 600 // 100000:.0f}L – ₹{locs[i % len(locs)]['avg_psf'] * 1800 // 10000000:.1f}Cr",
+                "launch_date":  "Jan 2024",
+                "bhk_range":    "1–3 BHK",
+            }
+            for i in range(4)
+        ],
+        "total": 4,
+    }
 
 
 def _handle_get_demand_supply(params: dict) -> dict:
-    return {"demand_supply_ratio": 1.35, "active_listings": 2400, "new_listings_last_30d": 180, "avg_days_on_market": 45}
+    return {"demand_supply_ratio": 1.35, "buyer_interest": "high", "active_listings": 2400,
+            "new_listings_last_30d": 180, "avg_days_on_market": 45,
+            "demand_percentages": {"buy": 65, "rent": 35}, "supply": {"total_units": 2400}}
 
 
 def _handle_get_travel_time(params: dict) -> dict:
@@ -477,6 +539,22 @@ def _handle_get_transaction_history(params: dict) -> dict:
 # Dispatch table
 # ---------------------------------------------------------------------------
 
+def _handle_get_price_buckets(params: dict) -> dict:
+    city = params.get("city", "Mumbai")
+    locs = _top_localities(city, 1)
+    base_psf = locs[0]["avg_psf"] if locs else 20000
+    area = 900
+    return {
+        "price_buckets": [
+            {"range_label": f"Under ₹{base_psf * area * 0.6 // 100000:.0f}L",   "min": 0,                      "max": int(base_psf * area * 0.6),   "count": 120},
+            {"range_label": f"₹{base_psf * area * 0.6 // 100000:.0f}L–₹{base_psf * area // 100000:.0f}L", "min": int(base_psf * area * 0.6), "max": int(base_psf * area), "count": 340},
+            {"range_label": f"Above ₹{base_psf * area // 100000:.0f}L",          "min": int(base_psf * area),   "max": None,                         "count": 210},
+        ],
+        "p90_price": int(base_psf * area * 1.3),
+        "city": city,
+    }
+
+
 _HANDLERS: dict[str, Any] = {
     "searchProperties":         _handle_search_properties,
     "getPropertyDetail":        _handle_get_property_detail,
@@ -485,18 +563,22 @@ _HANDLERS: dict[str, Any] = {
     "getTrendingLocalities":    _handle_get_trending_localities,
     "getPriceTrends":           _handle_get_price_trends,
     "getProjectDetail":         _handle_get_project_detail,
-    "getProjectPriceTrends":    _handle_get_price_trends,     # same shape
+    "getProjectPriceTrends":    _handle_get_price_trends,
     "getSimilarProperties":     _handle_get_similar_properties,
+    "getFloorPlans":            _handle_get_floor_plans,
     "getBrochure":              _handle_get_brochure,
     "getNearbyLandmarks":       _handle_get_nearby_landmarks,
     "getRatingsReviews":        _handle_get_ratings_reviews,
     "getSavedProperties":       _handle_get_saved_properties,
-    "getViewedProperties":      _handle_get_saved_properties,  # same shape
+    "getViewedProperties":      _handle_get_saved_properties,
+    "getRecentlyViewed":        _handle_get_saved_properties,
     "getRecommendations":       _handle_get_recommendations,
+    "getTrendingProjects":      _handle_get_trending_projects,
     "calculateEMI":             _handle_calculate_emi,
     "calculateAffordability":   _handle_calculate_affordability,
     "convertUnit":              _handle_convert_unit,
     "getDemandSupplyInsight":   _handle_get_demand_supply,
+    "getPriceBuckets":          _handle_get_price_buckets,
     "getTravelTime":            _handle_get_travel_time,
     "getTransactionHistory":    _handle_get_transaction_history,
 }
