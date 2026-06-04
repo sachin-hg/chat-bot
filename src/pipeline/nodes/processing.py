@@ -140,7 +140,7 @@ def apply_filter_delta(session: dict, filter_delta: dict) -> dict:
 # Node: filter_apply_node  (CHAT-P-008)
 # ---------------------------------------------------------------------------
 
-async def filter_apply_node(state: BotState) -> dict:
+async def filter_apply_node(state: BotState, emit_sse=None) -> dict:
     """Merge SLM filter_delta into session.active_filters.
 
     Reads filter_delta from state['classification']['filter_delta'].
@@ -156,6 +156,7 @@ async def filter_apply_node(state: BotState) -> dict:
     session = dict(state["session"])
 
     if filter_delta and not clarification_needed:
+        filters_before = dict(session.get("active_filters") or {})
         # Parse tagged amount strings before writing to session.
         filter_delta = dict(filter_delta)
         for key in ("price_min", "price_max", "price_per_sqft"):
@@ -169,6 +170,14 @@ async def filter_apply_node(state: BotState) -> dict:
             keys=list(filter_delta.keys()),
             request_id=state.get("request_id"),
         )
+        if emit_sse:
+            emit_sse("pipeline_step", {
+                "step":           "filters",
+                "before":         filters_before,
+                "delta":          filter_delta,
+                "after":          dict(session.get("active_filters") or {}),
+                "pivot":          c.get("pivot", False),
+            })
         return {"session": session, "filter_delta_applied": True}
 
     return {}
@@ -530,7 +539,7 @@ async def execute_tier2_action(state: BotState, executor=None) -> dict:
 # Node: route_node  (CHAT-P-012)
 # ---------------------------------------------------------------------------
 
-async def route_node(state: BotState, executor=None) -> dict:
+async def route_node(state: BotState, executor=None, emit_sse=None) -> dict:
     """Route the classified intent to the appropriate tier action.
 
     Tier 0 — out-of-scope canned response.
@@ -551,9 +560,22 @@ async def route_node(state: BotState, executor=None) -> dict:
     record      = get_intent_record(main_intent, sub_intent)  # guaranteed by validate_slm_node
 
     if record.requires_auth and not state['session'].get('auth_token'):
+        if emit_sse:
+            emit_sse("pipeline_step", {"step": "routing", "tier": "auth_required",
+                                       "main_intent": main_intent, "sub_intent": sub_intent})
         return {'bot_response': build_login_template_response(main_intent, sub_intent)}
 
     routing = {'tier': record.tier, 'model': record.model}
+
+    if emit_sse:
+        emit_sse("pipeline_step", {
+            "step":         "routing",
+            "tier":         str(record.tier),
+            "model":        record.model,
+            "main_intent":  main_intent,
+            "sub_intent":   sub_intent,
+            "requires_auth": record.requires_auth,
+        })
 
     if routing['tier'] == 0:
         return {'routing': routing, 'bot_response': build_out_of_scope_response(c)}

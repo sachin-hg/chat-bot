@@ -162,16 +162,58 @@ async def _build_tool_params(req, state: BotState) -> dict:
     return {}
 
 
-async def _execute_prefetch_stub(req, state: BotState, executor) -> tuple:
+async def _execute_prefetch_stub(req, state: BotState, executor, emit_sse=None) -> tuple:
+    import time as _time
     key = req.fetch_key or req.tool
     if executor is not None:
         from src.tools.executor import get_tool_cache_ttl
         ttl = get_tool_cache_ttl(req.tool)
         params = await _build_tool_params(req, state)
+        t0 = _time.monotonic()
         data = await executor.execute(req.tool, params, ttl)
+        latency_ms = int((_time.monotonic() - t0) * 1000)
+        if emit_sse:
+            # Build a compact result summary for the debug panel
+            summary = _tool_result_summary(req.tool, data)
+            emit_sse("pipeline_step", {
+                "step":       "tool_call",
+                "tool":       req.tool,
+                "params":     {k: v for k, v in params.items() if k not in ("auth_token",)},
+                "result_summary": summary,
+                "latency_ms": latency_ms,
+                "fetch_key":  key if key != req.tool else None,
+            })
         return key, data
     log.info('prefetch_stub_no_executor', tool=req.tool, key=key)
     return key, {}
+
+
+def _tool_result_summary(tool: str, data: dict) -> str:
+    """Compact one-line summary of a tool result for the debug panel."""
+    if not data:
+        return "empty"
+    if tool in ("searchProperties", "getSimilarProperties"):
+        hits = len(data.get("hits") or data.get("properties") or [])
+        total = data.get("total_count") or data.get("total") or hits
+        return f"{total} results ({hits} returned)"
+    if tool == "resolveEntity":
+        name = data.get("display_name") or ""
+        conf = data.get("confidence", 0)
+        return f"{name} (conf={conf:.2f})" if name else f"confidence={conf:.2f}"
+    if tool in ("getLocalityDetail",):
+        return data.get("display_name") or data.get("name") or "ok"
+    if tool == "getTrendingLocalities":
+        n = len(data.get("localities") or [])
+        return f"{n} localities"
+    if tool in ("getPriceTrends", "getProjectPriceTrends"):
+        return f"yoy={data.get('yoy_change_pct', '')}%"
+    if tool == "calculateEMI":
+        emi = data.get("monthly_emi", "")
+        return f"₹{emi:,}/month" if isinstance(emi, int) else str(emi)
+    if tool == "calculateAffordability":
+        budget = data.get("affordable_property_price") or data.get("recommended_budget", "")
+        return f"budget ₹{budget//100000:.0f}L" if isinstance(budget, (int, float)) else str(budget)
+    return f"{len(data)} keys"
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +221,7 @@ async def _execute_prefetch_stub(req, state: BotState, executor) -> tuple:
 # ---------------------------------------------------------------------------
 
 
-async def fetch_data_node(state: BotState, executor) -> dict:
+async def fetch_data_node(state: BotState, executor, emit_sse=None) -> dict:
     """Pre-fetch all tool data in parallel groups before the LLM call.
 
     Reads the data_requirements for the current intent from the intent registry,
@@ -209,7 +251,7 @@ async def fetch_data_node(state: BotState, executor) -> dict:
     for group_num in sorted(groups):
         group = groups[group_num]
         results = await asyncio.gather(
-            *[_execute_prefetch_stub(req, state, executor) for req in group],
+            *[_execute_prefetch_stub(req, state, executor, emit_sse=emit_sse) for req in group],
             return_exceptions=True,
         )
         for req, result in zip(group, results):
@@ -661,6 +703,14 @@ async def llm_node(state: BotState, llm: LLMPort, emit_sse: Callable, executor=N
     text_message_id = str(uuid.uuid4())
     source_msg_id   = state.get('request_id', '')
     seq             = (1 if state.get('summary_emitted') else 0) + (state.get('template_count') or 0)
+
+    if emit_sse:
+        emit_sse("pipeline_step", {
+            "step":   "llm_start",
+            "model":  model_id,
+            "intent": f"{state.get('classification', {}).get('main_intent','')}/{state.get('classification', {}).get('sub_intent','')}",
+            "tools_available": len(state.get('tool_definitions') or []),
+        })
     chunk_index     = 0
 
     def on_chunk(chunk: str):

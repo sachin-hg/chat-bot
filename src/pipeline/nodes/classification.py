@@ -254,7 +254,7 @@ async def normalize_node(state: BotState) -> dict:
 # Node 3a: route_domain_node
 # ---------------------------------------------------------------------------
 
-async def route_domain_node(state: BotState, router: object) -> dict:
+async def route_domain_node(state: BotState, router: object, emit_sse=None) -> dict:
     """Stage 1 domain router.
 
     Calls router.route() (DomainRouterPort) with normalized message + session context.
@@ -263,7 +263,9 @@ async def route_domain_node(state: BotState, router: object) -> dict:
     Input:  state['normalized_message'], state['session']
     Output: state['domain']
     """
+    import time as _time
     session: dict = state.get("session") or {}
+    t0 = _time.monotonic()
 
     try:
         result: dict = await router.route({   # type: ignore[attr-defined]
@@ -274,6 +276,9 @@ async def route_domain_node(state: BotState, router: object) -> dict:
     except asyncio.TimeoutError:
         log.warn("domain_router_timeout", session_id=session.get("session_id"))
         fallback_domain: str = session.get("last_domain") or "out_of_scope"
+        if emit_sse:
+            emit_sse("pipeline_step", {"step": "domain_router", "domain": fallback_domain,
+                                       "confidence": 0.0, "latency_ms": int((_time.monotonic()-t0)*1000), "timeout": True})
         return {
             "domain": fallback_domain,
             "classification": {"timeout_fallback": True, "confidence": 0.0},
@@ -281,8 +286,9 @@ async def route_domain_node(state: BotState, router: object) -> dict:
 
     domain: str = result.get("domain", "out_of_scope")
     confidence: float = result.get("confidence", 0.0)
+    latency_ms = int((_time.monotonic() - t0) * 1000)
 
-    # Low-confidence domain routing → treat as out_of_scope; clarify via nested_qna.
+    coerced = False
     if confidence < 0.65 and domain != "out_of_scope":
         log.info(
             "route_domain_low_confidence",
@@ -292,6 +298,17 @@ async def route_domain_node(state: BotState, router: object) -> dict:
             request_id=state.get("request_id"),
         )
         domain = "out_of_scope"
+        coerced = True
+
+    if emit_sse:
+        emit_sse("pipeline_step", {
+            "step":       "domain_router",
+            "domain":     domain,
+            "confidence": round(confidence, 3),
+            "latency_ms": latency_ms,
+            "coerced":    coerced,
+            "prev_domain": session.get("last_domain"),
+        })
 
     return {"domain": domain}
 
@@ -300,7 +317,7 @@ async def route_domain_node(state: BotState, router: object) -> dict:
 # Node 3b: classify_node
 # ---------------------------------------------------------------------------
 
-async def classify_node(state: BotState, classifier: object) -> dict:
+async def classify_node(state: BotState, classifier: object, emit_sse=None) -> dict:
     """Stage 2 domain-scoped intent classifier.
 
     If domain == 'out_of_scope': returns a canned classification immediately —
@@ -312,23 +329,28 @@ async def classify_node(state: BotState, classifier: object) -> dict:
     Input:  state['normalized_message'], state['domain'], state['session']
     Output: state['classification'] (SLMOutput dict)
     """
+    import time as _time
     domain: str = state.get("domain") or "out_of_scope"
     session: dict = state.get("session") or {}
+    t0 = _time.monotonic()
 
     # out_of_scope fast path — no Stage 2 SLM call
     if domain == "out_of_scope":
-        return {
-            "classification": {
-                "main_intent":          "out_of_scope",
-                "sub_intent":           "out_of_scope_query",
-                "entities_mentioned":   [],
-                "multi_intent":         False,
-                "pivot":                False,
-                "filter_delta":         {},
-                "clarification_needed": None,
-                "reasoning":            "domain_router: out_of_scope",
-            }
+        canned = {
+            "main_intent":          "out_of_scope",
+            "sub_intent":           "out_of_scope_query",
+            "entities_mentioned":   [],
+            "multi_intent":         False,
+            "pivot":                False,
+            "filter_delta":         {},
+            "clarification_needed": None,
+            "reasoning":            "domain_router: out_of_scope",
         }
+        if emit_sse:
+            emit_sse("pipeline_step", {"step": "classifier", "domain": domain,
+                                       "main_intent": "out_of_scope", "sub_intent": "out_of_scope_query",
+                                       "latency_ms": 0, "fast_path": True})
+        return {"classification": canned}
 
     taxonomy_prompt: str = DOMAIN_TAXONOMY_PROMPTS.get(domain, "")
     classification: dict = await classifier.classify({   # type: ignore[attr-defined]
@@ -339,6 +361,22 @@ async def classify_node(state: BotState, classifier: object) -> dict:
         "previous_intent": session.get("last_intent"),
         "active_filters":  _compact_filters(session.get("active_filters") or {}),
     })
+    latency_ms = int((_time.monotonic() - t0) * 1000)
+
+    if emit_sse:
+        emit_sse("pipeline_step", {
+            "step":                 "classifier",
+            "domain":               domain,
+            "main_intent":          classification.get("main_intent"),
+            "sub_intent":           classification.get("sub_intent"),
+            "filter_delta":         classification.get("filter_delta") or {},
+            "entities_mentioned":   classification.get("entities_mentioned") or [],
+            "pivot":                classification.get("pivot", False),
+            "clarification_needed": classification.get("clarification_needed"),
+            "reasoning":            classification.get("reasoning", ""),
+            "latency_ms":           latency_ms,
+        })
+
     return {"classification": classification}
 
 
