@@ -97,6 +97,9 @@ async def summary_node(state: BotState, emit_sse: Callable) -> dict:
     """
     routing = state.get('routing') or {}
     if routing.get('tier') not in ('3a', '3b'):
+        if emit_sse:
+            emit_sse('pipeline_step', {'step': 'node_result', 'node': 'summary',
+                                       'status': 'skipped', 'reason': f"tier={routing.get('tier')} (only 3a/3b)"})
         return {}
 
     c = state.get('classification') or {}
@@ -104,6 +107,10 @@ async def summary_node(state: BotState, emit_sse: Callable) -> dict:
 
     builder = SUMMARY_BUILDERS.get(intent_key)
     if not builder:
+        if emit_sse:
+            emit_sse('pipeline_step', {'step': 'node_result', 'node': 'summary',
+                                       'status': 'skipped', 'reason': 'no summary builder for this intent',
+                                       'intent': f"{intent_key[0]}/{intent_key[1]}"})
         return {}
 
     # Eagerness guard — skip summary when any entity confidence is too low
@@ -148,7 +155,9 @@ async def summary_node(state: BotState, emit_sse: Callable) -> dict:
         content              = MessageContent(text=summary_text),
     )
     emit_sse('chat_event', summary_event.model_dump(by_alias=True))
-
+    emit_sse('pipeline_step', {'step': 'node_result', 'node': 'summary',
+                               'status': 'emitted', 'text': summary_text,
+                               'intent': f"{intent_key[0]}/{intent_key[1]}"})
     return {'summary_emitted': True}
 
 
@@ -1081,6 +1090,9 @@ async def respond_node(state: BotState, emit_sse: Callable) -> dict:
     )
 
     if not template_events:
+        emit_sse('pipeline_step', {'step': 'node_result', 'node': 'respond',
+                                   'status': 'no_templates', 'intent': f"{c.get('main_intent')}/{c.get('sub_intent')}",
+                                   'reason': 'no TEMPLATE_BUILDER registered for this intent'})
         return {'template_count': 0}
 
     for event in template_events:
@@ -1088,6 +1100,10 @@ async def respond_node(state: BotState, emit_sse: Callable) -> dict:
         emit_sse('chat_event', event.model_dump(by_alias=True))
 
     await persist_to_kafka(conversation_id, [e.model_dump(by_alias=True) for e in template_events])
+    tpl_ids = [e.content.template_id for e in template_events if e.content.template_id]
+    emit_sse('pipeline_step', {'step': 'node_result', 'node': 'respond',
+                               'status': 'templates_emitted', 'count': len(template_events),
+                               'template_ids': tpl_ids, 'intent': f"{c.get('main_intent')}/{c.get('sub_intent')}"})
 
     # Save carousel items to session for ordinal resolution in future turns
     # ("tell me about the second property" → look up session['carousel_state'])
@@ -1256,6 +1272,18 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
     saved = await update_session_state(session, c, state.get('tool_results') or [])
     if not saved:
         await reconcile_session_conflict(session, bot_response)
+
+    emit_sse('pipeline_step', {'step': 'node_result', 'node': 'followup',
+                               'status': 'completed',
+                               'text_len': len(validated_text),
+                               'has_text': bool(validated_text),
+                               'turn_count': session['turn_count'],
+                               'session_saved': saved,
+                               'active_filters': dict(session.get('active_filters') or {}),
+                               'last_intent': session.get('last_intent'),
+                               'carousel_type': (session.get('carousel_state') or {}).get('type'),
+                               'carousel_items': len((session.get('carousel_state') or {}).get('items') or []),
+                               })
 
     # Trigger async conversation summarization every 20 turns (fire-and-forget)
     if session['turn_count'] >= 20 and session['turn_count'] % 20 == 0:

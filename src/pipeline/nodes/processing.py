@@ -883,10 +883,17 @@ async def derive_node(state: BotState, emit_sse=None) -> dict:
         filters["localities"] = upgraded
 
     session["active_filters"] = filters
-    if emit_sse and derived:
-        emit_sse("pipeline_step", {"step": "node_result", "node": "derive",
-                                   "status": "derived", "derived_filters": derived,
-                                   "active_filters": filters})
+    if emit_sse:
+        emit_sse("pipeline_step", {
+            "step": "node_result", "node": "derive",
+            "status": "derived" if derived else "no_derivations",
+            "derived_filters": derived or {},
+            "active_filters": filters,
+            "operations_run": [
+                k for k in ["price_per_sqft→price_range", "search_anchor→lat_lng", "entity_uuids→localities"]
+                if k.split("→")[0].replace("_", " ").split()[0] in str(filters) or k == "entity_uuids→localities"
+            ]
+        })
     return {"session": session, "derived_filters": derived}
 
 
@@ -968,10 +975,21 @@ async def clarify_node(state: BotState, emit_sse=None) -> dict:
         except Exception as exc:
             log.warn("clarify_session_persist_failed", error=str(exc))
 
+        emit_sse('pipeline_step', {'step': 'node_result', 'node': 'clarify',
+                                   'status': 'clarification_emitted',
+                                   'question': c["clarification_needed"],
+                                   'main_intent': c.get('main_intent'),
+                                   'sub_intent': c.get('sub_intent'),
+                                   'has_options': bool(clarification_data.get('options'))})
         return {
             "bot_response": bot_response,
             "clarification_emitted": True,
         }
+
+    # clarification not needed — node was a no-op
+    if emit_sse:
+        emit_sse('pipeline_step', {'step': 'node_result', 'node': 'clarify',
+                                   'status': 'no_clarification_needed'})
 
 
 # ---------------------------------------------------------------------------
