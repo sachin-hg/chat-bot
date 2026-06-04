@@ -18,6 +18,16 @@ log = get_logger(__name__)
 _PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "slm" / "domain_router.md"
 _SYSTEM_PROMPT: str = _PROMPT_PATH.read_text(encoding="utf-8")
 
+def _strip_code_fence(text: str) -> str:
+    """Strip markdown code fences the model sometimes adds despite instructions."""
+    if not text.startswith("```"):
+        return text
+    lines = text.split("\n")
+    start = 1  # skip ```json or ``` line
+    end = len(lines) - 1 if lines[-1].strip() == "```" else len(lines)
+    return "\n".join(lines[start:end]).strip()
+
+
 # Shared client — single connection pool across all calls.
 _client: Optional[anthropic.AsyncAnthropic] = None
 
@@ -60,7 +70,7 @@ class AnthropicDomainRouter:
             try:
                 result = await asyncio.wait_for(
                     self._call_api(user_content),
-                    timeout=0.5,
+                    timeout=2.0,
                 )
                 latency_ms = int((time.monotonic() - t0) * 1000)
                 log.info(
@@ -122,11 +132,12 @@ class AnthropicDomainRouter:
         client = _get_client()
         response = await client.messages.create(
             model=self._model_id,
-            max_tokens=25,
+            max_tokens=40,
             system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_content}],
         )
         raw = response.content[0].text.strip()
+        raw = _strip_code_fence(raw)
         parsed = json.loads(raw)
         domain = str(parsed.get("domain", "out_of_scope"))
         confidence = float(parsed.get("confidence", 0.0))

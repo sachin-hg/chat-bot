@@ -104,7 +104,7 @@ def build_graph(
     graph.add_node('fetch_data',       _no_op_safe(partial(fetch_data_node,     executor=executor)))
     graph.add_node('respond',          partial(respond_node,        emit_sse=emit_sse))
     graph.add_node('build_prompt',     partial(build_prompt_node,   composer=composer))
-    graph.add_node('llm',              partial(llm_node,            llm=llm, emit_sse=emit_sse))
+    graph.add_node('llm',              partial(llm_node,            llm=llm, emit_sse=emit_sse, executor=executor))
     graph.add_node('validate_output',  validate_output_node)
     graph.add_node('followup',         partial(followup_node,       emit_sse=emit_sse))
 

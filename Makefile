@@ -34,7 +34,7 @@ logs:
 
 # ── Database ──────────────────────────────────────────────────────────────
 migrate:
-	alembic upgrade head
+	.venv/bin/python -m alembic upgrade head
 
 # Seeds 1 conversation + 5 messages for local dev/testing
 seed:

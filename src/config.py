@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     user_activity_base_url: str = ""
 
     # Application
-    bot_env:    Literal["mock", "local", "staging", "production"] = "local"
+    bot_env:    Literal["mock", "dev", "local", "staging", "production"] = "dev"
     log_level:  str              = "INFO"
     secret_key: Optional[SecretStr] = None          # required in local/staging/prod
 

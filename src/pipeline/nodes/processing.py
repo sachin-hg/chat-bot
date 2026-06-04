@@ -639,4 +639,28 @@ async def clarify_node(state: BotState) -> dict:
             },
             "clarification_emitted": True,
         }
+
+
+# ---------------------------------------------------------------------------
+# translate_to_wire_format — apply TOOL_REGISTRY wire_param renames
+# ---------------------------------------------------------------------------
+
+def translate_to_wire_format(tool: str, params: dict, session: dict) -> dict:
+    """Apply wire_param renames from TOOL_REGISTRY so LLM tool-call params
+    match what the HTTP executor expects on the wire.
+
+    Example: TOOL_REGISTRY says ToolParam(key='bhk', wire_param='bedrooms')
+    → {'bhk': [2]} becomes {'bedrooms': [2]}
+
+    Params that have no wire_param are left as-is.
+    """
+    from src.registries.tool_registry import get_tool
+    record = get_tool(tool)
+    if not record:
+        return dict(params)
+    result = dict(params)
+    for p in record.input_params:
+        if p.wire_param and p.key in result:
+            result[p.wire_param] = result.pop(p.key)
+    return result
     return {}

@@ -148,13 +148,27 @@ async def summary_node(state: BotState, emit_sse: Callable) -> dict:
 # ---------------------------------------------------------------------------
 
 
+async def _build_tool_params(req, state: BotState) -> dict:
+    """Build tool call params from BotState based on DataRequirement.params_source."""
+    source = getattr(req, 'params_source', 'session')
+    if source == 'session':
+        return dict(state['session'].get('active_filters') or {})
+    elif source == 'entity_resolution':
+        entities = list((state.get('resolved_entities') or {}).values())
+        idx = req.entity_index or 0
+        return entities[idx] if idx < len(entities) else {}
+    elif source == 'filter_delta':
+        return dict((state.get('classification') or {}).get('filter_delta') or {})
+    return {}
+
+
 async def _execute_prefetch_stub(req, state: BotState, executor) -> tuple:
     key = req.fetch_key or req.tool
     if executor is not None:
-        # Real executor available (Sprint 2+): use it
         from src.tools.executor import get_tool_cache_ttl
         ttl = get_tool_cache_ttl(req.tool)
-        data = await executor.execute(req.tool, {}, ttl)
+        params = await _build_tool_params(req, state)
+        data = await executor.execute(req.tool, params, ttl)
         return key, data
     log.info('prefetch_stub_no_executor', tool=req.tool, key=key)
     return key, {}
@@ -316,17 +330,57 @@ FOLLOWUP_PROMPT_BLOCKS: dict[tuple[str, str], str] = {
 
 
 def get_residual_tools(main_intent: str, sub_intent: str) -> list:
-    """Returns tool names the LLM can call on-demand (getNearbyLandmarks, etc.).
-    Sprint 1 stub — returns empty list (no residual tools until Sprint 2).
-    # TODO CHAT-P-016: populate from TOOL_REGISTRY.llm_visible field."""
-    return []
+    """Returns tool names the LLM can call on-demand for this intent.
+
+    Combines:
+      1. Intent-specific residual_tools from INTENT_REGISTRY.
+      2. Tier B tools (tier_b=True, llm_visible=True) — pure-computation tools
+         always available to every Tier 3 call except calculator intents.
+    """
+    from src.registries.intent_registry import get_intent_record
+    from src.registries.tool_registry import TOOL_REGISTRY
+    record = get_intent_record(main_intent, sub_intent)
+    names: list[str] = list(record.residual_tools) if record else []
+    calculator_sub_intents = {'calculate_emi', 'calculate_affordability', 'convert_unit'}
+    if sub_intent not in calculator_sub_intents:
+        tier_b = [t.name for t in TOOL_REGISTRY if t.tier_b and t.llm_visible]
+        for name in tier_b:
+            if name not in names:
+                names.append(name)
+    return names
 
 
 def build_all_llm_tools(tool_names: list, main_intent: str) -> list:
-    """Builds Anthropic tool_definitions list for LLM.
-    Sprint 1 stub — returns [].
-    # TODO CHAT-P-014b: build from TOOL_REGISTRY records."""
-    return []
+    """Build Anthropic tool_definitions list from TOOL_REGISTRY for the given tool names.
+
+    Only includes tools with llm_visible=True. Wire-only params (wire_param set)
+    are excluded from the schema — the LLM never sees internal API param names.
+    """
+    from src.registries.tool_registry import get_tool
+    tools = []
+    for name in tool_names:
+        rec = get_tool(name)
+        if not rec or not rec.llm_visible:
+            continue
+        llm_params = [p for p in rec.input_params if not p.wire_param]
+        properties = {}
+        for p in llm_params:
+            schema: dict = {'type': p.type, 'description': p.description}
+            if p.enum:
+                schema['enum'] = p.enum
+            if p.items:
+                schema['items'] = p.items
+            properties[p.key] = schema
+        tools.append({
+            'name': rec.name,
+            'description': rec.description,
+            'input_schema': {
+                'type': 'object',
+                'properties': properties,
+                'required': [p.key for p in llm_params if p.required],
+            },
+        })
+    return tools
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +530,7 @@ async def stream_llm(llm: LLMPort, model: str, system: str, messages: list,
 # ---------------------------------------------------------------------------
 
 
-async def llm_node(state: BotState, llm: LLMPort, emit_sse: Callable) -> dict:
+async def llm_node(state: BotState, llm: LLMPort, emit_sse: Callable, executor=None) -> dict:
     """Stream an LLM response, handling tool calls and emitting SSE message_delta events.
 
     Input:  state['routing'], state['session'], state['system_prompt'],
@@ -521,9 +575,17 @@ async def llm_node(state: BotState, llm: LLMPort, emit_sse: Callable) -> dict:
         if not validation['valid']:
             return build_missing_param_error(validation)
         from src.pipeline.nodes.processing import translate_to_wire_format
-        wired     = translate_to_wire_format(tool, params, state['session'])
-        timeout_s = 2.0
-        return await asyncio.wait_for(execute_tool_with_cache(tool, wired), timeout=timeout_s)
+        wired = translate_to_wire_format(tool, params, state['session'])
+        if executor is not None:
+            from src.tools.executor import get_tool_cache_ttl
+            ttl = get_tool_cache_ttl(tool)
+            try:
+                return await asyncio.wait_for(executor.execute(tool, wired, ttl), timeout=2.0)
+            except asyncio.TimeoutError:
+                log.warning('llm_tool_call_timeout', tool=tool)
+                return {}
+        log.info('llm_tool_call_no_executor', tool=tool)
+        return {}
 
     llm_response = await stream_llm(
         llm=llm,

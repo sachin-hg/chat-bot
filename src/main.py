@@ -17,6 +17,21 @@ from src.session.redis import close_redis, get_redis, init_redis
 log = get_logger(__name__)
 
 
+def _configure_anthropic(settings) -> None:
+    """Export ANTHROPIC_API_KEY to os.environ so the Anthropic SDK can find it.
+
+    pydantic_settings reads .env into the Settings object but does NOT set
+    os.environ, and anthropic.AsyncAnthropic() reads from os.environ by default.
+    """
+    import os
+    from pydantic import SecretStr
+    api_key = settings.anthropic_api_key
+    if api_key:
+        key_str = api_key.get_secret_value() if isinstance(api_key, SecretStr) else str(api_key)
+        if key_str:
+            os.environ.setdefault("ANTHROPIC_API_KEY", key_str)
+
+
 def _configure_langsmith(settings) -> None:
     """Export LangSmith env vars so LangGraph picks them up automatically."""
     import os
@@ -39,6 +54,7 @@ def _configure_langsmith(settings) -> None:
 async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
+    _configure_anthropic(settings)
     _configure_langsmith(settings)
     log.info("startup", bot_env=settings.bot_env)
 

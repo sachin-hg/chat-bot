@@ -1,4 +1,5 @@
 """Chat endpoints — CHAT-A-007 (get-conversation-id), CHAT-A-006 (SSE streaming), CHAT-A-024 (send-message), CHAT-A-018 (migrate-chat)."""
+import asyncio
 import uuid
 from datetime import datetime
 from typing import AsyncGenerator
@@ -14,14 +15,61 @@ from src.api.models import (
 )
 from src.api.sse import sse_frame
 from src.config import Settings, get_settings
+from src.observability.logging import get_logger
 from src.pipeline.graph import build_graph
 from src.pipeline.state import make_base_state
 from src.session.redis import get_redis
+
+log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/chat")
 
 # Redis key TTL for conversation IDs: 365 days
 CONVERSATION_TTL = 365 * 24 * 3600
+
+
+# ---------------------------------------------------------------------------
+# Adapter factory — selects SLM/LLM/executor based on bot_env
+# ---------------------------------------------------------------------------
+
+def _build_adapters(settings: Settings, redis):
+    """Return (router_adapter, classifier_adapter, llm_adapter, executor) for the current bot_env."""
+    from src.adapters.domain_router import AnthropicDomainRouter
+    from src.adapters.classifier import AnthropicClassifier
+    from src.adapters.llm import AnthropicLLM
+
+    if settings.bot_env == "mock":
+        from unittest.mock import MagicMock, AsyncMock
+        router_adapter = MagicMock()
+        router_adapter.route = AsyncMock(return_value={"domain": "property_search", "confidence": 0.95})
+        classifier_adapter = MagicMock()
+        classifier_adapter.classify = AsyncMock(return_value={
+            "main_intent": "property_search",
+            "sub_intent": "filter_search",
+            "filter_delta": {},
+            "entities_mentioned": [],
+            "clarification_needed": None,
+            "pivot": False,
+            "multi_intent": False,
+        })
+        llm_adapter = MagicMock()
+        async def _mock_stream(**kw):
+            if kw.get("on_chunk"):
+                kw["on_chunk"]("I can help you find properties. What are you looking for?")
+            return {
+                "response": {"text": "I can help you find properties. What are you looking for?"},
+                "tool_results": [],
+            }
+        llm_adapter.stream = _mock_stream
+        return router_adapter, classifier_adapter, llm_adapter, None
+
+    if settings.bot_env == "dev":
+        from src.tools.dev_executor import DevExecutor
+        return AnthropicDomainRouter(), AnthropicClassifier(), AnthropicLLM(), DevExecutor()
+
+    # local / staging / production — real Anthropic + real HTTP executor (VPN required)
+    from src.tools.executor import HttpToolExecutor
+    return AnthropicDomainRouter(), AnthropicClassifier(), AnthropicLLM(), HttpToolExecutor(redis_pool=redis)
 
 
 # ---------------------------------------------------------------------------
@@ -165,37 +213,41 @@ async def send_message_streamed(
     body: ChatEventFromUser,
     request: Request,
     streaming_enabled: bool = Query(False, alias="streamingEnabled"),
+    settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
     """
-    Primary chat endpoint.  Returns a Server-Sent Events stream.
+    Primary chat endpoint. Returns a Server-Sent Events stream.
 
-    Phase 1 — immediate: emit connection_ack.
-    Phase 2 — pipeline (stubbed for Sprint 1): emit a canned chat_event.
-    Phase 3 — close: emit connection_close.
+    Phase 1 — immediate: connection_ack.
+    Phase 2 — LangGraph pipeline runs; nodes emit SSE events via queue.
+    Phase 3 — connection_close.
+
+    Adapter selection is driven by BOT_ENV:
+      mock  — canned responses, no API calls
+      dev   — real Anthropic SLM/LLM + DevExecutor (contextual mock Housing data)
+      local — real Anthropic + real Housing APIs (VPN required)
     """
-    # 1. Validate session token (stub: just check non-empty)
+    # 1. Auth check — X-Session-Token must be present
     session_token: str | None = request.headers.get("X-Session-Token")
     if not session_token:
-        # Return a 401 SSE stream so the FE always gets a proper SSE response
         async def _unauth() -> AsyncGenerator[str, None]:
-            yield sse_frame(
-                "error",
-                {
-                    "code": "auth_expired",
-                    "message": "Missing session token.",
-                    "recoverable": False,
-                },
-            )
+            yield sse_frame("error", {"code": "auth_expired", "message": "Missing session token.", "recoverable": False})
         return StreamingResponse(content=_unauth(), media_type="text/event-stream", status_code=401)
 
-    # 2. Resolve request_id (set by request_id_middleware; fall back to new UUID)
+    # 2. LLM concurrency gate
+    gate = getattr(getattr(request.app, "state", None), "llm_gate", None)
+    if gate is not None:
+        allowed = await gate.acquire()
+        if not allowed:
+            async def _rate_limited() -> AsyncGenerator[str, None]:
+                yield sse_frame("error", {"code": "rate_limited", "message": "Too many concurrent requests.", "recoverable": True})
+            return StreamingResponse(content=_rate_limited(), media_type="text/event-stream", status_code=429)
+
+    # 3. Build request context
     ctx = structlog.contextvars.get_contextvars()
     request_id: str = ctx.get("request_id") or str(uuid.uuid4())
-
-    # 3. Extract conversation_id from body
     conversation_id: str = body.conversation_id
 
-    # 4. Extract raw_message
     if body.message_type == "text":
         raw_message = body.content.text or ""
     elif body.message_type == "user_action":
@@ -204,7 +256,6 @@ async def send_message_streamed(
     else:
         raw_message = body.content.text or ""
 
-    # 5. Build initial BotState (seed with gateway handoff context on Turn 1)
     handoff = body.handoff_context.model_dump(by_alias=False) if body.handoff_context else None
     state = make_base_state(
         raw_message=raw_message,
@@ -214,38 +265,54 @@ async def send_message_streamed(
     )
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        # Phase 1 — connection_ack
-        yield sse_frame(
-            "connection_ack",
-            {"messageId": request_id, "messageState": "IN_PROGRESS"},
+        # Phase 1 — immediate ack
+        yield sse_frame("connection_ack", {"messageId": request_id, "messageState": "IN_PROGRESS"})
+
+        # Build a queue so pipeline nodes can emit SSE events asynchronously
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def emit_sse(event: str, data: dict) -> None:
+            queue.put_nowait(sse_frame(event, data))
+
+        # Select adapters based on bot_env
+        router_adapter, classifier_adapter, llm_adapter, executor = _build_adapters(settings, get_redis())
+        graph = build_graph(
+            emit_sse=emit_sse,
+            executor=executor,
+            router=router_adapter,
+            classifier=classifier_adapter,
+            llm=llm_adapter,
         )
 
-        # Phase 2 — TODO: invoke LangGraph pipeline (Sprint 1 stub)
-        yield sse_frame(
-            "chat_event",
-            ChatEventToUser(
-                conversation_id=conversation_id,
-                message_id=str(uuid.uuid4()),
-                source_message_id=request_id,
-                message_type="text",
-                message_state="COMPLETED",
-                source_message_state="COMPLETED",
-                created_at=datetime.utcnow().isoformat() + "Z",
-                sequence_number=0,
-                sender={"type": "bot"},
-                content=MessageContent(
-                    text="Pipeline not yet wired — Sprint 1 stub response."
-                ),
-            ).model_dump(by_alias=True),
-        )
+        async def _run_pipeline() -> None:
+            try:
+                await graph.ainvoke(state)
+            except Exception as exc:
+                log.error("pipeline_error", error=str(exc), request_id=request_id)
+                emit_sse("error", {"code": "pipeline_error", "message": "An internal error occurred.", "recoverable": False})
+            finally:
+                queue.put_nowait(None)  # sentinel — signals generator to stop
 
-        # Phase 3 — connection_close
+        asyncio.create_task(_run_pipeline())
+
+        # Phase 2 — stream SSE frames from the pipeline as they arrive
+        try:
+            while True:
+                frame = await asyncio.wait_for(queue.get(), timeout=90.0)
+                if frame is None:
+                    break
+                yield frame
+        except asyncio.TimeoutError:
+            log.warning("pipeline_timeout", request_id=request_id)
+            yield sse_frame("error", {"code": "timeout", "message": "Response timed out.", "recoverable": False})
+        finally:
+            if gate is not None:
+                await gate.release()
+
+        # Phase 3 — close
         yield sse_frame("connection_close", {"reason": "response_complete"})
 
-    return StreamingResponse(
-        content=event_generator(),
-        media_type="text/event-stream",
-    )
+    return StreamingResponse(content=event_generator(), media_type="text/event-stream")
 
 
 # ---------------------------------------------------------------------------

@@ -133,12 +133,17 @@ def _is_gibberish(msg: str) -> bool:
 # Domain taxonomy prompt cache (loaded once at startup)
 # ---------------------------------------------------------------------------
 
+def _build_taxonomy_prompt(domain: str) -> str:
+    """Build the intent + filter taxonomy block injected into the Stage 2 classifier."""
+    from src.prompt.taxonomy import build_intent_taxonomy_block, build_filter_delta_block
+    intents = build_intent_taxonomy_block(domain)
+    filters = build_filter_delta_block(domain)
+    return f"AVAILABLE INTENTS:\n{intents}\nAVAILABLE FILTER KEYS:\n{filters}"
+
+
 DOMAIN_TAXONOMY_PROMPTS: dict = {
-    "property_search":  _load_template("prompts/slm/domains/property_search.md"),
-    "property_detail":  _load_template("prompts/slm/domains/property_detail.md"),
-    "locality":         _load_template("prompts/slm/domains/locality.md"),
-    "project_research": _load_template("prompts/slm/domains/project_research.md"),
-    "portfolio":        _load_template("prompts/slm/domains/portfolio.md"),
+    domain: _build_taxonomy_prompt(domain)
+    for domain in ["property_search", "property_detail", "locality", "project_research", "portfolio"]
 }
 # NOTE: 'comparison' is NOT a separate domain. compare_localities is handled within
 # the 'locality' domain prompt; compare_projects within 'project_research'.
@@ -403,6 +408,15 @@ async def validate_slm_node(state: BotState) -> dict:
             })
         }
 
+    # ── Normalise sub_intent: strip "main_intent/" prefix if model included it ──
+    # The taxonomy block shows intents as "main_intent/sub_intent" which the model
+    # sometimes copies verbatim into the sub_intent field.
+    c = dict(c)
+    mi = c["main_intent"]
+    si = c.get("sub_intent", "")
+    if si.startswith(f"{mi}/"):
+        c["sub_intent"] = si[len(mi) + 1:]
+
     # ── Check 3: intent pair in INTENT_REGISTRY ─────────────────────────
     if (
         not get_intent_record(c["main_intent"], c["sub_intent"])
@@ -424,8 +438,6 @@ async def validate_slm_node(state: BotState) -> dict:
         }
 
     # ── Type coercions ──────────────────────────────────────────────────
-    c = dict(c)
-
     # localities must be list[str] or None
     delta = dict(c.get("filter_delta") or {})
     if "localities" in delta and isinstance(delta["localities"], str):

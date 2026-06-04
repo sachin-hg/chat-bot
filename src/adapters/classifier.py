@@ -26,6 +26,16 @@ def _load_domain_prompt(domain: str) -> str:
     return _domain_prompt_cache[domain]
 
 
+def _strip_code_fence(text: str) -> str:
+    """Strip markdown code fences the model sometimes adds despite instructions."""
+    if not text.startswith("```"):
+        return text
+    lines = text.split("\n")
+    start = 1
+    end = len(lines) - 1 if lines[-1].strip() == "```" else len(lines)
+    return "\n".join(lines[start:end]).strip()
+
+
 # Shared client — single connection pool.
 _client: Optional[anthropic.AsyncAnthropic] = None
 
@@ -109,7 +119,7 @@ class AnthropicClassifier:
             try:
                 result = await asyncio.wait_for(
                     self._call_api(model_id, system_prompt, user_content),
-                    timeout=2.0,
+                    timeout=10.0,
                 )
                 latency_ms = int((time.monotonic() - t0) * 1000)
                 log.info(
@@ -183,11 +193,12 @@ class AnthropicClassifier:
         client = _get_client()
         response = await client.messages.create(
             model=model_id,
-            max_tokens=160,
+            max_tokens=400,
             system=system_prompt,
             messages=[{"role": "user", "content": user_content}],
         )
         raw = response.content[0].text.strip()
+        raw = _strip_code_fence(raw)
         return json.loads(raw)
 
     @staticmethod

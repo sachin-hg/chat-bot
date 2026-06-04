@@ -18,6 +18,9 @@ def get_engine() -> AsyncEngine:
             max_overflow=5,
             pool_pre_ping=True,
             echo=settings.log_level == "DEBUG",
+            # pgbouncer transaction-mode doesn't support prepared statements;
+            # statement_cache_size=0 forces asyncpg to use the simple query protocol.
+            connect_args={"statement_cache_size": 0},
         )
     return _engine
 
