@@ -370,8 +370,12 @@
             <div class="k">messages</div>     <div class="v dim" id="bp_msgs">—</div>
             <div class="k">is_followup</div>  <div class="v dim" id="bp_followup">—</div>
           </div>
-          <div class="sec-lbl">Available Tools (schemas)</div>
-          <div class="json-box" id="bp_tool_defs" style="font-size:9px;">—</div>
+          <details style="margin-top:6px;">
+            <summary class="sec-lbl" style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:4px;">
+              <span style="color:#555;font-size:9px;">▶</span> Available Tools (schemas)
+            </summary>
+            <div class="json-box" id="bp_tool_defs" style="font-size:9px;margin-top:4px;">—</div>
+          </details>
           <div class="sec-lbl">Full System Prompt</div>
           <div class="prompt-box prompt-collapsed" id="bp_prompt">—</div>
           <div class="expand-btn" onclick="expandPrompt('bp_prompt', this)">▼ show full prompt</div>
@@ -809,12 +813,16 @@ function handleStep(d) {
 
   else if (step === 'llm_start') {
     llmStartTime = Date.now();
-    const model = (d.model||'').replace('claude-','').replace('-20251001','').replace(/-4-5/,'4.5');
+    const model = (d.model||'').replace('claude-','').replace(/-20251001$/,'').replace(/-4-5$/,'4.5').replace(/-4-6$/,'4.6');
     setDot('dLLM', 'purple');
     setEl('bLLM', model);
     setEl('llm_model',  d.model||'—');
     setEl('llm_intent', d.intent||'—', 'dim');
-    setEl('llm_tools',  (d.tools_available||0) + ' tools', 'dim');
+    setEl('llm_tools',  (d.tools_available||0) + ' available', 'dim');
+    // Show "waiting for first token…" in flowchart until streaming starts
+    setNode('llm', 'active', null);
+    const msEl = document.getElementById('ndms_llm');
+    if (msEl) msEl.textContent = 'waiting…';
     document.getElementById('cLLM').classList.add('open');
   }
 
@@ -857,6 +865,12 @@ function handleSSE(type, data, bubble) {
       llmChunks++;
       setEl('llm_chunks', llmChunks, 'hi');
       setNode('llm', 'active', null);
+      // Live progress in the flowchart node: "streaming… 14 chunks · 3.2s"
+      if (llmStartTime) {
+        const elapsed = ((Date.now() - llmStartTime) / 1000).toFixed(1);
+        const msEl = document.getElementById('ndms_llm');
+        if (msEl) msEl.textContent = `${llmChunks} chunks · ${elapsed}s`;
+      }
       break;
 
     case 'chat_event': {

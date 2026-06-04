@@ -215,14 +215,27 @@ async def safety_node(state: BotState, emit_sse=None) -> dict:
         reason = safety_result.get("reason")
         log.warning("safety_blocked", reason=reason, request_id=state.get("request_id"))
         if emit_sse:
-            emit_sse("pipeline_step", {"step": "node_result", "node": "safety",
-                                       "status": "blocked", "reason": reason,
-                                       "message_len": len(raw_message)})
+            emit_sse("pipeline_step", {
+                "step": "node_result", "node": "safety", "status": "blocked",
+                "reason": reason,
+                "canned_response": _canned_safety_response(reason),
+                "message_preview": raw_message[:120],
+                "message_len": len(raw_message),
+                "checks": ["empty_check", "length_check", "prompt_injection", "profanity"],
+            })
         return {"safety_result": safety_result, "bot_response": _canned_safety_response(reason)}
 
     if emit_sse:
-        emit_sse("pipeline_step", {"step": "node_result", "node": "safety",
-                                   "status": "passed", "message_len": len(raw_message)})
+        emit_sse("pipeline_step", {
+            "step": "node_result", "node": "safety", "status": "passed",
+            "message_preview": raw_message[:120],
+            "message_len": len(raw_message),
+            "checks_run": [
+                "✓ not empty",
+                f"✓ length ok ({len(raw_message)} < {_MAX_MESSAGE_LENGTH})",
+                f"✓ {len(_BLOCKED_PATTERNS)} injection patterns — no match",
+            ],
+        })
     return {"safety_result": safety_result}
 
 
@@ -246,14 +259,26 @@ async def normalize_node(state: BotState, emit_sse=None) -> dict:
     if _is_gibberish(normalized):
         log.info("normalize_gibberish", message_len=len(normalized), request_id=state.get("request_id"))
         if emit_sse:
-            emit_sse("pipeline_step", {"step": "node_result", "node": "normalize",
-                                       "status": "gibberish", "raw": raw_message[:100]})
+            emit_sse("pipeline_step", {
+                "step": "node_result", "node": "normalize", "status": "gibberish",
+                "raw_message": raw_message[:120],
+                "normalized": normalized[:120],
+                "reason": "single-word with consonant overload / repeated chars / vowel starvation",
+            })
         return {"normalized_message": normalized,
                 "bot_response": "I didn't catch that — could you describe what you're looking for?"}
 
-    if emit_sse and raw_message != normalized:
-        emit_sse("pipeline_step", {"step": "node_result", "node": "normalize",
-                                   "status": "ok", "raw": raw_message[:120], "normalized": normalized[:120]})
+    # Always emit (even when unchanged) so the node is always clickable
+    if emit_sse:
+        changed = raw_message != normalized
+        emit_sse("pipeline_step", {
+            "step": "node_result", "node": "normalize", "status": "ok",
+            "raw_message": raw_message[:120],
+            "normalized": normalized[:120],
+            "unicode_changed": changed,
+            "unicode_normalisation": "NFKC applied" if changed else "no change needed",
+            "gibberish_check": "multi-word (bypassed)" if len(normalized.split()) > 1 else "passed single-word checks",
+        })
     return {"normalized_message": normalized}
 
 
