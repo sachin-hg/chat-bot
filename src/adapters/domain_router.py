@@ -141,7 +141,15 @@ class AnthropicDomainRouter:
         parsed = json.loads(raw)
         domain = str(parsed.get("domain", "out_of_scope"))
         confidence = float(parsed.get("confidence", 0.0))
-        return {"domain": domain, "confidence": confidence}
+        usage = getattr(response, 'usage', None)
+        return {
+            "domain":     domain,
+            "confidence": confidence,
+            "_usage": {
+                "input_tokens":  getattr(usage, 'input_tokens',  0) if usage else 0,
+                "output_tokens": getattr(usage, 'output_tokens', 0) if usage else 0,
+            },
+        }
 
     @staticmethod
     def _build_user_content(

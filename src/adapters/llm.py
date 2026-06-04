@@ -67,9 +67,14 @@ class AnthropicLLM:
                         except Exception as exc:
                             log.warn('tool_call_failed', tool=block.name, error=str(exc))
 
+            usage = getattr(final_msg, 'usage', None)
             return {
-                'response': {'text': ''.join(full_text), 'stop_reason': final_msg.stop_reason},
+                'response':    {'text': ''.join(full_text), 'stop_reason': final_msg.stop_reason},
                 'tool_results': tool_results,
+                'usage': {
+                    'input_tokens':  getattr(usage, 'input_tokens',  0) if usage else 0,
+                    'output_tokens': getattr(usage, 'output_tokens', 0) if usage else 0,
+                },
             }
 
         except anthropic.APIError as exc:

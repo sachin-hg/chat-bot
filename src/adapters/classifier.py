@@ -199,7 +199,16 @@ class AnthropicClassifier:
         )
         raw = response.content[0].text.strip()
         raw = _strip_code_fence(raw)
-        return json.loads(raw)
+        result = json.loads(raw)
+        # Attach token usage for cost tracking
+        usage = getattr(response, 'usage', None)
+        result['_usage'] = {
+            'input_tokens':  getattr(usage, 'input_tokens',  0) if usage else 0,
+            'output_tokens': getattr(usage, 'output_tokens', 0) if usage else 0,
+            'system_prompt_chars': len(system_prompt),
+            'user_content_chars':  len(user_content),
+        }
+        return result
 
     @staticmethod
     def _build_system_prompt(domain: str, taxonomy_prompt: str) -> str:

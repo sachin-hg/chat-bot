@@ -301,13 +301,21 @@ async def route_domain_node(state: BotState, router: object, emit_sse=None) -> d
         coerced = True
 
     if emit_sse:
+        usage = result.get("_usage", {}) if isinstance(result, dict) else {}
+        _HAIKU_IN, _HAIKU_OUT = 0.80, 4.00
+        cost_usd = (usage.get("input_tokens", 0) * _HAIKU_IN + usage.get("output_tokens", 0) * _HAIKU_OUT) / 1_000_000
         emit_sse("pipeline_step", {
-            "step":       "domain_router",
-            "domain":     domain,
-            "confidence": round(confidence, 3),
-            "latency_ms": latency_ms,
-            "coerced":    coerced,
-            "prev_domain": session.get("last_domain"),
+            "step":          "domain_router",
+            "domain":        domain,
+            "confidence":    round(confidence, 3),
+            "latency_ms":    latency_ms,
+            "coerced":       coerced,
+            "prev_domain":   session.get("last_domain"),
+            "input_tokens":  usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "cost_usd":      round(cost_usd, 6),
+            "prompt_preview": "See prompts/slm/domain_router.md",
+            "user_content":  state.get("normalized_message", "")[:200],
         })
 
     return {"domain": domain}
@@ -364,6 +372,9 @@ async def classify_node(state: BotState, classifier: object, emit_sse=None) -> d
     latency_ms = int((_time.monotonic() - t0) * 1000)
 
     if emit_sse:
+        usage = classification.pop("_usage", {}) or {}
+        _HAIKU_IN, _HAIKU_OUT = 0.80, 4.00
+        cost_usd = (usage.get("input_tokens", 0) * _HAIKU_IN + usage.get("output_tokens", 0) * _HAIKU_OUT) / 1_000_000
         emit_sse("pipeline_step", {
             "step":                 "classifier",
             "domain":               domain,
@@ -375,6 +386,11 @@ async def classify_node(state: BotState, classifier: object, emit_sse=None) -> d
             "clarification_needed": classification.get("clarification_needed"),
             "reasoning":            classification.get("reasoning", ""),
             "latency_ms":           latency_ms,
+            "input_tokens":         usage.get("input_tokens", 0),
+            "output_tokens":        usage.get("output_tokens", 0),
+            "cost_usd":             round(cost_usd, 6),
+            "system_prompt_chars":  usage.get("system_prompt_chars", 0),
+            "user_content":         state.get("normalized_message", "")[:200],
         })
 
     return {"classification": classification}

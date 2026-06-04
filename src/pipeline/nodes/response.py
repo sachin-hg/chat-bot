@@ -430,7 +430,7 @@ def build_all_llm_tools(tool_names: list, main_intent: str) -> list:
 # ---------------------------------------------------------------------------
 
 
-async def build_prompt_node(state: BotState, composer: LLMPromptComposerProtocol) -> dict:
+async def build_prompt_node(state: BotState, composer: LLMPromptComposerProtocol, emit_sse=None) -> dict:
     """Assemble the LLM system prompt and tool definitions for the current intent.
 
     Looks up the correct prompt block from FOLLOWUP_PROMPT_BLOCKS (falling back
@@ -478,6 +478,18 @@ async def build_prompt_node(state: BotState, composer: LLMPromptComposerProtocol
         messages = [{'role': 'user', 'content': raw_message}] + turn_history
     else:
         messages = turn_history or [{'role': 'user', 'content': raw_message or 'Hello'}]
+
+    if emit_sse:
+        tool_names = [t['name'] for t in tool_definitions if isinstance(t, dict)]
+        emit_sse("pipeline_step", {
+            "step":             "build_prompt",
+            "prompt_block":     prompt_block,
+            "system_prompt":    system,           # full prompt — UI truncates for display
+            "tool_definitions": tool_definitions, # full schemas
+            "tool_names":       tool_names,
+            "message_count":    len(messages),
+            "is_followup":      bool(state.get('summary_emitted')),
+        })
 
     return {'system_prompt': system, 'tool_definitions': tool_definitions, 'llm_messages': messages}
 
@@ -761,6 +773,26 @@ async def llm_node(state: BotState, llm: LLMPort, emit_sse: Callable, executor=N
         on_chunk=on_chunk,
     )
     response = llm_response.get('response') or {}
+    usage    = llm_response.get('usage') or {}
+
+    if emit_sse and usage:
+        # Pricing: haiku $0.80/$4.00 per 1M, sonnet $3.00/$15.00 per 1M
+        _PRICES = {
+            'claude-haiku-4-5-20251001': (0.80, 4.00),
+            'claude-sonnet-4-6':         (3.00, 15.00),
+        }
+        in_p, out_p = _PRICES.get(model_id, (0.80, 4.00))
+        cost_usd = (usage.get('input_tokens', 0) * in_p + usage.get('output_tokens', 0) * out_p) / 1_000_000
+        emit_sse("pipeline_step", {
+            "step":          "llm_done",
+            "model":         model_id,
+            "input_tokens":  usage.get('input_tokens', 0),
+            "output_tokens": usage.get('output_tokens', 0),
+            "cost_usd":      round(cost_usd, 6),
+            "stop_reason":   response.get('stop_reason', ''),
+            "chunks":        chunk_index,
+        })
+
     return {
         'llm_response': {**response, 'text_message_id': text_message_id},
         'tool_results':  llm_response.get('tool_results', []),

@@ -6,511 +6,178 @@
   <title>Housing.com Chatbot Playground</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
     :root {
       --red: #D6001C;
       --dark: #1A1A1A;
       --mid: #2D2D2D;
-      --border: #3A3A3A;
-      --text-dim: #888;
-      --text-muted: #aaa;
+      --border: #2a2a2a;
+      --text-dim: #666;
+      --text-muted: #999;
       --bg-chat: #F7F7F8;
-      --bubble-user: #D6001C;
-      --bubble-bot: #FFFFFF;
-      --card-bg: #FAFAFA;
-      --font-mono: "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
+      --font-mono: "SFMono-Regular","Consolas","Liberation Mono",monospace;
     }
+    body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#111; color:#EEE; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
 
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #111;
-      color: #EEE;
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
+    header { background:var(--dark); border-bottom:2px solid var(--red); padding:8px 16px; display:flex; align-items:center; gap:10px; flex-shrink:0; }
+    header .logo { font-weight:700; font-size:17px; color:var(--red); letter-spacing:-0.5px; }
+    header .badge { font-size:10px; background:var(--red); color:#fff; padding:2px 7px; border-radius:3px; font-weight:600; letter-spacing:0.5px; }
+    header .turn-nav { display:flex; align-items:center; gap:6px; margin-left:auto; }
+    header .nav-btn { background:#222; border:1px solid #333; color:#aaa; border-radius:4px; padding:3px 10px; font-size:11px; cursor:pointer; font-weight:600; }
+    header .nav-btn:hover:not(:disabled) { background:#333; color:#fff; }
+    header .nav-btn:disabled { opacity:0.3; cursor:not-allowed; }
+    header .turn-label { font-size:11px; color:#666; font-family:var(--font-mono); }
 
-    /* ── Header ─────────────────────────────────────── */
-    header {
-      background: var(--dark);
-      border-bottom: 2px solid var(--red);
-      padding: 10px 20px;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-shrink: 0;
-    }
-    header .logo {
-      font-weight: 700;
-      font-size: 18px;
-      color: var(--red);
-      letter-spacing: -0.5px;
-    }
-    header .badge {
-      font-size: 11px;
-      background: var(--red);
-      color: #fff;
-      padding: 2px 8px;
-      border-radius: 3px;
-      font-weight: 600;
-      letter-spacing: 0.5px;
-    }
+    .layout { display:grid; grid-template-columns:180px 1fr 360px; flex:1; min-height:0; }
 
-    /* ── Layout ──────────────────────────────────────── */
-    .layout {
-      display: grid;
-      grid-template-columns: 200px 1fr 320px;
-      flex: 1;
-      min-height: 0;
-      overflow: hidden;
-    }
+    /* Left panel */
+    .panel-left { background:var(--dark); border-right:1px solid var(--border); padding:12px 10px; display:flex; flex-direction:column; gap:10px; overflow-y:auto; }
+    .ps-label { font-size:9px; font-weight:700; letter-spacing:1px; text-transform:uppercase; color:var(--text-dim); margin-bottom:4px; }
+    .conv-id-box { background:#111; border:1px solid var(--border); border-radius:5px; padding:6px 8px; }
+    .conv-id-val { font-size:9px; font-family:var(--font-mono); color:#aaa; word-break:break-all; line-height:1.4; }
+    .btn { cursor:pointer; border:none; border-radius:5px; font-size:12px; font-weight:600; padding:7px 10px; transition:opacity .15s; }
+    .btn:hover { opacity:0.85; }
+    .btn-primary { background:var(--red); color:#fff; width:100%; }
+    .btn-scenario { background:#1e1e1e; color:#ccc; width:100%; text-align:left; font-size:11px; font-weight:500; padding:6px 8px; border:1px solid var(--border); border-radius:4px; cursor:pointer; }
+    .btn-scenario:hover { background:#2a2a2a; border-color:var(--red); color:#fff; }
+    .toggle-row { display:flex; align-items:center; gap:7px; font-size:11px; color:var(--text-muted); }
+    .toggle-row input[type=checkbox] { accent-color:var(--red); cursor:pointer; }
 
-    @media (max-width: 1000px) {
-      .layout { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto; }
-      .panel-left, .panel-debug { max-height: 250px; overflow-y: auto; }
-    }
+    /* Chat panel */
+    .panel-chat { display:flex; flex-direction:column; background:var(--bg-chat); min-height:0; }
+    .chat-messages { flex:1; overflow-y:auto; padding:16px 14px; display:flex; flex-direction:column; gap:10px; }
+    .chat-row { display:flex; align-items:flex-end; gap:7px; }
+    .chat-row.user { flex-direction:row-reverse; }
+    .avatar { width:26px; height:26px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; flex-shrink:0; }
+    .avatar.bot { background:var(--red); color:#fff; }
+    .avatar.user { background:#444; color:#ddd; }
+    .bubble { max-width:74%; padding:9px 13px; border-radius:14px; font-size:13px; line-height:1.55; }
+    .chat-row.user .bubble { background:var(--red); color:#fff; border-bottom-right-radius:4px; }
+    .chat-row.bot  .bubble { background:#fff; color:#1A1A1A; border-bottom-left-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+    .template-cards { display:flex; flex-direction:column; gap:7px; margin-top:7px; }
+    .tpl-card { border:1.5px solid #e0e0e0; border-radius:9px; padding:9px 12px; background:#fafafa; font-size:12px; }
+    .tpl-card .tpl-title { font-weight:700; color:#1A1A1A; margin-bottom:3px; }
+    .tpl-card .tpl-price { color:var(--red); font-weight:700; font-size:14px; }
+    .tpl-card .tpl-meta { color:#666; font-size:11px; margin-top:2px; }
+    .tpl-card .tpl-highlights { display:flex; flex-wrap:wrap; gap:3px; margin-top:5px; }
+    .tpl-chip { background:#f0f0f0; border:1px solid #ddd; border-radius:10px; padding:2px 7px; font-size:10px; color:#444; }
+    .locality-chips { display:flex; flex-wrap:wrap; gap:5px; margin-top:5px; }
+    .locality-chip { background:#FFF0F0; border:1px solid #FFC0C0; border-radius:10px; padding:3px 10px; font-size:11px; color:#cc0000; font-weight:500; }
+    .login-required-box { border:2px solid var(--red); border-radius:9px; padding:10px 14px; margin-top:5px; background:#FFF8F8; text-align:center; }
+    .qna-options { display:flex; flex-direction:column; gap:5px; margin-top:5px; }
+    .qna-opt-btn { background:#fff; border:1.5px solid var(--red); border-radius:7px; padding:6px 11px; font-size:12px; color:var(--red); font-weight:600; cursor:pointer; text-align:left; }
+    .qna-opt-btn:hover { background:#FFF0F0; }
+    .error-bubble { background:#FFF2F2; border:1.5px solid #FF4444; border-radius:9px; padding:7px 11px; color:#CC0000; font-size:12px; margin-top:5px; }
+    .chat-input-bar { border-top:1px solid #ddd; padding:10px 14px; background:#fff; display:flex; gap:7px; }
+    .chat-input { flex:1; border:1.5px solid #ddd; border-radius:20px; padding:8px 14px; font-size:13px; outline:none; resize:none; font-family:inherit; max-height:110px; min-height:38px; line-height:1.4; }
+    .chat-input:focus { border-color:var(--red); }
+    .btn-send { background:var(--red); color:#fff; border:none; border-radius:20px; padding:8px 18px; font-size:13px; font-weight:700; cursor:pointer; transition:opacity .15s; align-self:flex-end; }
+    .btn-send:hover { opacity:.85; }
+    .btn-send:disabled { opacity:.4; cursor:not-allowed; }
 
-    /* ── Left Panel ──────────────────────────────────── */
-    .panel-left {
-      background: var(--dark);
-      border-right: 1px solid var(--border);
-      padding: 16px 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-      overflow-y: auto;
-    }
+    /* Debug panel */
+    .panel-debug { background:#0d0d0d; border-left:1px solid var(--border); overflow-y:auto; display:flex; flex-direction:column; min-height:0; }
 
-    .panel-section-label {
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: 1px;
-      text-transform: uppercase;
-      color: var(--text-dim);
-      margin-bottom: 6px;
-    }
+    /* Pipeline graph */
+    .pg-header { padding:8px 10px 6px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; flex-shrink:0; }
+    .pg-title { font-size:10px; font-weight:700; letter-spacing:1px; text-transform:uppercase; color:#666; }
+    .pg-status { font-size:10px; font-family:var(--font-mono); color:#555; margin-left:auto; }
+    .pg-cost-total { font-size:10px; font-family:var(--font-mono); color:#f59e0b; margin-left:8px; }
 
-    .conv-id-box {
-      background: var(--mid);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 8px 10px;
-    }
-    .conv-id-label {
-      font-size: 10px;
-      color: var(--text-dim);
-      margin-bottom: 4px;
-      font-weight: 600;
-    }
-    .conv-id-value {
-      font-size: 10px;
-      font-family: var(--font-mono);
-      color: #ccc;
-      word-break: break-all;
-      line-height: 1.4;
-    }
+    .pipeline-graph { padding:8px 10px; display:flex; flex-direction:column; gap:2px; flex-shrink:0; border-bottom:1px solid var(--border); }
+    .pg-row { display:flex; align-items:center; gap:0; }
+    .pg-node { display:flex; align-items:center; gap:5px; padding:3px 7px; border-radius:4px; font-size:9px; font-family:var(--font-mono); font-weight:600; letter-spacing:0.3px; background:#111; border:1px solid #1e1e1e; color:#444; cursor:default; transition:all .2s; width:100%; }
+    .pg-node.pending  { color:#333; border-color:#1a1a1a; }
+    .pg-node.active   { color:#fbbf24; border-color:#fbbf24; background:#1a1500; box-shadow:0 0 6px #fbbf2440; animation:pulse 1s infinite; }
+    .pg-node.done     { color:#22c55e; border-color:#22c55e40; background:#0a1a0a; }
+    .pg-node.skipped  { color:#222; border-color:#1a1a1a; text-decoration:line-through; }
+    .pg-node.error    { color:#ef4444; border-color:#ef444440; background:#1a0a0a; }
+    .pg-node .nd-dot  { width:5px; height:5px; border-radius:50%; flex-shrink:0; background:currentColor; }
+    .pg-node .nd-ms   { margin-left:auto; color:#333; font-size:8px; font-weight:400; }
+    .pg-node.done .nd-ms { color:#22c55e60; }
+    .pg-node.active .nd-ms { color:#fbbf24; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.6; } }
+    .pg-arrow { color:#1e1e1e; font-size:8px; padding:0 8px; }
+    .pg-exit { font-size:9px; font-family:var(--font-mono); color:#555; padding:1px 7px; margin-top:1px; font-style:italic; }
 
-    .btn {
-      cursor: pointer;
-      border: none;
-      border-radius: 6px;
-      font-size: 13px;
-      font-weight: 600;
-      padding: 8px 12px;
-      transition: opacity 0.15s;
-    }
-    .btn:hover { opacity: 0.85; }
-    .btn:active { opacity: 0.7; }
+    /* Detail sections */
+    .dbg-sections { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:0; }
+    .dbg-card { border-bottom:1px solid #1a1a1a; }
+    .dbg-card-header { display:flex; align-items:center; gap:6px; padding:7px 10px; cursor:pointer; user-select:none; background:#0d0d0d; }
+    .dbg-card-header:hover { background:#141414; }
+    .dbg-dot { width:6px; height:6px; border-radius:50%; flex-shrink:0; background:#222; }
+    .dbg-dot.green  { background:#22c55e; box-shadow:0 0 4px #22c55e80; }
+    .dbg-dot.yellow { background:#f59e0b; box-shadow:0 0 4px #f59e0b80; }
+    .dbg-dot.blue   { background:#38bdf8; box-shadow:0 0 4px #38bdf880; }
+    .dbg-dot.purple { background:#a78bfa; box-shadow:0 0 4px #a78bfa80; }
+    .dbg-dot.red    { background:#ef4444; box-shadow:0 0 4px #ef444480; }
+    .dbg-dot.gray   { background:#333; }
+    .dbg-card-label { font-size:10px; font-weight:700; letter-spacing:0.7px; text-transform:uppercase; color:#888; flex:1; }
+    .dbg-card-badge { font-size:9px; font-family:var(--font-mono); color:#555; }
+    .dbg-chev { font-size:9px; color:#444; transition:transform .15s; }
+    .dbg-card.open .dbg-chev { transform:rotate(90deg); }
+    .dbg-card-body { display:none; padding:8px 10px; background:#0a0a0a; border-top:1px solid #1a1a1a; }
+    .dbg-card.open .dbg-card-body { display:block; }
 
-    .btn-primary {
-      background: var(--red);
-      color: #fff;
-      width: 100%;
-    }
+    /* KV grid */
+    .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 8px; font-size:10px; font-family:var(--font-mono); margin-bottom:4px; }
+    .k { color:#444; white-space:nowrap; padding:1px 0; }
+    .v { color:#7ec8e3; word-break:break-all; padding:1px 0; }
+    .v.hi   { color:#22c55e; font-weight:700; }
+    .v.warn { color:#f59e0b; }
+    .v.err  { color:#ef4444; }
+    .v.dim  { color:#444; }
+    .v.purple { color:#a78bfa; }
 
-    .btn-scenario {
-      background: var(--mid);
-      color: #ddd;
-      width: 100%;
-      text-align: left;
-      font-size: 12px;
-      font-weight: 500;
-      padding: 7px 10px;
-      border: 1px solid var(--border);
-    }
-    .btn-scenario:hover { background: #3A3A3A; border-color: var(--red); color: #fff; }
+    /* JSON / pre */
+    .json-box { font-family:var(--font-mono); font-size:10px; color:#7ec8e3; white-space:pre-wrap; word-break:break-all; line-height:1.5; }
+    .json-box .j-key  { color:#a78bfa; }
+    .json-box .j-str  { color:#86efac; }
+    .json-box .j-num  { color:#fbbf24; }
+    .json-box .j-bool { color:#38bdf8; }
+    .json-box .j-null { color:#444; }
 
-    .toggle-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    .toggle-row input[type=checkbox] { accent-color: var(--red); cursor: pointer; }
+    /* Prompt viewer */
+    .prompt-box { font-family:var(--font-mono); font-size:9px; line-height:1.6; color:#7ec8e3; white-space:pre-wrap; word-break:break-all; background:#050505; border:1px solid #1a1a1a; border-radius:4px; padding:7px 8px; margin-top:4px; max-height:300px; overflow-y:auto; }
+    .prompt-collapsed { max-height:80px; overflow:hidden; position:relative; }
+    .prompt-collapsed::after { content:''; position:absolute; bottom:0; left:0; right:0; height:30px; background:linear-gradient(transparent, #050505); pointer-events:none; }
+    .expand-btn { font-size:9px; color:#555; cursor:pointer; margin-top:3px; font-family:var(--font-mono); }
+    .expand-btn:hover { color:#888; }
 
-    /* ── Chat Panel ──────────────────────────────────── */
-    .panel-chat {
-      display: flex;
-      flex-direction: column;
-      background: var(--bg-chat);
-      min-height: 0;
-    }
+    /* Cost badge */
+    .cost-chip { display:inline-flex; align-items:center; gap:3px; background:#1a1200; border:1px solid #f59e0b40; border-radius:3px; padding:1px 5px; font-size:9px; font-family:var(--font-mono); color:#f59e0b; }
 
-    .chat-messages {
-      flex: 1;
-      overflow-y: auto;
-      padding: 20px 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
+    /* Filter diff */
+    .fdiff { font-size:10px; font-family:var(--font-mono); display:flex; flex-direction:column; gap:1px; }
+    .fdiff .fa { color:#22c55e; }
+    .fdiff .fk { color:#444; }
 
-    .chat-row {
-      display: flex;
-      align-items: flex-end;
-      gap: 8px;
-    }
-    .chat-row.user { flex-direction: row-reverse; }
+    /* Tool call rows */
+    .tc-row { padding:5px 0; border-bottom:1px solid #1a1a1a; font-size:10px; font-family:var(--font-mono); }
+    .tc-row:last-child { border-bottom:none; }
+    .tc-name { color:#22c55e; font-weight:700; font-size:11px; }
+    .tc-latency { float:right; color:#444; font-size:9px; }
+    .tc-params { color:#666; margin-top:2px; word-break:break-all; }
+    .tc-result { color:#f59e0b; margin-top:2px; }
 
-    .avatar {
-      width: 28px;
-      height: 28px;
-      border-radius: 50%;
-      background: #555;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 12px;
-      font-weight: 700;
-      flex-shrink: 0;
-    }
-    .avatar.bot { background: var(--red); color: #fff; }
-    .avatar.user { background: #444; color: #ddd; }
+    /* Timeline */
+    .tl-scroll { max-height:200px; overflow-y:auto; display:flex; flex-direction:column; gap:1px; }
+    .tl-row { display:flex; gap:5px; font-size:9px; font-family:var(--font-mono); padding:1px 0; }
+    .tl-t { color:#f0c060; font-weight:700; min-width:90px; flex-shrink:0; }
+    .tl-t.step { color:#a78bfa; }
+    .tl-t.err  { color:#ef4444; }
+    .tl-m { color:#444; }
 
-    .bubble {
-      max-width: 72%;
-      padding: 10px 14px;
-      border-radius: 16px;
-      font-size: 14px;
-      line-height: 1.55;
-      color: #1A1A1A;
-    }
-    .chat-row.user .bubble {
-      background: var(--bubble-user);
-      color: #fff;
-      border-bottom-right-radius: 4px;
-    }
-    .chat-row.bot .bubble {
-      background: var(--bubble-bot);
-      border-bottom-left-radius: 4px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-    }
+    /* Typing */
+    .typing-indicator { display:none; align-items:center; gap:4px; padding:4px 0; }
+    .typing-indicator.visible { display:flex; }
+    .typing-dot { width:6px; height:6px; border-radius:50%; background:#bbb; animation:bounce 1s infinite; }
+    .typing-dot:nth-child(2) { animation-delay:.2s; }
+    .typing-dot:nth-child(3) { animation-delay:.4s; }
+    @keyframes bounce { 0%,80%,100% { transform:translateY(0); } 40% { transform:translateY(-5px); } }
 
-    /* Template cards inside bot bubble */
-    .template-cards {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      margin-top: 8px;
-    }
-    .tpl-card {
-      border: 1.5px solid #e0e0e0;
-      border-radius: 10px;
-      padding: 10px 14px;
-      background: var(--card-bg);
-      font-size: 13px;
-    }
-    .tpl-card .tpl-title {
-      font-weight: 700;
-      color: var(--dark);
-      margin-bottom: 4px;
-    }
-    .tpl-card .tpl-price {
-      color: var(--red);
-      font-weight: 700;
-      font-size: 15px;
-    }
-    .tpl-card .tpl-meta {
-      color: #666;
-      font-size: 12px;
-      margin-top: 3px;
-    }
-    .tpl-card .tpl-highlights {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 4px;
-      margin-top: 6px;
-    }
-    .tpl-chip {
-      background: #f0f0f0;
-      border: 1px solid #ddd;
-      border-radius: 12px;
-      padding: 2px 8px;
-      font-size: 11px;
-      color: #444;
-    }
-    .locality-chips {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-top: 6px;
-    }
-    .locality-chip {
-      background: #FFF0F0;
-      border: 1px solid #FFC0C0;
-      border-radius: 12px;
-      padding: 4px 12px;
-      font-size: 12px;
-      color: #cc0000;
-      font-weight: 500;
-    }
-    .login-required-box {
-      border: 2px solid var(--red);
-      border-radius: 10px;
-      padding: 12px 16px;
-      margin-top: 6px;
-      background: #FFF8F8;
-      text-align: center;
-    }
-    .login-required-box .lr-title {
-      font-weight: 700;
-      color: var(--red);
-      font-size: 15px;
-      margin-bottom: 4px;
-    }
-    .login-required-box .lr-sub {
-      font-size: 12px;
-      color: #888;
-    }
-    .qna-options {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      margin-top: 6px;
-    }
-    .qna-option-btn {
-      background: #fff;
-      border: 1.5px solid var(--red);
-      border-radius: 8px;
-      padding: 7px 12px;
-      font-size: 13px;
-      color: var(--red);
-      font-weight: 600;
-      cursor: pointer;
-      text-align: left;
-      transition: background 0.15s;
-    }
-    .qna-option-btn:hover { background: #FFF0F0; }
-
-    .error-bubble {
-      background: #FFF2F2;
-      border: 1.5px solid #FF4444;
-      border-radius: 10px;
-      padding: 8px 12px;
-      color: #CC0000;
-      font-size: 13px;
-    }
-
-    /* SSE raw events (collapsible) */
-    .raw-sse-box {
-      background: #1A1A1A;
-      border: 1px solid #333;
-      border-radius: 8px;
-      padding: 8px 10px;
-      font-family: var(--font-mono);
-      font-size: 11px;
-      color: #7ec8e3;
-      max-height: 120px;
-      overflow-y: auto;
-      margin-top: 6px;
-      white-space: pre-wrap;
-      word-break: break-all;
-    }
-    .raw-sse-box.hidden { display: none; }
-
-    /* ── Input Bar ───────────────────────────────────── */
-    .chat-input-bar {
-      border-top: 1px solid #ddd;
-      padding: 12px 16px;
-      background: #fff;
-      display: flex;
-      gap: 8px;
-    }
-    .chat-input {
-      flex: 1;
-      border: 1.5px solid #ddd;
-      border-radius: 22px;
-      padding: 9px 16px;
-      font-size: 14px;
-      outline: none;
-      resize: none;
-      font-family: inherit;
-      max-height: 120px;
-      min-height: 40px;
-      line-height: 1.4;
-    }
-    .chat-input:focus { border-color: var(--red); }
-    .btn-send {
-      background: var(--red);
-      color: #fff;
-      border: none;
-      border-radius: 22px;
-      padding: 9px 20px;
-      font-size: 14px;
-      font-weight: 700;
-      cursor: pointer;
-      transition: opacity 0.15s;
-      align-self: flex-end;
-    }
-    .btn-send:hover { opacity: 0.85; }
-    .btn-send:disabled { opacity: 0.4; cursor: not-allowed; }
-
-    /* ── Debug Panel ─────────────────────────────────── */
-    .panel-debug {
-      background: #0d0d0d;
-      border-left: 1px solid var(--border);
-      padding: 10px 10px;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      width: 320px;
-      flex-shrink: 0;
-    }
-
-    .dbg-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding-bottom: 6px;
-      border-bottom: 1px solid var(--border);
-    }
-    .dbg-title { font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--text-dim); }
-    .dbg-status { font-size: 10px; font-family: var(--font-mono); color: #888; }
-
-    .dbg-card {
-      background: #141414;
-      border: 1px solid #2a2a2a;
-      border-radius: 6px;
-      overflow: hidden;
-    }
-    .dbg-card-header {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 6px 8px;
-      border-bottom: 1px solid #1e1e1e;
-      cursor: pointer;
-      user-select: none;
-    }
-    .dbg-card-header:hover { background: #1a1a1a; }
-    .dbg-card-dot {
-      width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
-      background: #333;
-    }
-    .dbg-card-dot.green  { background: #22c55e; box-shadow: 0 0 4px #22c55e80; }
-    .dbg-card-dot.yellow { background: #f59e0b; box-shadow: 0 0 4px #f59e0b80; }
-    .dbg-card-dot.blue   { background: #38bdf8; box-shadow: 0 0 4px #38bdf880; }
-    .dbg-card-dot.red    { background: #ef4444; box-shadow: 0 0 4px #ef444480; }
-    .dbg-card-dot.purple { background: #a78bfa; box-shadow: 0 0 4px #a78bfa80; }
-    .dbg-card-dot.gray   { background: #555; }
-
-    .dbg-card-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.7px; color: #aaa; flex: 1; }
-    .dbg-card-badge { font-size: 9px; font-family: var(--font-mono); color: #666; }
-    .dbg-card-chevron { font-size: 9px; color: #555; transition: transform 0.15s; }
-    .dbg-card.open .dbg-card-chevron { transform: rotate(90deg); }
-
-    .dbg-card-body { padding: 8px; display: none; }
-    .dbg-card.open .dbg-card-body { display: block; }
-
-    .dbg-kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; font-size: 10px; font-family: var(--font-mono); }
-    .dbg-k { color: #555; white-space: nowrap; padding: 1px 0; }
-    .dbg-v { color: #7ec8e3; word-break: break-all; padding: 1px 0; }
-    .dbg-v.hi   { color: #22c55e; font-weight: 700; }
-    .dbg-v.warn { color: #f59e0b; }
-    .dbg-v.err  { color: #ef4444; }
-    .dbg-v.dim  { color: #555; }
-
-    .dbg-json {
-      font-family: var(--font-mono);
-      font-size: 10px;
-      color: #7ec8e3;
-      white-space: pre-wrap;
-      word-break: break-all;
-      line-height: 1.5;
-      max-height: 200px;
-      overflow-y: auto;
-    }
-    .dbg-json .j-key  { color: #a78bfa; }
-    .dbg-json .j-str  { color: #86efac; }
-    .dbg-json .j-num  { color: #fbbf24; }
-    .dbg-json .j-bool { color: #38bdf8; }
-    .dbg-json .j-null { color: #666; }
-
-    .filter-diff { font-size: 10px; font-family: var(--font-mono); display: flex; flex-direction: column; gap: 2px; }
-    .filter-add    { color: #22c55e; }
-    .filter-change { color: #f59e0b; }
-    .filter-keep   { color: #555; }
-
-    .tool-call-row {
-      border-bottom: 1px solid #1a1a1a;
-      padding: 6px 0;
-      font-size: 10px;
-      font-family: var(--font-mono);
-    }
-    .tool-call-row:last-child { border-bottom: none; }
-    .tool-name { color: #22c55e; font-weight: 700; font-size: 11px; }
-    .tool-params { color: #888; margin-top: 2px; word-break: break-all; }
-    .tool-result { color: #f59e0b; margin-top: 2px; }
-    .tool-latency { color: #555; float: right; }
-
-    .timeline-scroll { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
-    .tl-row { display: flex; gap: 5px; font-size: 9px; font-family: var(--font-mono); align-items: baseline; }
-    .tl-type { color: #f0c060; font-weight: 700; min-width: 95px; flex-shrink: 0; }
-    .tl-type.tl-step { color: #a78bfa; }
-    .tl-type.tl-err  { color: #ef4444; }
-    .tl-meta { color: #555; }
-
-    .turn-counter {
-      font-size: 28px; font-weight: 800; color: var(--red); text-align: center; line-height: 1;
-    }
-    .turn-label {
-      font-size: 10px; color: var(--text-dim); text-align: center;
-      letter-spacing: 0.8px; text-transform: uppercase; margin-top: 2px;
-    }
-
-    /* legacy compat */
-    .debug-section { background: #141414; border: 1px solid #2a2a2a; border-radius: 6px; padding: 8px; }
-    .debug-section-title { font-size: 10px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase; color: var(--text-dim); margin-bottom: 6px; }
-    .debug-kv { font-size: 11px; font-family: var(--font-mono); color: #bbb; line-height: 1.7; }
-    .debug-kv span.key { color: var(--text-dim); }
-    .debug-kv span.val { color: #7ec8e3; }
-    .debug-json { font-family: var(--font-mono); font-size: 10px; color: #7ec8e3; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }
-    .tool-list { display: flex; flex-direction: column; gap: 3px; }
-    .tool-item { font-size: 11px; font-family: var(--font-mono); color: #6bff9e; background: rgba(107,255,158,0.07); border-radius: 4px; padding: 2px 6px; }
-
-    /* Typing indicator */
-    .typing-indicator {
-      display: none;
-      align-items: center;
-      gap: 4px;
-      padding: 4px 0;
-    }
-    .typing-indicator.visible { display: flex; }
-    .typing-dot {
-      width: 7px; height: 7px;
-      border-radius: 50%;
-      background: #bbb;
-      animation: bounce 1s infinite;
-    }
-    .typing-dot:nth-child(2) { animation-delay: 0.2s; }
-    .typing-dot:nth-child(3) { animation-delay: 0.4s; }
-    @keyframes bounce {
-      0%, 80%, 100% { transform: translateY(0); }
-      40% { transform: translateY(-6px); }
-    }
+    /* Section label */
+    .sec-lbl { font-size:9px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; color:#333; margin-bottom:3px; margin-top:6px; }
+    .sec-lbl:first-child { margin-top:0; }
   </style>
 </head>
 <body>
@@ -518,765 +185,811 @@
 <header>
   <div class="logo">housing.com</div>
   <div class="badge">PLAYGROUND</div>
-  <div style="flex:1"></div>
-  <div style="font-size:11px; color:#888;">Chatbot Pipeline Testing UI</div>
+  <div style="font-size:10px;color:#555;margin-left:6px;" id="statusIndicator">Idle</div>
+  <div class="turn-nav">
+    <button class="nav-btn" id="btnPrev" onclick="navTurn(-1)" disabled>◀ Prev</button>
+    <span class="turn-label" id="turnNavLabel">Turn 0 / 0</span>
+    <button class="nav-btn" id="btnNext" onclick="navTurn(+1)" disabled>Next ▶</button>
+    <button class="btn" style="background:#1a1a1a;border:1px solid #333;color:#aaa;font-size:10px;padding:3px 9px;border-radius:4px;cursor:pointer;margin-left:8px;" onclick="newConversation()">New Conv</button>
+  </div>
 </header>
 
 <div class="layout">
-
-  <!-- ── Left Panel ── -->
+  <!-- Left panel -->
   <aside class="panel-left">
     <div>
-      <div class="panel-section-label">Session</div>
-      <div class="conv-id-box">
-        <div class="conv-id-label">Conversation ID</div>
-        <div class="conv-id-value" id="convIdDisplay">—</div>
+      <div class="ps-label">Session</div>
+      <div class="conv-id-box"><div class="conv-id-val" id="convIdDisplay">—</div></div>
+    </div>
+    <div>
+      <div class="ps-label">Presets</div>
+      <div style="display:flex;flex-direction:column;gap:4px;">
+        <button class="btn-scenario" onclick="fill('show me 2bhk in bandra under 2 crore')">2BHK Bandra &lt;2Cr</button>
+        <button class="btn-scenario" onclick="fill('i want something in bangalore')">Vague → clarify</button>
+        <button class="btn-scenario" onclick="fill('tell me about Andheri West')">Locality Research</button>
+        <button class="btn-scenario" onclick="fill('compare Bandra and Worli')">Compare Localities</button>
+        <button class="btn-scenario" onclick="fill('EMI for 1.5 crore at 8.5%')">EMI Calculator</button>
+        <button class="btn-scenario" onclick="fill('tell me a joke')">Out of Scope</button>
+        <button class="btn-scenario" onclick="fill('my saved properties')">Portfolio</button>
       </div>
     </div>
-    <button class="btn btn-primary" onclick="newConversation()">New Conversation</button>
-
     <div>
-      <div class="panel-section-label">Preset Scenarios</div>
-      <div style="display:flex;flex-direction:column;gap:5px;">
-        <button class="btn btn-scenario" onclick="fillScenario('show me 2bhk in bandra under 80 lakh')">2BHK Bandra Search</button>
-        <button class="btn btn-scenario" onclick="fillScenario('tell me about Andheri West')">Locality Research</button>
-        <button class="btn btn-scenario" onclick="fillScenario('compare Bandra and Worli')">Compare Localities</button>
-        <button class="btn btn-scenario" onclick="fillScenario('tell me a joke')">Out of Scope</button>
-        <button class="btn btn-scenario" onclick="fillScenario('EMI for 1.5 crore at 8.5%')">EMI Calculator</button>
-        <button class="btn btn-scenario" onclick="fillScenario('I want to contact the seller')">Contact Seller</button>
-      </div>
-    </div>
-
-    <div>
-      <div class="panel-section-label">Options</div>
-      <label class="toggle-row">
-        <input type="checkbox" id="debugToggle" onchange="toggleDebug()" />
-        Show raw SSE events
-      </label>
+      <div class="ps-label">Options</div>
+      <label class="toggle-row"><input type="checkbox" id="rawToggle" onchange="showRaw=this.checked"/> Raw SSE</label>
     </div>
   </aside>
 
-  <!-- ── Chat Panel ── -->
+  <!-- Chat -->
   <main class="panel-chat">
     <div class="chat-messages" id="chatMessages">
-      <div style="text-align:center; color:#aaa; font-size:13px; margin:auto; padding:40px 20px;">
-        <div style="font-size:28px; margin-bottom:10px;">💬</div>
-        <div style="font-weight:600; color:#666;">Housing.com Chatbot Playground</div>
-        <div style="margin-top:6px; font-size:12px;">Select a preset or type a message to begin</div>
+      <div id="emptyState" style="text-align:center;color:#aaa;font-size:13px;margin:auto;padding:40px 20px;">
+        <div style="font-size:26px;margin-bottom:8px;">💬</div>
+        <div style="font-weight:600;color:#666;">Housing.com Chatbot Playground</div>
+        <div style="margin-top:5px;font-size:11px;">Pick a preset or type a message</div>
       </div>
     </div>
     <div class="chat-input-bar">
-      <textarea
-        class="chat-input"
-        id="chatInput"
-        placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
-        rows="1"
-        onkeydown="handleKeydown(event)"
-        oninput="autoResize(this)"
-      ></textarea>
-      <button class="btn-send" id="sendBtn" onclick="triggerSend()">Send</button>
+      <textarea class="chat-input" id="chatInput" placeholder="Type a message… (Enter to send, Shift+Enter for newline)" rows="1"
+        onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+      <button class="btn-send" id="sendBtn" onclick="doSend()">Send</button>
     </div>
   </main>
 
-  <!-- ── Debug Panel ── -->
-  <aside class="panel-debug" id="debugPanel">
-    <!-- Header row -->
-    <div class="dbg-header">
-      <div style="display:flex;align-items:center;gap:10px;">
-        <div>
-          <div class="turn-counter" id="turnCounter">0</div>
-          <div class="turn-label">turns</div>
+  <!-- Debug panel -->
+  <aside class="panel-debug">
+    <div class="pg-header">
+      <div class="pg-title">Pipeline</div>
+      <div class="pg-cost-total" id="pgCostTotal"></div>
+      <div class="pg-status" id="pgStatus">Idle</div>
+    </div>
+
+    <!-- Node flowchart -->
+    <div class="pipeline-graph" id="pipelineGraph"></div>
+
+    <!-- Detail cards -->
+    <div class="dbg-sections">
+
+      <!-- Domain Router -->
+      <div class="dbg-card" id="cDR">
+        <div class="dbg-card-header" onclick="tog('cDR')">
+          <div class="dbg-dot gray" id="dDR"></div>
+          <div class="dbg-card-label">Stage 1 · Domain Router</div>
+          <div class="dbg-card-badge" id="bDR">—</div>
+          <div class="dbg-chev">▶</div>
         </div>
-        <div class="dbg-title">Pipeline</div>
-      </div>
-      <div class="dbg-status" id="statusIndicator">Idle</div>
-    </div>
-
-    <!-- Stage 1: Domain Router -->
-    <div class="dbg-card" id="cardDomainRouter">
-      <div class="dbg-card-header" onclick="toggleCard('cardDomainRouter')">
-        <div class="dbg-card-dot gray" id="dotDomainRouter"></div>
-        <div class="dbg-card-label">Stage 1 · Domain Router</div>
-        <div class="dbg-card-badge" id="badgeDomainRouter">—</div>
-        <div class="dbg-card-chevron">▶</div>
-      </div>
-      <div class="dbg-card-body">
-        <div class="dbg-kv" id="kvDomainRouter">
-          <div class="dbg-k">domain</div>    <div class="dbg-v dim" id="dr_domain">—</div>
-          <div class="dbg-k">confidence</div><div class="dbg-v dim" id="dr_conf">—</div>
-          <div class="dbg-k">latency</div>   <div class="dbg-v dim" id="dr_latency">—</div>
-          <div class="dbg-k">prev_domain</div><div class="dbg-v dim" id="dr_prev">—</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Stage 2: Classifier -->
-    <div class="dbg-card" id="cardClassifier">
-      <div class="dbg-card-header" onclick="toggleCard('cardClassifier')">
-        <div class="dbg-card-dot gray" id="dotClassifier"></div>
-        <div class="dbg-card-label">Stage 2 · Classifier</div>
-        <div class="dbg-card-badge" id="badgeClassifier">—</div>
-        <div class="dbg-card-chevron">▶</div>
-      </div>
-      <div class="dbg-card-body">
-        <div class="dbg-kv" id="kvClassifier" style="margin-bottom:6px;">
-          <div class="dbg-k">main_intent</div>   <div class="dbg-v hi"  id="clf_main">—</div>
-          <div class="dbg-k">sub_intent</div>    <div class="dbg-v"    id="clf_sub">—</div>
-          <div class="dbg-k">pivot</div>          <div class="dbg-v"    id="clf_pivot">—</div>
-          <div class="dbg-k">clarify</div>        <div class="dbg-v"    id="clf_clarify">—</div>
-          <div class="dbg-k">entities</div>       <div class="dbg-v"    id="clf_entities">—</div>
-          <div class="dbg-k">latency</div>        <div class="dbg-v dim" id="clf_latency">—</div>
-          <div class="dbg-k">reasoning</div>      <div class="dbg-v dim" id="clf_reasoning" style="font-size:9px;">—</div>
-        </div>
-        <div style="font-size:9px;color:#555;margin-bottom:3px;font-weight:700;letter-spacing:0.5px;">FILTER DELTA</div>
-        <div class="dbg-json" id="clf_filter_delta" style="font-size:9px;">—</div>
-      </div>
-    </div>
-
-    <!-- Filters -->
-    <div class="dbg-card" id="cardFilters">
-      <div class="dbg-card-header" onclick="toggleCard('cardFilters')">
-        <div class="dbg-card-dot gray" id="dotFilters"></div>
-        <div class="dbg-card-label">Active Filters</div>
-        <div class="dbg-card-badge" id="badgeFilters">—</div>
-        <div class="dbg-card-chevron">▶</div>
-      </div>
-      <div class="dbg-card-body">
-        <div style="font-size:9px;color:#555;margin-bottom:3px;font-weight:700;letter-spacing:0.5px;">AFTER MERGE</div>
-        <div class="filter-diff" id="filterAfter">—</div>
-        <div style="font-size:9px;color:#555;margin:6px 0 3px;font-weight:700;letter-spacing:0.5px;">DELTA APPLIED</div>
-        <div class="dbg-json" id="filterDeltaApplied" style="font-size:9px;">—</div>
-      </div>
-    </div>
-
-    <!-- Routing -->
-    <div class="dbg-card" id="cardRouting">
-      <div class="dbg-card-header" onclick="toggleCard('cardRouting')">
-        <div class="dbg-card-dot gray" id="dotRouting"></div>
-        <div class="dbg-card-label">Routing</div>
-        <div class="dbg-card-badge" id="badgeRouting">—</div>
-        <div class="dbg-card-chevron">▶</div>
-      </div>
-      <div class="dbg-card-body">
-        <div class="dbg-kv">
-          <div class="dbg-k">tier</div>   <div class="dbg-v hi"  id="rt_tier">—</div>
-          <div class="dbg-k">model</div>  <div class="dbg-v"    id="rt_model">—</div>
-          <div class="dbg-k">auth?</div>  <div class="dbg-v dim" id="rt_auth">—</div>
+        <div class="dbg-card-body">
+          <div class="kv">
+            <div class="k">domain</div>    <div class="v hi"  id="dr_domain">—</div>
+            <div class="k">confidence</div><div class="v"     id="dr_conf">—</div>
+            <div class="k">latency</div>   <div class="v dim" id="dr_ms">—</div>
+            <div class="k">cost</div>      <div class="v"     id="dr_cost">—</div>
+            <div class="k">tokens in/out</div><div class="v dim" id="dr_tokens">—</div>
+          </div>
+          <div class="sec-lbl">Prompt sent to model</div>
+          <div class="prompt-box prompt-collapsed" id="dr_prompt">—</div>
+          <div class="expand-btn" onclick="expandPrompt('dr_prompt', this)">▼ show full prompt</div>
+          <div class="sec-lbl">User message</div>
+          <div class="json-box" id="dr_user" style="font-size:9px;">—</div>
         </div>
       </div>
-    </div>
 
-    <!-- Tool Calls -->
-    <div class="dbg-card open" id="cardTools">
-      <div class="dbg-card-header" onclick="toggleCard('cardTools')">
-        <div class="dbg-card-dot gray" id="dotTools"></div>
-        <div class="dbg-card-label">Tool Calls</div>
-        <div class="dbg-card-badge" id="badgeTools">0</div>
-        <div class="dbg-card-chevron">▶</div>
-      </div>
-      <div class="dbg-card-body" id="toolCallsList">
-        <div style="font-size:10px;color:#555;font-family:var(--font-mono);">none this turn</div>
-      </div>
-    </div>
-
-    <!-- LLM -->
-    <div class="dbg-card" id="cardLLM">
-      <div class="dbg-card-header" onclick="toggleCard('cardLLM')">
-        <div class="dbg-card-dot gray" id="dotLLM"></div>
-        <div class="dbg-card-label">LLM</div>
-        <div class="dbg-card-badge" id="badgeLLM">—</div>
-        <div class="dbg-card-chevron">▶</div>
-      </div>
-      <div class="dbg-card-body">
-        <div class="dbg-kv">
-          <div class="dbg-k">model</div>  <div class="dbg-v"    id="llm_model">—</div>
-          <div class="dbg-k">intent</div> <div class="dbg-v dim" id="llm_intent">—</div>
-          <div class="dbg-k">tools</div>  <div class="dbg-v dim" id="llm_tools">—</div>
-          <div class="dbg-k">chunks</div> <div class="dbg-v dim" id="llm_chunks">0</div>
+      <!-- Classifier -->
+      <div class="dbg-card" id="cCLF">
+        <div class="dbg-card-header" onclick="tog('cCLF')">
+          <div class="dbg-dot gray" id="dCLF"></div>
+          <div class="dbg-card-label">Stage 2 · Classifier</div>
+          <div class="dbg-card-badge" id="bCLF">—</div>
+          <div class="dbg-chev">▶</div>
+        </div>
+        <div class="dbg-card-body">
+          <div class="kv">
+            <div class="k">main_intent</div>    <div class="v hi"   id="clf_main">—</div>
+            <div class="k">sub_intent</div>     <div class="v"      id="clf_sub">—</div>
+            <div class="k">pivot</div>           <div class="v"      id="clf_pivot">—</div>
+            <div class="k">clarify</div>         <div class="v warn" id="clf_clarify">—</div>
+            <div class="k">entities</div>        <div class="v"      id="clf_entities">—</div>
+            <div class="k">reasoning</div>       <div class="v dim"  id="clf_reason" style="font-size:9px;">—</div>
+            <div class="k">latency</div>         <div class="v dim"  id="clf_ms">—</div>
+            <div class="k">cost</div>            <div class="v"      id="clf_cost">—</div>
+            <div class="k">tokens in/out</div>   <div class="v dim"  id="clf_tokens">—</div>
+          </div>
+          <div class="sec-lbl">Filter Delta</div>
+          <div class="json-box" id="clf_fd">—</div>
+          <div class="sec-lbl">User message sent</div>
+          <div class="json-box" id="clf_user" style="font-size:9px;">—</div>
         </div>
       </div>
-    </div>
 
-    <!-- SSE Timeline -->
-    <div class="dbg-card open" id="cardTimeline">
-      <div class="dbg-card-header" onclick="toggleCard('cardTimeline')">
-        <div class="dbg-card-dot blue"></div>
-        <div class="dbg-card-label">SSE Timeline</div>
-        <div class="dbg-card-badge" id="badgeTimeline">0</div>
-        <div class="dbg-card-chevron">▶</div>
-      </div>
-      <div class="dbg-card-body">
-        <div class="timeline-scroll" id="dbgEventTimeline">
-          <div style="font-size:10px;color:#555;font-family:var(--font-mono);">waiting…</div>
+      <!-- Active Filters -->
+      <div class="dbg-card" id="cFLT">
+        <div class="dbg-card-header" onclick="tog('cFLT')">
+          <div class="dbg-dot gray" id="dFLT"></div>
+          <div class="dbg-card-label">Active Filters</div>
+          <div class="dbg-card-badge" id="bFLT">—</div>
+          <div class="dbg-chev">▶</div>
+        </div>
+        <div class="dbg-card-body">
+          <div class="sec-lbl">After merge</div>
+          <div class="fdiff" id="flt_after">—</div>
+          <div class="sec-lbl">Delta applied</div>
+          <div class="json-box" id="flt_delta">—</div>
         </div>
       </div>
+
+      <!-- Routing -->
+      <div class="dbg-card" id="cRT">
+        <div class="dbg-card-header" onclick="tog('cRT')">
+          <div class="dbg-dot gray" id="dRT"></div>
+          <div class="dbg-card-label">Routing</div>
+          <div class="dbg-card-badge" id="bRT">—</div>
+          <div class="dbg-chev">▶</div>
+        </div>
+        <div class="dbg-card-body">
+          <div class="kv">
+            <div class="k">tier</div>   <div class="v hi"   id="rt_tier">—</div>
+            <div class="k">model</div>  <div class="v"      id="rt_model">—</div>
+            <div class="k">auth?</div>  <div class="v dim"  id="rt_auth">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Build Prompt -->
+      <div class="dbg-card" id="cBP">
+        <div class="dbg-card-header" onclick="tog('cBP')">
+          <div class="dbg-dot gray" id="dBP"></div>
+          <div class="dbg-card-label">LLM Prompt Built</div>
+          <div class="dbg-card-badge" id="bBP">—</div>
+          <div class="dbg-chev">▶</div>
+        </div>
+        <div class="dbg-card-body">
+          <div class="kv">
+            <div class="k">prompt_file</div>  <div class="v dim" id="bp_file" style="word-break:break-all;font-size:9px;">—</div>
+            <div class="k">tools available</div><div class="v" id="bp_tools">—</div>
+            <div class="k">messages</div>     <div class="v dim" id="bp_msgs">—</div>
+            <div class="k">is_followup</div>  <div class="v dim" id="bp_followup">—</div>
+          </div>
+          <div class="sec-lbl">Available Tools (schemas)</div>
+          <div class="json-box" id="bp_tool_defs" style="font-size:9px;">—</div>
+          <div class="sec-lbl">Full System Prompt</div>
+          <div class="prompt-box prompt-collapsed" id="bp_prompt">—</div>
+          <div class="expand-btn" onclick="expandPrompt('bp_prompt', this)">▼ show full prompt</div>
+        </div>
+      </div>
+
+      <!-- Tool Calls -->
+      <div class="dbg-card open" id="cTC">
+        <div class="dbg-card-header" onclick="tog('cTC')">
+          <div class="dbg-dot gray" id="dTC"></div>
+          <div class="dbg-card-label">Tool Calls</div>
+          <div class="dbg-card-badge" id="bTC">0</div>
+          <div class="dbg-chev">▶</div>
+        </div>
+        <div class="dbg-card-body" id="tcList">
+          <div id="tcPlaceholder" style="font-size:10px;color:#333;font-family:var(--font-mono);">none this turn</div>
+        </div>
+      </div>
+
+      <!-- LLM -->
+      <div class="dbg-card" id="cLLM">
+        <div class="dbg-card-header" onclick="tog('cLLM')">
+          <div class="dbg-dot gray" id="dLLM"></div>
+          <div class="dbg-card-label">LLM Response</div>
+          <div class="dbg-card-badge" id="bLLM">—</div>
+          <div class="dbg-chev">▶</div>
+        </div>
+        <div class="dbg-card-body">
+          <div class="kv">
+            <div class="k">model</div>        <div class="v"      id="llm_model">—</div>
+            <div class="k">intent</div>       <div class="v dim"  id="llm_intent">—</div>
+            <div class="k">tools given</div>  <div class="v dim"  id="llm_tools">—</div>
+            <div class="k">chunks streamed</div><div class="v dim" id="llm_chunks">0</div>
+            <div class="k">tokens in/out</div><div class="v dim"  id="llm_tokens">—</div>
+            <div class="k">cost</div>         <div class="v"      id="llm_cost">—</div>
+            <div class="k">stop_reason</div>  <div class="v dim"  id="llm_stop">—</div>
+            <div class="k">latency</div>      <div class="v dim"  id="llm_ms">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SSE Timeline -->
+      <div class="dbg-card open" id="cTL">
+        <div class="dbg-card-header" onclick="tog('cTL')">
+          <div class="dbg-dot blue"></div>
+          <div class="dbg-card-label">SSE Timeline</div>
+          <div class="dbg-card-badge" id="bTL">0</div>
+          <div class="dbg-chev">▶</div>
+        </div>
+        <div class="dbg-card-body">
+          <div class="tl-scroll" id="tlList">
+            <div style="font-size:9px;color:#333;font-family:var(--font-mono);">waiting…</div>
+          </div>
+        </div>
+      </div>
+
     </div>
   </aside>
-
 </div>
 
 <script>
-  // ── State ─────────────────────────────────────────────────────────────────
-  let conversationId = generateUUID();
-  let tokenId = generateUUID();
-  let turnCount = 0;
-  let isSending = false;
-  let showDebug = false;
-  let currentTurnTools = [];
-  let timelineEntries = [];
-  let llmChunkCount = 0;
-  let timelineCount = 0;
+// ── Pipeline node definitions ─────────────────────────────────────────────
+const NODES = [
+  'safety','normalize','route_domain','classify','validate_slm',
+  'filter_apply','sanitize','derive','clarify','resolve_entities',
+  'route','summary','experiment','fetch_data','respond',
+  'build_prompt','llm','validate_output','followup'
+];
 
-  // ── Init ──────────────────────────────────────────────────────────────────
-  document.getElementById('convIdDisplay').textContent = conversationId;
+// Map pipeline_step names to node names
+const STEP_TO_NODE = {
+  domain_router:  'route_domain',
+  classifier:     'classify',
+  filters:        'filter_apply',
+  routing:        'route',
+  tool_call:      'fetch_data',
+  build_prompt:   'build_prompt',
+  llm_start:      'llm',
+  llm_done:       'llm',
+};
 
-  function generateUUID() {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-      const r = Math.random() * 16 | 0;
-      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+// ── State ─────────────────────────────────────────────────────────────────
+let convId = uuid4();
+let tokenId = uuid4();
+let isSending = false;
+let showRaw = false;
+let llmChunks = 0;
+let tlCount = 0;
+let tcCount = 0;
+let currentTurnCost = 0;
+let llmStartTime = 0;
+
+// Turn history for navigation
+let turnHistory = [];   // [{debug, messages}]
+let turnIdx = -1;       // currently viewed turn (-1 = live)
+
+// Node state for flowchart
+let nodeState = {};     // nodeName → 'pending'|'active'|'done'|'skipped'|'error'
+let nodeTiming = {};    // nodeName → ms
+
+document.getElementById('convIdDisplay').textContent = convId;
+buildFlowchart();
+
+// ── Flowchart ─────────────────────────────────────────────────────────────
+function buildFlowchart() {
+  const el = document.getElementById('pipelineGraph');
+  el.innerHTML = NODES.map(n => `
+    <div class="pg-row">
+      <div class="pg-node pending" id="nd_${n}">
+        <div class="nd-dot"></div>
+        <span>${n.replace('_',' ')}</span>
+        <span class="nd-ms" id="ndms_${n}"></span>
+      </div>
+    </div>`).join('');
+}
+
+function setNode(name, state, ms) {
+  const el = document.getElementById('nd_' + name);
+  const msEl = document.getElementById('ndms_' + name);
+  if (!el) return;
+  el.className = 'pg-node ' + state;
+  if (ms != null && msEl) msEl.textContent = ms + 'ms';
+  nodeState[name] = state;
+  if (ms != null) nodeTiming[name] = ms;
+}
+
+function markNodesUpTo(nodeName, status) {
+  const idx = NODES.indexOf(nodeName);
+  if (idx < 0) return;
+  for (let i = 0; i < idx; i++) {
+    if (nodeState[NODES[i]] === 'pending') setNode(NODES[i], 'done', null);
+  }
+  setNode(nodeName, status === 'active' ? 'active' : 'done', null);
+}
+
+function markRestSkipped(fromNode) {
+  const idx = NODES.indexOf(fromNode);
+  for (let i = idx + 1; i < NODES.length; i++) {
+    if (nodeState[NODES[i]] === 'pending') setNode(NODES[i], 'skipped', null);
+  }
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────
+function uuid4() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+function escHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function tog(id) { document.getElementById(id).classList.toggle('open'); }
+function setEl(id, text, cls) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = String(text ?? '—');
+  if (cls !== undefined) el.className = 'v ' + (cls || '');
+}
+function setHtml(id, html) { const el=document.getElementById(id); if(el) el.innerHTML=html; }
+function setDot(id, color) { const el=document.getElementById(id); if(el) el.className='dbg-dot '+(color||'gray'); }
+function setJson(id, obj) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (!obj || (typeof obj==='object' && !Object.keys(obj).length)) { el.textContent='{}'; return; }
+  el.innerHTML = syntaxHL(JSON.stringify(obj, null, 2));
+}
+function syntaxHL(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/("(\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, m => {
+      let c = 'j-num';
+      if (/^"/.test(m)) c = /:$/.test(m) ? 'j-key' : 'j-str';
+      else if (/true|false/.test(m)) c = 'j-bool';
+      else if (/null/.test(m)) c = 'j-null';
+      return `<span class="${c}">${m}</span>`;
     });
+}
+function costChip(usd) {
+  return `<span class="cost-chip">$${usd.toFixed(6)}</span>`;
+}
+function expandPrompt(id, btn) {
+  const el = document.getElementById(id);
+  if (el.classList.contains('prompt-collapsed')) {
+    el.classList.remove('prompt-collapsed');
+    btn.textContent = '▲ collapse';
+  } else {
+    el.classList.add('prompt-collapsed');
+    btn.textContent = '▼ show full prompt';
+  }
+}
+function setStatus(t) {
+  document.getElementById('statusIndicator').textContent = t;
+  document.getElementById('pgStatus').textContent = t;
+}
+
+// ── Reset per turn ────────────────────────────────────────────────────────
+function resetTurn() {
+  llmChunks = 0; tlCount = 0; tcCount = 0; currentTurnCost = 0; llmStartTime = 0;
+  nodeState = {}; nodeTiming = {};
+  NODES.forEach(n => { setNode(n, 'pending', null); document.getElementById('ndms_' + n).textContent = ''; });
+  setEl('pgCostTotal', '');
+  // Reset dots
+  ['DR','CLF','FLT','RT','BP','TC','LLM'].forEach(s => setDot('d'+s,'gray'));
+  // Reset badges
+  ['DR','CLF','FLT','RT','BP','TC','LLM','TL'].forEach(s => setEl('b'+s,'—'));
+  setEl('bTC','0'); setEl('bTL','0');
+  // Reset KV fields
+  ['dr_domain','dr_conf','dr_ms','dr_cost','dr_tokens','dr_prompt','dr_user'].forEach(s=>setEl(s,'—'));
+  ['clf_main','clf_sub','clf_pivot','clf_clarify','clf_entities','clf_reason','clf_ms','clf_cost','clf_tokens','clf_user'].forEach(s=>setEl(s,'—'));
+  setHtml('clf_fd','—');
+  setHtml('flt_after','—'); setHtml('flt_delta','—');
+  ['rt_tier','rt_model','rt_auth'].forEach(s=>setEl(s,'—'));
+  ['bp_file','bp_tools','bp_msgs','bp_followup'].forEach(s=>setEl(s,'—'));
+  setHtml('bp_tool_defs','—'); setEl('bp_prompt','—');
+  document.getElementById('tcList').innerHTML = '<div id="tcPlaceholder" style="font-size:10px;color:#333;font-family:var(--font-mono);">none this turn</div>';
+  ['llm_model','llm_intent','llm_tools','llm_chunks','llm_tokens','llm_cost','llm_stop','llm_ms'].forEach(s=>setEl(s,'—'));
+  setEl('llm_chunks','0','dim');
+  document.getElementById('tlList').innerHTML = '<div style="font-size:9px;color:#333;font-family:var(--font-mono);">waiting…</div>';
+  // Reset prompt boxes
+  ['dr_prompt','bp_prompt'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && !el.classList.contains('prompt-collapsed')) el.classList.add('prompt-collapsed');
+  });
+}
+
+// ── Pipeline step handler ─────────────────────────────────────────────────
+function handleStep(d) {
+  const step = d.step;
+  const node = STEP_TO_NODE[step];
+  if (node) {
+    markNodesUpTo(node, 'done');
+    setNode(node, 'done', d.latency_ms);
   }
 
-  function newConversation() {
-    conversationId = generateUUID();
-    tokenId = generateUUID();
-    document.getElementById('convIdDisplay').textContent = conversationId;
-    document.getElementById('chatMessages').innerHTML = `
-      <div style="text-align:center; color:#aaa; font-size:13px; margin:auto; padding:40px 20px;">
-        <div style="font-size:28px; margin-bottom:10px;">💬</div>
-        <div style="font-weight:600; color:#666;">New conversation started</div>
-        <div style="margin-top:6px; font-size:12px;">Conversation ID reset</div>
-      </div>`;
-    turnCount = 0;
-    resetDebugPanel();
-  }
-
-  function resetDebugPanel() {
-    currentTurnTools = [];
-    timelineEntries = [];
-    llmChunkCount = 0;
-    timelineCount = 0;
-    document.getElementById('turnCounter').textContent = turnCount;
-    document.getElementById('statusIndicator').textContent = 'Idle';
-    // Reset all cards
-    ['DomainRouter','Classifier','Filters','Routing','LLM'].forEach(n => {
-      setDot('dot'+n, 'gray');
-      setEl('badge'+n, '—');
-    });
-    setEl('badgeTools', '0');
-    setEl('badgeTimeline', '0');
-    setEl('dr_domain','—'); setEl('dr_conf','—'); setEl('dr_latency','—'); setEl('dr_prev','—');
-    setEl('clf_main','—'); setEl('clf_sub','—'); setEl('clf_pivot','—');
-    setEl('clf_clarify','—'); setEl('clf_entities','—'); setEl('clf_latency','—');
-    setEl('clf_reasoning','—'); setEl('clf_filter_delta','—');
-    setEl('filterAfter','—'); setEl('filterDeltaApplied','—');
-    setEl('rt_tier','—'); setEl('rt_model','—'); setEl('rt_auth','—');
-    setEl('llm_model','—'); setEl('llm_intent','—'); setEl('llm_tools','—'); setEl('llm_chunks','0');
-    document.getElementById('toolCallsList').innerHTML =
-      '<div style="font-size:10px;color:#555;font-family:var(--font-mono);">none this turn</div>';
-    document.getElementById('dbgEventTimeline').innerHTML =
-      '<div style="font-size:10px;color:#555;font-family:var(--font-mono);">waiting…</div>';
-  }
-
-  function fillScenario(text) {
-    const input = document.getElementById('chatInput');
-    input.value = text;
-    autoResize(input);
-    input.focus();
-  }
-
-  function toggleDebug() {
-    showDebug = document.getElementById('debugToggle').checked;
-  }
-
-  function autoResize(el) {
-    el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 120) + 'px';
-  }
-
-  function handleKeydown(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      triggerSend();
+  if (step === 'domain_router') {
+    const conf = d.confidence != null ? Math.round(d.confidence * 100) + '%' : '—';
+    setDot('dDR', d.domain === 'out_of_scope' ? 'yellow' : 'green');
+    setEl('bDR', d.domain + ' · ' + conf);
+    setEl('dr_domain', d.domain, d.domain==='out_of_scope'?'warn':'hi');
+    setEl('dr_conf',   conf, parseFloat(conf)<70?'warn':'');
+    setEl('dr_ms',     d.latency_ms + 'ms', 'dim');
+    if (d.cost_usd != null) {
+      setHtml('dr_cost', costChip(d.cost_usd));
+      currentTurnCost += d.cost_usd;
     }
+    setEl('dr_tokens', `${d.input_tokens||0} / ${d.output_tokens||0}`, 'dim');
+    if (d.prompt_preview) setEl('dr_prompt', d.prompt_preview + (d.prompt_preview.length >= 300 ? '\n…[truncated]' : ''));
+    if (d.user_content)   setEl('dr_user', d.user_content);
+    document.getElementById('cDR').classList.add('open');
   }
 
-  function triggerSend() {
-    const input = document.getElementById('chatInput');
-    const text = input.value.trim();
-    if (!text || isSending) return;
-    input.value = '';
-    autoResize(input);
-    sendMessage(text);
+  else if (step === 'classifier') {
+    const main = d.main_intent || '—';
+    const sub  = d.sub_intent  || '—';
+    setDot('dCLF', main==='out_of_scope'?'yellow':'green');
+    setEl('bCLF', main + '/' + sub);
+    setEl('clf_main',    main, 'hi');
+    setEl('clf_sub',     sub);
+    setEl('clf_pivot',   d.pivot ? '⚡ YES' : 'no', d.pivot?'warn':'dim');
+    const clarify = d.clarification_needed;
+    setEl('clf_clarify', clarify || 'null', clarify?'warn':'dim');
+    const ents = (d.entities_mentioned||[]).map(e=>e.name||e).join(', ')||'none';
+    setEl('clf_entities', ents, ents==='none'?'dim':'');
+    setEl('clf_reason',  d.reasoning||'—', 'dim');
+    setEl('clf_ms',      (d.latency_ms||0) + 'ms', 'dim');
+    if (d.cost_usd != null) {
+      setHtml('clf_cost', costChip(d.cost_usd));
+      currentTurnCost += d.cost_usd;
+    }
+    setEl('clf_tokens', `${d.input_tokens||0} / ${d.output_tokens||0}`, 'dim');
+    setJson('clf_fd',   d.filter_delta || {});
+    if (d.user_content) setEl('clf_user', d.user_content);
+    document.getElementById('cCLF').classList.add('open');
+    updateTotalCost();
   }
 
-  // ── Chat rendering ────────────────────────────────────────────────────────
-  function addUserBubble(text) {
-    const messages = document.getElementById('chatMessages');
-    // Remove empty state placeholder if present
-    const placeholder = messages.querySelector('div[style*="margin:auto"]');
+  else if (step === 'filters') {
+    const nKeys = Object.keys(d.after||{}).length;
+    setDot('dFLT', nKeys > 0 ? 'blue' : 'gray');
+    setEl('bFLT', nKeys + ' active');
+    const afterEl = document.getElementById('flt_after');
+    if (afterEl) {
+      const delta = d.delta || {};
+      afterEl.innerHTML = Object.entries(d.after||{}).map(([k,v]) => {
+        const isNew = k in delta;
+        return `<div class="${isNew?'fa':'fk'}">${isNew?'+ ':' '}${escHtml(k)}: ${escHtml(JSON.stringify(v))}</div>`;
+      }).join('') || '<div class="fk">empty</div>';
+    }
+    setJson('flt_delta', d.delta || {});
+  }
+
+  else if (step === 'routing') {
+    const tier = d.tier || '—';
+    const model = d.model || '—';
+    const dotColors = {'0':'yellow','1':'blue','2':'blue','3a':'green','3b':'purple','auth_required':'red'};
+    setDot('dRT', dotColors[tier] || 'gray');
+    setEl('bRT', 'Tier ' + tier + (model?(' · '+model):''));
+    setEl('rt_tier',  'Tier ' + tier, tier==='3b'?'purple':tier==='3a'?'hi':'warn');
+    setEl('rt_model', model);
+    setEl('rt_auth',  d.requires_auth ? '🔒 yes' : 'no', d.requires_auth?'warn':'dim');
+    if (tier==='0'||tier==='1'||tier==='2'||tier==='auth_required') {
+      markRestSkipped('route');
+    }
+    document.getElementById('cRT').classList.add('open');
+  }
+
+  else if (step === 'build_prompt') {
+    const n = (d.tool_names||[]).length;
+    setDot('dBP', 'blue');
+    setEl('bBP', n + ' tools · ' + (d.message_count||0) + ' msgs');
+    setEl('bp_file',     d.prompt_block||'—', 'dim');
+    setEl('bp_tools',    (d.tool_names||[]).join(', ')||'none', n>0?'':'dim');
+    setEl('bp_msgs',     (d.message_count||0) + ' messages', 'dim');
+    setEl('bp_followup', d.is_followup ? 'yes (templates emitted before)' : 'no', 'dim');
+    if (d.tool_definitions && d.tool_definitions.length) {
+      setHtml('bp_tool_defs', syntaxHL(JSON.stringify(d.tool_definitions, null, 2)));
+    } else {
+      setEl('bp_tool_defs', 'none');
+    }
+    if (d.system_prompt) {
+      const el = document.getElementById('bp_prompt');
+      if (el) el.textContent = d.system_prompt;
+    }
+    document.getElementById('cBP').classList.add('open');
+  }
+
+  else if (step === 'tool_call') {
+    setDot('dTC', 'green');
+    tcCount++;
+    setEl('bTC', tcCount);
+    const placeholder = document.getElementById('tcPlaceholder');
     if (placeholder) placeholder.remove();
-
+    const list = document.getElementById('tcList');
+    const params = d.params || {};
+    const paramStr = Object.entries(params).slice(0,4).map(([k,v])=>`${k}=${JSON.stringify(v)}`).join(', ');
     const row = document.createElement('div');
-    row.className = 'chat-row user';
-    row.innerHTML = `
-      <div class="avatar user">U</div>
-      <div class="bubble">${escHtml(text)}</div>`;
-    messages.appendChild(row);
-    scrollToBottom();
+    row.className = 'tc-row';
+    row.innerHTML = `<div><span class="tc-name">${escHtml(d.tool||'?')}</span><span class="tc-latency">${escHtml(d.latency_ms!=null?(d.latency_ms+'ms'):'')}</span></div>
+      <div class="tc-params">${escHtml(paramStr||'(no params)')}</div>
+      ${d.result_summary?`<div class="tc-result">→ ${escHtml(d.result_summary)}</div>`:''}`;
+    list.appendChild(row);
+    document.getElementById('cTC').classList.add('open');
   }
 
-  function addBotBubble(initialText) {
-    const messages = document.getElementById('chatMessages');
-    const row = document.createElement('div');
-    row.className = 'chat-row bot';
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble';
-    bubble.innerHTML = escHtml(initialText);
-    row.innerHTML = '<div class="avatar bot">H</div>';
-    row.appendChild(bubble);
-    messages.appendChild(row);
-    scrollToBottom();
-    return bubble;
+  else if (step === 'llm_start') {
+    llmStartTime = Date.now();
+    const model = (d.model||'').replace('claude-','').replace('-20251001','').replace(/-4-5/,'4.5');
+    setDot('dLLM', 'purple');
+    setEl('bLLM', model);
+    setEl('llm_model',  d.model||'—');
+    setEl('llm_intent', d.intent||'—', 'dim');
+    setEl('llm_tools',  (d.tools_available||0) + ' tools', 'dim');
+    document.getElementById('cLLM').classList.add('open');
   }
 
-  function addErrorBubble(message) {
-    const messages = document.getElementById('chatMessages');
-    const row = document.createElement('div');
-    row.className = 'chat-row bot';
-    row.innerHTML = `
-      <div class="avatar bot">H</div>
-      <div class="error-bubble">${escHtml(message)}</div>`;
-    messages.appendChild(row);
-    scrollToBottom();
-  }
-
-  function renderTemplate(bubble, templateId, data) {
-    if (templateId === 'property_carousel' || templateId === 'property_list') {
-      const items = data.items || data.properties || [];
-      if (!items.length) return;
-      const cardsHtml = items.map(p => `
-        <div class="tpl-card">
-          <div class="tpl-title">${escHtml(p.name || p.title || 'Property')}</div>
-          <div class="tpl-price">${escHtml(p.price || p.expectedPrice || '—')}</div>
-          <div class="tpl-meta">${escHtml(p.bhk || '')} ${escHtml(p.locality || p.area || '')}</div>
-          <div class="tpl-highlights">
-            ${(p.highlights || p.features || []).map(h => `<span class="tpl-chip">${escHtml(h)}</span>`).join('')}
-          </div>
-        </div>`).join('');
-      bubble.innerHTML += `<div class="template-cards">${cardsHtml}</div>`;
-    } else if (templateId === 'locality_carousel' || templateId === 'locality_list') {
-      const items = data.localities || data.items || [];
-      if (!items.length) return;
-      const chipsHtml = items.map(l =>
-        `<span class="locality-chip">${escHtml(l.name || l)}</span>`).join('');
-      bubble.innerHTML += `<div class="locality-chips">${chipsHtml}</div>`;
-    } else if (templateId === 'login_required' || templateId === 'login') {
-      bubble.innerHTML += `
-        <div class="login-required-box">
-          <div class="lr-title">Login Required</div>
-          <div class="lr-sub">${escHtml(data.message || 'Please log in to continue.')}</div>
-        </div>`;
-    } else if (templateId === 'qna' || templateId === 'nested_qna') {
-      const question = data.question || '';
-      const options = data.options || [];
-      const optBtns = options.map(o =>
-        `<button class="qna-option-btn" onclick="fillScenario('${escAttr(o.label || o)}')">${escHtml(o.label || o)}</button>`
-      ).join('');
-      bubble.innerHTML += `
-        <div style="font-size:13px; color:#444; margin-top:4px;">${escHtml(question)}</div>
-        <div class="qna-options">${optBtns}</div>`;
+  else if (step === 'llm_done') {
+    const ms = llmStartTime ? (Date.now() - llmStartTime) : null;
+    if (d.cost_usd != null) {
+      setHtml('llm_cost', costChip(d.cost_usd));
+      currentTurnCost += d.cost_usd;
+      updateTotalCost();
     }
+    setEl('llm_tokens', `${d.input_tokens||0} / ${d.output_tokens||0}`, 'dim');
+    setEl('llm_stop',   d.stop_reason||'—', d.stop_reason==='max_tokens'?'warn':'dim');
+    if (ms) setEl('llm_ms', ms + 'ms', 'dim');
+    setEl('llm_chunks', llmChunks, 'hi');
+    setEl('bLLM', `$${d.cost_usd?.toFixed(5)||'?'} · ${d.output_tokens||'?'}tok`);
   }
+}
 
-  function scrollToBottom() {
-    const m = document.getElementById('chatMessages');
-    m.scrollTop = m.scrollHeight;
+function updateTotalCost() {
+  if (currentTurnCost > 0) {
+    setHtml('pgCostTotal', `<span style="color:#f59e0b;font-size:10px;font-family:var(--font-mono);">$${currentTurnCost.toFixed(5)} turn</span>`);
   }
+}
 
-  // ── Card helpers ──────────────────────────────────────────────────────────
-  function toggleCard(id) {
-    document.getElementById(id).classList.toggle('open');
-  }
-  function openCard(id) {
-    document.getElementById(id).classList.add('open');
-  }
-  function setDot(id, color) {
-    const el = document.getElementById(id);
-    if (el) { el.className = 'dbg-card-dot ' + color; }
-  }
-  function setEl(id, text, cls) {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.textContent = text;
-    if (cls) el.className = 'dbg-v ' + cls;
-  }
-  function setJson(id, obj) {
-    const el = document.getElementById(id);
-    if (!el) return;
-    if (!obj || (typeof obj === 'object' && !Object.keys(obj).length)) {
-      el.textContent = '{}';
-      return;
-    }
-    el.innerHTML = syntaxHighlight(JSON.stringify(obj, null, 2));
-  }
-  function syntaxHighlight(json) {
-    return json
-      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-      .replace(/("(\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, m => {
-        let cls = 'j-num';
-        if (/^"/.test(m)) cls = /:$/.test(m) ? 'j-key' : 'j-str';
-        else if (/true|false/.test(m)) cls = 'j-bool';
-        else if (/null/.test(m)) cls = 'j-null';
-        return `<span class="${cls}">${m}</span>`;
-      });
-  }
+// ── SSE event handler ─────────────────────────────────────────────────────
+function handleSSE(type, data, bubble) {
+  addTimeline(type, data);
 
-  // ── Pipeline step renderer ────────────────────────────────────────────────
-  function handlePipelineStep(data) {
-    const step = data.step;
+  switch (type) {
+    case 'connection_ack':
+      setStatus('⚡ Running');
+      setNode('safety','done'); setNode('normalize','done');
+      break;
 
-    if (step === 'domain_router') {
-      const domain = data.domain || '—';
-      const conf   = data.confidence != null ? (data.confidence * 100).toFixed(0) + '%' : '—';
-      const ms     = data.latency_ms != null ? data.latency_ms + 'ms' : '—';
-      const dotColor = domain === 'out_of_scope' ? 'yellow' : 'green';
-      setDot('dotDomainRouter', dotColor);
-      setEl('badgeDomainRouter', domain + ' · ' + conf);
-      setEl('dr_domain',  domain,  domain === 'out_of_scope' ? 'warn' : 'hi');
-      setEl('dr_conf',    conf,    parseFloat(conf) < 70 ? 'warn' : '');
-      setEl('dr_latency', ms,      'dim');
-      setEl('dr_prev',    data.prev_domain || '—', 'dim');
-      if (data.coerced) setEl('dr_domain', domain + ' (coerced)', 'warn');
-    }
+    case 'pipeline_step':
+      handleStep(data);
+      break;
 
-    else if (step === 'classifier') {
-      const main = data.main_intent || '—';
-      const sub  = data.sub_intent  || '—';
-      const ms   = data.latency_ms != null ? data.latency_ms + 'ms' : '—';
-      setDot('dotClassifier', main === 'out_of_scope' ? 'yellow' : 'green');
-      setEl('badgeClassifier', main + '/' + sub);
-      setEl('clf_main',      main, 'hi');
-      setEl('clf_sub',       sub);
-      setEl('clf_pivot',     data.pivot ? '⚡ YES' : 'no', data.pivot ? 'warn' : 'dim');
-      setEl('clf_clarify',   data.clarification_needed || 'null', data.clarification_needed ? 'warn' : 'dim');
-      const ents = (data.entities_mentioned || []).map(e => e.name || e).join(', ') || 'none';
-      setEl('clf_entities',  ents, ents === 'none' ? 'dim' : '');
-      setEl('clf_latency',   ms, 'dim');
-      setEl('clf_reasoning', data.reasoning || '—', 'dim');
-      setJson('clf_filter_delta', data.filter_delta || {});
-      openCard('cardClassifier');
-    }
+    case 'message_delta':
+      llmChunks++;
+      setEl('llm_chunks', llmChunks, 'hi');
+      setNode('llm', 'active', null);
+      break;
 
-    else if (step === 'filters') {
-      const delta  = data.delta  || {};
-      const after  = data.after  || {};
-      const nKeys  = Object.keys(after).length;
-      setDot('dotFilters', nKeys > 0 ? 'blue' : 'gray');
-      setEl('badgeFilters', nKeys + ' active');
-      // Show after state as key-value diffs
-      const filterEl = document.getElementById('filterAfter');
-      if (filterEl) {
-        filterEl.innerHTML = Object.entries(after).map(([k, v]) => {
-          const isNew = delta && delta[k] !== undefined;
-          const cls   = isNew ? 'filter-add' : 'filter-keep';
-          const prefix = isNew ? '+ ' : '  ';
-          return `<div class="${cls}">${escHtml(prefix + k + ': ' + JSON.stringify(v))}</div>`;
-        }).join('') || '<div class="filter-keep dim">empty</div>';
+    case 'chat_event': {
+      const c = data.content || {};
+      const tpl = c.templateId || c.template_id;
+      if (tpl && bubble) renderTemplate(bubble, tpl, c.data||{});
+      // Mark downstream nodes done when we get final COMPLETED event
+      if (data.sourceMessageState === 'COMPLETED') {
+        ['llm','validate_output','followup'].forEach(n => setNode(n,'done',null));
       }
-      setJson('filterDeltaApplied', delta);
+      break;
     }
 
-    else if (step === 'routing') {
-      const tier  = data.tier  || '—';
-      const model = data.model || '—';
-      const tierColors = {'0':'yellow','1':'blue','2':'blue','3a':'green','3b':'purple','auth_required':'red'};
-      setDot('dotRouting', tierColors[tier] || 'gray');
-      setEl('badgeRouting', 'Tier ' + tier + (model ? ' · ' + model : ''));
-      setEl('rt_tier',  'Tier ' + tier, tier === '3b' ? 'purple' : tier === '3a' ? 'hi' : 'warn');
-      setEl('rt_model', model || '—');
-      setEl('rt_auth',  data.requires_auth ? '🔒 yes' : 'no', data.requires_auth ? 'warn' : 'dim');
-      openCard('cardRouting');
-    }
+    case 'connection_close':
+      setStatus('Done ✓');
+      NODES.forEach(n => { if (nodeState[n] === 'active') setNode(n,'done',null); });
+      break;
 
-    else if (step === 'tool_call') {
-      const tool    = data.tool    || '—';
-      const summary = data.result_summary || '';
-      const ms      = data.latency_ms != null ? data.latency_ms + 'ms' : '';
-      const params  = data.params  || {};
-
-      setDot('dotTools', 'green');
-      currentTurnTools.push({ tool, params, summary, ms });
-      setEl('badgeTools', currentTurnTools.length);
-
-      const listEl = document.getElementById('toolCallsList');
-      // Remove placeholder
-      if (listEl.querySelector('div[style*="none this turn"]')) listEl.innerHTML = '';
-      const row = document.createElement('div');
-      row.className = 'tool-call-row';
-      const paramStr = Object.entries(params).slice(0, 3).map(([k,v]) => `${k}=${JSON.stringify(v)}`).join(', ');
-      row.innerHTML = `
-        <div><span class="tool-name">${escHtml(tool)}</span><span class="tool-latency">${escHtml(ms)}</span></div>
-        <div class="tool-params">${escHtml(paramStr || '{}')}</div>
-        ${summary ? `<div class="tool-result">→ ${escHtml(summary)}</div>` : ''}`;
-      listEl.appendChild(row);
-      openCard('cardTools');
-    }
-
-    else if (step === 'llm_start') {
-      const model = (data.model || '').replace('claude-', '').replace('-20251001','').replace('-4-5','4.5');
-      setDot('dotLLM', 'purple');
-      setEl('badgeLLM', model);
-      setEl('llm_model',  data.model || '—');
-      setEl('llm_intent', data.intent || '—', 'dim');
-      setEl('llm_tools',  data.tools_available + ' available', 'dim');
-      llmChunkCount = 0;
-      setEl('llm_chunks', '0', 'dim');
-      openCard('cardLLM');
+    case 'error': {
+      const msg = data.message || JSON.stringify(data);
+      if (bubble) bubble.innerHTML += `<div class="error-bubble">${escHtml(msg)}</div>`;
+      else addErrBubble(msg);
+      setStatus('⚠ Error');
+      break;
     }
   }
+}
 
-  // ── SSE handling ──────────────────────────────────────────────────────────
-  function handleSSEEvent(eventType, data, bubbleRef) {
-    addTimelineEntry(eventType, data);
+// ── Timeline ──────────────────────────────────────────────────────────────
+function addTimeline(type, data) {
+  const el = document.getElementById('tlList');
+  const ph = el.querySelector('div[style*="waiting"]');
+  if (ph) ph.remove();
+  tlCount++;
+  setEl('bTL', tlCount);
+  const step = (type==='pipeline_step'&&data?.step) ? data.step : '';
+  const meta = step || (data?.sequenceNumber!=null?'seq:'+data.sequenceNumber:'');
+  const cls  = type==='pipeline_step'?'step':type==='error'?'err':'';
+  const row  = document.createElement('div');
+  row.className = 'tl-row';
+  row.innerHTML = `<span class="tl-t ${cls}">${escHtml(type)}</span><span class="tl-m">${escHtml(meta)}</span>`;
+  el.appendChild(row);
+  el.scrollTop = el.scrollHeight;
+}
 
-    // Conditionally append raw SSE to the last bubble
-    if (showDebug && bubbleRef) {
-      let rawBox = bubbleRef.querySelector('.raw-sse-box');
-      if (!rawBox) {
-        rawBox = document.createElement('pre');
-        rawBox.className = 'raw-sse-box';
-        bubbleRef.appendChild(rawBox);
-      }
-      rawBox.textContent += `[${eventType}] ${JSON.stringify(data, null, 2)}\n\n`;
-    }
-
-    switch (eventType) {
-      case 'connection_ack':
-        setStatus('⚡ Connected');
-        break;
-
-      case 'pipeline_step':
-        handlePipelineStep(data);
-        break;
-
-      case 'message_delta':
-        llmChunkCount++;
-        setEl('llm_chunks', llmChunkCount, 'hi');
-        break;
-
-      case 'chat_event': {
-        const content = data.content || {};
-        const templateId = content.templateId || content.template_id;
-        const tplData = content.data || {};
-        if (templateId && bubbleRef) renderTemplate(bubbleRef, templateId, tplData);
-        break;
-      }
-
-      case 'connection_close':
-        setStatus('Done ✓');
-        break;
-
-      case 'out_of_scope':
-        if (bubbleRef) {
-          bubbleRef.innerHTML += `<div style="font-size:11px;color:#999;margin-top:4px;font-style:italic;">[out of scope]</div>`;
-        }
-        break;
-
-      case 'error': {
-        const msg = data.message || JSON.stringify(data);
-        if (bubbleRef) {
-          bubbleRef.innerHTML += `<div class="error-bubble" style="margin-top:6px;">${escHtml(msg)}</div>`;
-        } else {
-          addErrorBubble(msg);
-        }
-        setStatus('⚠ Error');
-        break;
-      }
-
-      default:
-        break;
-    }
-  }
-
-  // ── Send message (SSE fetch loop) ─────────────────────────────────────────
-  async function sendMessage(text) {
-    if (isSending) return;
-    isSending = true;
-    setSendDisabled(true);
-    setStatus('Sending…');
-    // Reset per-turn debug state
-    currentTurnTools = [];
-    llmChunkCount = 0;
-    timelineCount = 0;
-    ['DomainRouter','Classifier','Filters','Routing','LLM','Tools'].forEach(n => {
-      setDot('dot'+n, 'gray');
+// ── Template rendering ────────────────────────────────────────────────────
+function renderTemplate(bubble, tpl, data) {
+  if (tpl === 'property_carousel') {
+    const items = data.properties || data.items || [];
+    if (!items.length) return;
+    const html = items.map(p => `
+      <div class="tpl-card">
+        <div class="tpl-title">${escHtml(p.title||p.name||'Property')}</div>
+        <div class="tpl-price">${escHtml(p.price_display||p.price||'')}</div>
+        <div class="tpl-meta">${escHtml(p.bhk?p.bhk+'BHK':'')} ${escHtml((p.locality?.name||p.locality||''))}</div>
+        <div class="tpl-highlights">${(p.amenities||[]).slice(0,3).map(a=>`<span class="tpl-chip">${escHtml(a)}</span>`).join('')}</div>
+      </div>`).join('');
+    bubble.innerHTML += `<div class="template-cards">${html}</div>`;
+  } else if (tpl === 'locality_carousel') {
+    const locs = data.localities || [];
+    if (!locs.length) return;
+    bubble.innerHTML += `<div class="locality-chips">${locs.map(l=>`<span class="locality-chip">${escHtml(l.name||l)}</span>`).join('')}</div>`;
+  } else if (tpl === 'nested_qna') {
+    const sels = data.selections || [];
+    sels.forEach(s => {
+      const opts = (s.options||[]).map(o=>`<button class="qna-opt-btn" onclick="fill('${escHtml(o.label||o)}')">${escHtml(o.label||o)}</button>`).join('');
+      bubble.innerHTML += `<div style="font-size:13px;color:#333;margin-top:5px;">${escHtml(s.title||'')}</div><div class="qna-options">${opts}</div>`;
     });
-    setEl('badgeTools','0');
-    document.getElementById('toolCallsList').innerHTML =
-      '<div style="font-size:10px;color:#555;font-family:var(--font-mono);">none this turn</div>';
+  } else if (tpl === 'login' || tpl === 'login_required') {
+    bubble.innerHTML += `<div class="login-required-box"><div style="font-weight:700;color:var(--red);">Login Required</div><div style="font-size:11px;color:#888;">${escHtml(data.message||'Please log in.')}</div></div>`;
+  } else if (tpl === 'text_response') {
+    if (data.text) bubble.innerHTML += `<div style="margin-top:4px;">${escHtml(data.text)}</div>`;
+  }
+}
 
-    addUserBubble(text);
+// ── Send message ──────────────────────────────────────────────────────────
+async function doSend() {
+  const input = document.getElementById('chatInput');
+  const text = input.value.trim();
+  if (!text || isSending) return;
+  input.value = ''; autoResize(input);
+  await sendMessage(text);
+}
 
-    const body = {
-      conversationId: conversationId,
-      sender: { type: 'user' },
-      messageType: 'text',
-      content: { text },
-      responseRequired: true,
-    };
+async function sendMessage(text) {
+  if (isSending) return;
+  isSending = true;
+  setSendDisabled(true);
+  setStatus('Sending…');
 
-    let currentBotBubble = null;
+  // Save current turn debug snapshot if we're navigating
+  if (turnIdx >= 0) turnIdx = -1; // jump to live
 
-    try {
-      const response = await fetch('/api/v1/chat/send-message-streamed', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Session-Token': tokenId,
-        },
-        body: JSON.stringify(body),
-      });
+  resetTurn();
+  removeEmpty();
+  addUserBubble(text);
 
-      if (!response.ok && response.status !== 200) {
-        // Try to read error
-        const errText = await response.text();
-        addErrorBubble(`HTTP ${response.status}: ${errText}`);
-        setStatus('Error');
-        isSending = false;
-        setSendDisabled(false);
-        return;
-      }
+  const body = { conversationId: convId, sender:{type:'user'}, messageType:'text', content:{text}, responseRequired:true };
+  let bubble = null;
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
+  try {
+    const resp = await fetch('/api/v1/chat/send-message-streamed', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Session-Token':tokenId},
+      body: JSON.stringify(body),
+    });
 
-      currentBotBubble = addBotBubble('');
-      setStatus('Streaming…');
+    if (!resp.ok) { addErrBubble('HTTP ' + resp.status); setSendDisabled(false); isSending=false; return; }
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop(); // keep partial line
+    const reader = resp.body.getReader();
+    const dec    = new TextDecoder();
+    let buf = '';
+    bubble = addBotBubble('');
 
-        let eventType = null;
-        for (const line of lines) {
-          if (line.startsWith('event:')) {
-            eventType = line.slice(6).trim();
-          } else if (line.startsWith('data:') && eventType) {
-            try {
-              const data = JSON.parse(line.slice(5).trim());
-              handleSSEEvent(eventType, data, currentBotBubble);
-
-              // Append text delta directly to bubble
-              if (eventType === 'message_delta') {
-                const chunk = (data.content && data.content.text) || data.text || '';
-                if (chunk) {
-                  // Append as text node to avoid XSS while allowing streamed text
-                  const rawBox = currentBotBubble.querySelector('.raw-sse-box');
-                  if (rawBox) {
-                    // Insert text before rawBox
-                    currentBotBubble.insertBefore(
-                      document.createTextNode(chunk), rawBox);
-                  } else {
-                    currentBotBubble.appendChild(document.createTextNode(chunk));
-                  }
-                  scrollToBottom();
-                }
-              }
-
-              // Also grab text from chat_event if present
-              if (eventType === 'chat_event') {
-                const content = data.content || {};
-                const textVal = content.text || '';
-                if (textVal && !content.templateId && !content.template_id) {
-                  // Only set if bubble is empty (no streamed text came before)
-                  const existingText = currentBotBubble.innerText.trim();
-                  if (!existingText) {
-                    currentBotBubble.innerHTML = escHtml(textVal);
-                  }
-                }
-              }
-            } catch (e) {
-              // Parse error — ignore malformed SSE data
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream:true});
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      let evType = null;
+      for (const line of lines) {
+        if (line.startsWith('event:')) { evType = line.slice(6).trim(); }
+        else if (line.startsWith('data:') && evType) {
+          try {
+            const data = JSON.parse(line.slice(5).trim());
+            handleSSE(evType, data, bubble);
+            if (evType === 'message_delta') {
+              const chunk = (data.content && data.content.text) || '';
+              if (chunk) { bubble.appendChild(document.createTextNode(chunk)); scrollBottom(); }
             }
-            eventType = null;
-          }
+            if (evType === 'chat_event') {
+              const cv = (data.content||{}).text;
+              const tpl = (data.content||{}).templateId;
+              if (cv && !tpl) {
+                const existing = bubble.innerText.trim();
+                if (!existing) bubble.textContent = cv;
+              }
+            }
+          } catch(e) {}
+          evType = null;
         }
       }
-
-      // Flush any remaining buffer
-      if (buffer.trim()) {
-        // attempt parse of last partial frame — ignore errors
-      }
-
-      turnCount++;
-      document.getElementById('turnCounter').textContent = turnCount;
-      setStatus('Done');
-
-      // If bubble is completely empty, show a placeholder
-      if (currentBotBubble && currentBotBubble.innerText.trim() === '') {
-        currentBotBubble.innerHTML = '<span style="color:#aaa;font-style:italic;">No text response received</span>';
-      }
-
-    } catch (err) {
-      addErrorBubble(`Connection error: ${err.message}`);
-      setStatus('Error');
-    } finally {
-      isSending = false;
-      setSendDisabled(false);
-      scrollToBottom();
     }
+
+    // Store turn snapshot for navigation
+    const turnSnap = { text, debug: captureDebugSnapshot() };
+    turnHistory.push(turnSnap);
+    updateTurnNav();
+
+  } catch(err) { addErrBubble('Connection error: ' + err.message); setStatus('Error'); }
+  finally {
+    if (bubble && !bubble.innerText.trim()) {
+      bubble.innerHTML = '<span style="color:#aaa;font-style:italic;">No text response received</span>';
+    }
+    isSending = false; setSendDisabled(false); scrollBottom();
   }
+}
 
-  // ── Debug helpers ─────────────────────────────────────────────────────────
-  function addTimelineEntry(type, data) {
-    const el = document.getElementById('dbgEventTimeline');
-    const placeholder = el.querySelector('div[style*="color:#555"]');
-    if (placeholder) placeholder.remove();
+// ── Turn navigation ───────────────────────────────────────────────────────
+function captureDebugSnapshot() {
+  // Capture current debug state as JSON
+  return {
+    nodeState: {...nodeState},
+    nodeTiming: {...nodeTiming},
+    cost: currentTurnCost,
+  };
+}
 
-    timelineCount++;
-    setEl('badgeTimeline', timelineCount);
+function updateTurnNav() {
+  const n = turnHistory.length;
+  document.getElementById('turnNavLabel').textContent = `Turn ${n} / ${n}`;
+  document.getElementById('btnPrev').disabled = n < 2;
+  document.getElementById('btnNext').disabled = true;
+}
 
-    const seq   = (data && data.sequenceNumber != null) ? 'seq:' + data.sequenceNumber : '';
-    const step  = (type === 'pipeline_step' && data && data.step) ? data.step : '';
-    const cls   = type === 'error' ? 'tl-err' : type === 'pipeline_step' ? 'tl-step' : '';
+function navTurn(dir) {
+  const n = turnHistory.length;
+  if (n === 0) return;
+  let idx = turnIdx < 0 ? n - 1 : turnIdx;
+  idx = Math.max(0, Math.min(n - 1, idx + dir));
+  turnIdx = idx;
+  document.getElementById('turnNavLabel').textContent = `Turn ${idx + 1} / ${n}`;
+  document.getElementById('btnPrev').disabled = idx === 0;
+  document.getElementById('btnNext').disabled = idx === n - 1;
+  // Show this turn's message in chat (simple: scroll to it)
+  // For now just update the nav label; full replay is a future enhancement
+}
 
-    const row = document.createElement('div');
-    row.className = 'tl-row';
-    row.innerHTML = `<span class="tl-type ${cls}">${escHtml(type)}</span>
-      <span class="tl-meta">${escHtml(step || seq)}</span>`;
-    el.appendChild(row);
-    el.scrollTop = el.scrollHeight;
-  }
+// ── New conversation ──────────────────────────────────────────────────────
+function newConversation() {
+  convId = uuid4(); tokenId = uuid4();
+  document.getElementById('convIdDisplay').textContent = convId;
+  document.getElementById('chatMessages').innerHTML = `
+    <div id="emptyState" style="text-align:center;color:#aaa;font-size:13px;margin:auto;padding:40px 20px;">
+      <div style="font-size:26px;margin-bottom:8px;">💬</div>
+      <div style="font-weight:600;color:#666;">New conversation</div>
+    </div>`;
+  turnHistory = []; turnIdx = -1;
+  document.getElementById('turnNavLabel').textContent = 'Turn 0 / 0';
+  document.getElementById('btnPrev').disabled = true;
+  document.getElementById('btnNext').disabled = true;
+  resetTurn();
+  setStatus('Idle');
+}
 
-  function renderToolCalls() { /* kept for compat — now handled in handlePipelineStep */ }
-
-  function setStatus(text) {
-    document.getElementById('statusIndicator').textContent = text;
-  }
-
-  function setSendDisabled(disabled) {
-    document.getElementById('sendBtn').disabled = disabled;
-    document.getElementById('chatInput').disabled = disabled;
-  }
-
-  // ── Utilities ─────────────────────────────────────────────────────────────
-  function escHtml(str) {
-    if (str === undefined || str === null) return '';
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
-  function escAttr(str) {
-    return escHtml(str).replace(/\n/g, ' ');
-  }
+// ── Chat rendering ────────────────────────────────────────────────────────
+function removeEmpty() {
+  const el = document.getElementById('emptyState');
+  if (el) el.remove();
+}
+function addUserBubble(text) {
+  const msgs = document.getElementById('chatMessages');
+  const row = document.createElement('div');
+  row.className = 'chat-row user';
+  row.innerHTML = `<div class="avatar user">U</div><div class="bubble">${escHtml(text)}</div>`;
+  msgs.appendChild(row); scrollBottom();
+}
+function addBotBubble(text) {
+  const msgs = document.getElementById('chatMessages');
+  const row = document.createElement('div');
+  row.className = 'chat-row bot';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  if (text) bubble.textContent = text;
+  row.innerHTML = '<div class="avatar bot">H</div>';
+  row.appendChild(bubble);
+  msgs.appendChild(row); scrollBottom();
+  return bubble;
+}
+function addErrBubble(msg) {
+  const msgs = document.getElementById('chatMessages');
+  const row = document.createElement('div');
+  row.className = 'chat-row bot';
+  row.innerHTML = `<div class="avatar bot">H</div><div class="error-bubble">${escHtml(msg)}</div>`;
+  msgs.appendChild(row); scrollBottom();
+}
+function scrollBottom() { const m=document.getElementById('chatMessages'); m.scrollTop=m.scrollHeight; }
+function setSendDisabled(d) {
+  document.getElementById('sendBtn').disabled = d;
+  document.getElementById('chatInput').disabled = d;
+}
+function fill(t) { const el=document.getElementById('chatInput'); el.value=t; autoResize(el); el.focus(); }
+function autoResize(el) { el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,110)+'px'; }
+function handleKey(e) { if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); doSend(); } }
 </script>
 </body>
 </html>
