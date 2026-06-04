@@ -96,7 +96,7 @@ def build_graph(
     graph.add_node('filter_apply',     _no_op_safe(partial(filter_apply_node,             emit_sse=emit_sse)))
     graph.add_node('sanitize',         _no_op_safe(sanitize_node))
     graph.add_node('derive',           derive_node)
-    graph.add_node('clarify',          _no_op_safe(clarify_node))
+    graph.add_node('clarify',          _no_op_safe(partial(clarify_node, emit_sse=emit_sse)))
     graph.add_node('resolve_entities', _no_op_safe(partial(resolve_entities_node, executor=executor)))
     graph.add_node('route',            partial(route_node, executor=executor,      emit_sse=emit_sse))
     graph.add_node('summary',          _no_op_safe(partial(summary_node,        emit_sse=emit_sse)))

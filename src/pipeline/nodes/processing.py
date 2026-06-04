@@ -563,7 +563,9 @@ async def route_node(state: BotState, executor=None, emit_sse=None) -> dict:
         if emit_sse:
             emit_sse("pipeline_step", {"step": "routing", "tier": "auth_required",
                                        "main_intent": main_intent, "sub_intent": sub_intent})
-        return {'bot_response': build_login_template_response(main_intent, sub_intent)}
+        bot_response = build_login_template_response(main_intent, sub_intent)
+        _emit_bot_response(bot_response, state, emit_sse)
+        return {'bot_response': bot_response}
 
     routing = {'tier': record.tier, 'model': record.model}
 
@@ -578,11 +580,19 @@ async def route_node(state: BotState, executor=None, emit_sse=None) -> dict:
         })
 
     if routing['tier'] == 0:
-        return {'routing': routing, 'bot_response': build_out_of_scope_response(c)}
+        bot_response = build_out_of_scope_response(c)
+        _emit_bot_response(bot_response, state, emit_sse)
+        return {'routing': routing, 'bot_response': bot_response}
+
     if routing['tier'] == 1:
-        return {'routing': routing, 'bot_response': await execute_tier1_action(state)}
+        bot_response = await execute_tier1_action(state)
+        _emit_bot_response(bot_response, state, emit_sse)
+        return {'routing': routing, 'bot_response': bot_response}
+
     if routing['tier'] == 2:
-        return {'routing': routing, 'bot_response': await execute_tier2_action(state, executor=executor)}
+        bot_response = await execute_tier2_action(state, executor=executor)
+        _emit_bot_response(bot_response, state, emit_sse)
+        return {'routing': routing, 'bot_response': bot_response}
 
     return {'routing': routing}
 
@@ -728,7 +738,50 @@ async def derive_node(state: BotState) -> dict:
 # Node: clarify_node  (CHAT-P-010b)
 # ---------------------------------------------------------------------------
 
-async def clarify_node(state: BotState) -> dict:
+# ---------------------------------------------------------------------------
+# _emit_bot_response — shared helper for early-exit response emission
+# ---------------------------------------------------------------------------
+
+def _emit_bot_response(bot_response: dict, state: BotState, emit_sse) -> None:
+    """Emit a bot_response dict as a chat_event SSE frame.
+
+    Called by nodes that short-circuit the pipeline (clarify_node, route_node
+    for Tier 0/1/2) so the response actually reaches the client.  Without this,
+    bot_response sits in state and nothing sends it over the wire.
+    """
+    if not emit_sse or not bot_response:
+        return
+
+    import uuid as _uuid
+    from datetime import datetime
+    from src.api.models import ChatEventToUser, MessageContent
+
+    template_id = bot_response.get("template_id")
+    data        = bot_response.get("data") or {}
+    text        = data.get("text") if isinstance(data, dict) else None
+    session     = state.get("session") or {}
+
+    msg_type = "template" if template_id and template_id != "text_response" else "text"
+    msg_text = None if msg_type == "template" else (text or "")
+    tpl_id   = template_id if msg_type == "template" else None
+    tpl_data = data        if msg_type == "template" else None
+
+    event = ChatEventToUser(
+        conversation_id      = session.get("session_id", ""),
+        message_id           = str(_uuid.uuid4()),
+        source_message_id    = state.get("request_id", ""),
+        message_type         = msg_type,
+        message_state        = "COMPLETED",
+        source_message_state = "COMPLETED",
+        created_at           = datetime.utcnow().isoformat() + "Z",
+        sequence_number      = 0,
+        sender               = {"type": "bot"},
+        content              = MessageContent(text=msg_text, template_id=tpl_id, data=tpl_data),
+    )
+    emit_sse("chat_event", event.model_dump(by_alias=True))
+
+
+async def clarify_node(state: BotState, emit_sse=None) -> dict:
     """Short-circuit to emit a nested_qna template when SLM signals clarification.
 
     Input:  state['classification']
@@ -746,11 +799,10 @@ async def clarify_node(state: BotState) -> dict:
                 "options":    clarification_data.get("options", []),
             }]
         }
+        bot_response = {"template_id": "nested_qna", "data": nested_qna_payload}
+        _emit_bot_response(bot_response, state, emit_sse)
         return {
-            "bot_response": {
-                "template_id": "nested_qna",
-                "data":        nested_qna_payload,
-            },
+            "bot_response": bot_response,
             "clarification_emitted": True,
         }
 
