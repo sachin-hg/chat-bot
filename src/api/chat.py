@@ -67,9 +67,9 @@ def _build_adapters(settings: Settings, redis):
         from src.tools.dev_executor import DevExecutor
         return AnthropicDomainRouter(), AnthropicClassifier(), AnthropicLLM(), DevExecutor()
 
-    # local / staging / production — real Anthropic + real HTTP executor (VPN required)
-    from src.tools.executor import HttpToolExecutor
-    return AnthropicDomainRouter(), AnthropicClassifier(), AnthropicLLM(), HttpToolExecutor(redis_pool=redis)
+    # local / staging / production — real Anthropic + real Housing APIs (VPN required)
+    from src.tools.housing_executor import HousingToolExecutor
+    return AnthropicDomainRouter(), AnthropicClassifier(), AnthropicLLM(), HousingToolExecutor(settings, redis)
 
 
 # ---------------------------------------------------------------------------

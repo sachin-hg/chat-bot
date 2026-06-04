@@ -489,9 +489,23 @@ def validate_bot_output(text: str) -> tuple:
 
 
 def validate_tool_call(tool: str, params: dict) -> dict:
-    """Sprint 1 stub — always valid.
-    # TODO CHAT-P-016: validate against TOOL_REGISTRY input_params."""
-    return {'valid': True}
+    """Validate LLM tool call params against TOOL_REGISTRY input_params.
+
+    Checks:
+      1. Tool exists in registry.
+      2. All required, non-wire params are present.
+    """
+    from src.registries.tool_registry import get_tool
+    record = get_tool(tool)
+    if not record:
+        return {"valid": False, "detail": f"Unknown tool: {tool}"}
+    missing = [
+        p.key for p in record.input_params
+        if p.required and not p.wire_param and p.key not in params
+    ]
+    if missing:
+        return {"valid": False, "detail": f"Missing required params: {missing}"}
+    return {"valid": True}
 
 
 def build_missing_param_error(validation: dict) -> dict:

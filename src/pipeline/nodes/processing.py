@@ -441,21 +441,96 @@ async def execute_tier1_action(state: BotState) -> dict:
     return {'template_id': 'text_response', 'data': {'text': 'Action completed.'}}
 
 
-async def execute_tier2_action(state: BotState) -> dict:
+async def execute_tier2_action(state: BotState, executor=None) -> dict:
     """Execute a Tier 2 (orchestrator-fetched, no LLM) action.
 
-    Sprint 1 stub — real data fetch + template build wired in CHAT-P-016.
+    Fetches data using the intent's data_requirements, then builds a template
+    response. No LLM call — the orchestrator formats the result directly.
+
+    Supported sub-intents:
+      portfolio/saved_properties       → property_carousel (getSavedProperties)
+      portfolio/viewed_properties      → property_carousel (getViewedProperties)
+      portfolio/recently_viewed_cross_session → property_carousel (getRecentlyViewed)
+      portfolio/recent_searches        → recent_searches from session state
+      calculator/calculate_emi         → emi_result (inline computation)
+      calculator/calculate_affordability → affordability_result (inline computation)
     """
-    log.info('tier2_action_stub', sub_intent=state['classification'].get('sub_intent'))
-    return {'template_id': 'text_response', 'data': {'text': 'Results loading...'}}
-    # TODO CHAT-P-016: replace with real data fetch + template build
+    c          = state['classification']
+    sub_intent = c.get('sub_intent', '')
+    session    = state.get('session') or {}
+    filters    = session.get('active_filters') or {}
+
+    log.info('tier2_action', sub_intent=sub_intent)
+
+    # ── calculator intents — inline, no executor needed ──────────────────
+    if sub_intent == 'calculate_emi':
+        fd = c.get('filter_delta') or {}
+        loan_amount = fd.get('loan_amount') or filters.get('loan_amount')
+        if not loan_amount:
+            return {'template_id': 'nested_qna', 'data': {'selections': [{'questionId': 'loan_amount', 'title': 'What is the loan amount you need?', 'type': 'text_input', 'options': []}]}}
+        rate         = fd.get('rate')         or filters.get('rate', 8.5)
+        tenure_years = fd.get('tenure_years') or filters.get('tenure_years', 20)
+        r = float(rate) / 1200
+        n = int(tenure_years) * 12
+        amt = float(loan_amount)
+        emi = int(amt * r * (1 + r) ** n / ((1 + r) ** n - 1)) if r > 0 else int(amt / n)
+        return {'template_id': 'emi_result', 'data': {'monthly_emi': emi, 'loan_amount': amt, 'rate': float(rate), 'tenure_years': int(tenure_years), 'total_amount': emi * n}}
+
+    if sub_intent == 'calculate_affordability':
+        fd = c.get('filter_delta') or {}
+        monthly_income = fd.get('monthly_income') or filters.get('monthly_income')
+        if not monthly_income:
+            return {'template_id': 'nested_qna', 'data': {'selections': [{'questionId': 'monthly_income', 'title': 'What is your monthly income?', 'type': 'text_input', 'options': []}]}}
+        mi  = float(monthly_income)
+        max_emi = mi * 0.40
+        r, n    = 8.5 / 1200, 240
+        max_loan = int(max_emi * ((1 + r) ** n - 1) / (r * (1 + r) ** n))
+        return {'template_id': 'affordability_result', 'data': {'monthly_income': mi, 'max_emi': int(max_emi), 'max_loan': max_loan, 'recommended_budget': int(max_loan * 1.20), 'min_down_payment': int(max_loan * 0.20)}}
+
+    # ── recent_searches — served from session state ───────────────────────
+    if sub_intent == 'recent_searches':
+        searches = session.get('recent_searches') or []
+        return {'template_id': 'recent_searches', 'data': {'searches': searches}}
+
+    # ── portfolio fetches — require executor ─────────────────────────────
+    if executor is None:
+        return {'template_id': 'text_response', 'data': {'text': 'Your portfolio data will be available once the service is fully connected.'}}
+
+    _TOOL_MAP = {
+        'saved_properties':              'getSavedProperties',
+        'viewed_properties':             'getViewedProperties',
+        'recently_viewed_cross_session': 'getRecentlyViewed',
+    }
+    tool = _TOOL_MAP.get(sub_intent)
+    if not tool:
+        log.warning('tier2_unknown_sub_intent', sub_intent=sub_intent)
+        return {'template_id': 'text_response', 'data': {'text': 'I could not fetch that right now. Please try again.'}}
+
+    try:
+        from src.tools.executor import get_tool_cache_ttl
+        params = dict(filters)
+        if session.get('auth_token'):
+            params['auth_token'] = session['auth_token']
+        data = await executor.execute(tool, params, get_tool_cache_ttl(tool))
+        properties = data.get('properties') or []
+        return {
+            'template_id': 'property_carousel',
+            'data': {
+                'properties':  properties[:10],
+                'totalCount':  data.get('total', len(properties)),
+                'source':      sub_intent,
+            },
+        }
+    except Exception as exc:
+        log.warning('tier2_fetch_failed', sub_intent=sub_intent, error=str(exc))
+        return {'template_id': 'text_response', 'data': {'text': 'I could not fetch that right now. Please try again.'}}
 
 
 # ---------------------------------------------------------------------------
 # Node: route_node  (CHAT-P-012)
 # ---------------------------------------------------------------------------
 
-async def route_node(state: BotState) -> dict:
+async def route_node(state: BotState, executor=None) -> dict:
     """Route the classified intent to the appropriate tier action.
 
     Tier 0 — out-of-scope canned response.
@@ -485,7 +560,7 @@ async def route_node(state: BotState) -> dict:
     if routing['tier'] == 1:
         return {'routing': routing, 'bot_response': await execute_tier1_action(state)}
     if routing['tier'] == 2:
-        return {'routing': routing, 'bot_response': await execute_tier2_action(state)}
+        return {'routing': routing, 'bot_response': await execute_tier2_action(state, executor=executor)}
 
     return {'routing': routing}
 
