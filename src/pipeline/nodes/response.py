@@ -420,7 +420,100 @@ async def build_prompt_node(state: BotState, composer: LLMPromptComposerProtocol
     tool_definitions = build_all_llm_tools(
         get_residual_tools(main_intent, sub_intent), main_intent
     )
-    return {'system_prompt': result.system, 'tool_definitions': tool_definitions}
+
+    # Inject pre-fetched data and session context into system_prompt so the LLM
+    # has the data it needs to write a grounded response.
+    system = result.system
+    system = _append_data_context(system, state, c, session)
+
+    # Build the messages list: turn_history + current user message.
+    # The LLM needs the actual user query in the messages to respond to it.
+    turn_history = list(session.get('turn_history') or [])
+    raw_message  = state.get('raw_message', '')
+    if raw_message and (not turn_history or turn_history[0].get('role') != 'user' or turn_history[0].get('content') != raw_message):
+        # Prepend the current user message (it hasn't been added to turn_history yet
+        # — followup_node does that after the LLM responds)
+        messages = [{'role': 'user', 'content': raw_message}] + turn_history
+    else:
+        messages = turn_history or [{'role': 'user', 'content': raw_message or 'Hello'}]
+
+    return {'system_prompt': system, 'tool_definitions': tool_definitions, 'llm_messages': messages}
+
+
+def _append_data_context(system: str, state: 'BotState', c: dict, session: dict) -> str:
+    """Append pre_fetched_data and session context to the system prompt.
+
+    This gives the LLM the actual data it should base its response on.
+    In production, the real LLMPromptComposer handles this; for now StubPromptComposer
+    delegates to this function.
+    """
+    import json as _json
+    parts = [system]
+
+    # Session context block
+    filters = session.get('active_filters') or {}
+    ctx_lines = []
+    if filters.get('city'):
+        ctx_lines.append(f"City: {filters['city']}")
+    if filters.get('transaction_type'):
+        ctx_lines.append(f"Transaction: {filters['transaction_type']}")
+    if filters.get('bhk'):
+        ctx_lines.append(f"BHK: {filters['bhk']}")
+    if filters.get('localities'):
+        ctx_lines.append(f"Localities: {', '.join(str(x) for x in filters['localities'])}")
+    if filters.get('price_max'):
+        psf = filters['price_max']
+        ctx_lines.append(f"Budget max: ₹{psf // 100000:.0f}L" if psf < 10_000_000 else f"₹{psf / 10_000_000:.2f}Cr")
+    if ctx_lines:
+        parts.append("\n\n## SESSION CONTEXT\n" + "\n".join(ctx_lines))
+
+    # Pre-fetched data block (truncated for token budget)
+    pre_fetched = state.get('pre_fetched_data') or {}
+    if pre_fetched:
+        data_lines = ["\n\n## DATA RETRIEVED FOR THIS TURN"]
+        for key, data in pre_fetched.items():
+            if not data:
+                continue
+            if key in ('searchProperties', 'filter_search'):
+                hits = (data.get('hits') or [])[:5]
+                total = data.get('total_count', len(hits))
+                data_lines.append(f"\n**{total} properties found** (showing {len(hits)}):")
+                for p in hits:
+                    loc = (p.get('locality') or {}).get('name', '')
+                    data_lines.append(
+                        f"- {p.get('title', 'Property')} | {p.get('price_display', '')} | "
+                        f"{p.get('carpet_area', '')} sqft | {loc}"
+                    )
+            elif key in ('getLocalityDetail', 'locality_overview'):
+                name = data.get('display_name') or data.get('name', '')
+                psf  = data.get('avg_price_sqft') or data.get('avg_price_per_sqft', '')
+                yoy  = (data.get('price_trend') or {}).get('yoy_change_percent') or data.get('yoy_change_percent', '')
+                rating = (data.get('ratings') or {}).get('overall', '')
+                data_lines.append(f"\n**{name}**: ₹{psf:,}/sqft, {yoy}% YoY growth, {rating}/5 rating")
+                if data.get('overview'):
+                    data_lines.append(data['overview'][:400])
+            elif key == 'getTrendingLocalities':
+                locs = (data.get('localities') or [])[:5]
+                data_lines.append(f"\n**Trending localities ({len(locs)}):**")
+                for loc in locs:
+                    data_lines.append(f"- {loc.get('name', '')} | ₹{loc.get('avg_price_per_sqft', '')} psf | {loc.get('yoy_growth_percent', '')}% growth")
+            elif key in ('getPriceTrends', 'getProjectPriceTrends'):
+                pts = (data.get('data_points') or [])[-3:]  # last 3 months
+                yoy = data.get('yoy_change_pct', '')
+                data_lines.append(f"\n**Price trend**: {yoy}% YoY | Last 3 months: {[p.get('avg_price_sqft', '') for p in pts]}")
+            elif key == 'getProjectDetail':
+                data_lines.append(f"\n**Project**: {data.get('name', '')} by {data.get('builder', '')} | {data.get('price_range', '')} | Possession: {data.get('possession_date', '')}")
+            else:
+                # Generic: dump compact JSON
+                try:
+                    compact = _json.dumps(data, ensure_ascii=False)[:500]
+                    data_lines.append(f"\n**{key}**: {compact}")
+                except Exception:
+                    pass
+        if len(data_lines) > 1:
+            parts.append("\n".join(data_lines))
+
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -601,11 +694,18 @@ async def llm_node(state: BotState, llm: LLMPort, emit_sse: Callable, executor=N
         log.info('llm_tool_call_no_executor', tool=tool)
         return {}
 
+    # Use llm_messages if build_prompt_node constructed them; fall back to turn_history
+    messages = (
+        state.get('llm_messages') or
+        state['session'].get('turn_history') or
+        [{'role': 'user', 'content': state.get('raw_message', 'Hello')}]
+    )
+
     llm_response = await stream_llm(
         llm=llm,
         model=model_id,
         system=state.get('system_prompt', ''),
-        messages=state['session'].get('turn_history', []),
+        messages=messages,
         tools=state.get('tool_definitions') or [],
         on_tool_use=on_tool_use,
         on_chunk=on_chunk,

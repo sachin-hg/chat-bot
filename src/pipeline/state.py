@@ -47,6 +47,7 @@ class BotState(TypedDict):
     # ── Set by build_prompt_node ─────────────────────────────────────────
     system_prompt:        Optional[str]
     tool_definitions:     Optional[List[Dict]]
+    llm_messages:         Optional[List[Dict]]   # Anthropic-format messages for llm_node
 
     # ── Set by llm_node ──────────────────────────────────────────────────
     llm_response:         Optional[Dict]
@@ -148,6 +149,7 @@ def make_base_state(
         fetch_errors=None,
         system_prompt=None,
         tool_definitions=None,
+        llm_messages=None,
         llm_response=None,
         tool_results=None,
         validated_text=None,
