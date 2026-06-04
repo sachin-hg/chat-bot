@@ -12,6 +12,13 @@ import anthropic
 from src.observability.logging import get_logger
 from src.registries.model_registry import get_model_id
 
+try:
+    from langsmith import traceable as _traceable
+except ImportError:
+    def _traceable(*args, **kwargs):               # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap if args and callable(args[0]) else _wrap
+
 log = get_logger(__name__)
 
 # Domain prompt files are loaded lazily on first access and cached.
@@ -184,6 +191,7 @@ class AnthropicClassifier:
         )
         return dict(_OUT_OF_SCOPE_CLASSIFICATION)
 
+    @_traceable(run_type="llm", name="intent_classifier")
     async def _call_api(
         self,
         model_id: str,

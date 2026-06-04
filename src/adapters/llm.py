@@ -5,6 +5,13 @@ from typing import Any, Callable, Optional
 import anthropic
 from src.observability.logging import get_logger
 
+try:
+    from langsmith import traceable as _traceable
+except ImportError:
+    def _traceable(*args, **kwargs):               # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap if args and callable(args[0]) else _wrap
+
 log = get_logger(__name__)
 
 _client: Optional[anthropic.AsyncAnthropic] = None
@@ -22,6 +29,7 @@ class AnthropicLLM:
     Returns: {'response': {'text': str, 'stop_reason': str}, 'tool_results': list}
     """
 
+    @_traceable(run_type="llm", name="llm_stream")
     async def stream(
         self,
         model: str,

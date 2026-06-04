@@ -33,43 +33,50 @@ CONVERSATION_TTL = 365 * 24 * 3600
 # ---------------------------------------------------------------------------
 
 def _build_adapters(settings: Settings, redis):
-    """Return (router_adapter, classifier_adapter, llm_adapter, executor) for the current bot_env."""
-    from src.adapters.domain_router import AnthropicDomainRouter
-    from src.adapters.classifier import AnthropicClassifier
-    from src.adapters.llm import AnthropicLLM
+    """Return (router_adapter, classifier_adapter, llm_adapter, executor) for the current bot_env.
 
+    Adapter selection follows this priority:
+      1. bot_env == 'mock' → mock adapters (no API calls)
+      2. bot_env == 'dev'  → MODEL_REGISTRY-driven real SLM/LLM + DevExecutor (no VPN)
+      3. bot_env == 'local/staging/production' → MODEL_REGISTRY-driven + real Housing APIs
+
+    Adding a new provider (e.g. 'google') only requires:
+      - A new adapter class implementing the relevant port
+      - A new branch in src/adapters/factory.py
+      - MODEL_REGISTRY entries pointing at the new provider
+    No changes to this function or any pipeline node.
+    """
     if settings.bot_env == "mock":
         from unittest.mock import MagicMock, AsyncMock
         router_adapter = MagicMock()
         router_adapter.route = AsyncMock(return_value={"domain": "property_search", "confidence": 0.95})
         classifier_adapter = MagicMock()
         classifier_adapter.classify = AsyncMock(return_value={
-            "main_intent": "property_search",
-            "sub_intent": "filter_search",
-            "filter_delta": {},
-            "entities_mentioned": [],
-            "clarification_needed": None,
-            "pivot": False,
-            "multi_intent": False,
+            "main_intent": "property_search", "sub_intent": "filter_search",
+            "filter_delta": {}, "entities_mentioned": [], "entity_refs": [],
+            "clarification_needed": None, "pivot": False, "multi_intent": False,
         })
         llm_adapter = MagicMock()
         async def _mock_stream(**kw):
             if kw.get("on_chunk"):
                 kw["on_chunk"]("I can help you find properties. What are you looking for?")
-            return {
-                "response": {"text": "I can help you find properties. What are you looking for?"},
-                "tool_results": [],
-            }
+            return {"response": {"text": "I can help you find properties. What are you looking for?"}, "tool_results": []}
         llm_adapter.stream = _mock_stream
         return router_adapter, classifier_adapter, llm_adapter, None
 
+    # Real SLM/LLM — provider determined by MODEL_REGISTRY (anthropic | openrouter | ...)
+    from src.adapters.factory import build_domain_router, build_classifier, build_llm
+    router_adapter     = build_domain_router(settings)
+    classifier_adapter = build_classifier(settings)
+    llm_adapter        = build_llm("llm_tier3a", settings)   # default; experiment_node may override per-turn
+
     if settings.bot_env == "dev":
         from src.tools.dev_executor import DevExecutor
-        return AnthropicDomainRouter(), AnthropicClassifier(), AnthropicLLM(), DevExecutor()
+        return router_adapter, classifier_adapter, llm_adapter, DevExecutor()
 
-    # local / staging / production — real Anthropic + real Housing APIs (VPN required)
+    # local / staging / production — real Housing APIs (VPN required)
     from src.tools.housing_executor import HousingToolExecutor
-    return AnthropicDomainRouter(), AnthropicClassifier(), AnthropicLLM(), HousingToolExecutor(settings, redis)
+    return router_adapter, classifier_adapter, llm_adapter, HousingToolExecutor(settings, redis)
 
 
 # ---------------------------------------------------------------------------

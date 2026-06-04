@@ -12,6 +12,16 @@ import anthropic
 from src.observability.logging import get_logger
 from src.registries.model_registry import get_model_id
 
+# LangSmith @traceable — wraps each API call so it appears as a named span in
+# LangSmith traces with inputs, outputs, and latency.  Falls back to a no-op
+# decorator when LangSmith is not installed or tracing is disabled.
+try:
+    from langsmith import traceable as _traceable
+except ImportError:
+    def _traceable(*args, **kwargs):               # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap if args and callable(args[0]) else _wrap
+
 log = get_logger(__name__)
 
 # Load static prompt once at module import time (always cache-warm after first request).
@@ -128,6 +138,7 @@ class AnthropicDomainRouter:
         )
         return {"domain": fallback_domain, "confidence": 0.0}
 
+    @_traceable(run_type="llm", name="domain_router")
     async def _call_api(self, user_content: str) -> dict:
         client = _get_client()
         response = await client.messages.create(

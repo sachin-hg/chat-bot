@@ -302,6 +302,34 @@ MODEL_REGISTRY: dict[str, ModelAssignment] = {
 
 
 
+# ── OpenRouter examples ────────────────────────────────────────────────────
+# Uncomment / copy-paste these into the registry above to A/B test non-Anthropic
+# models.  Set provider='openrouter' and OPENROUTER_API_KEY in .env.
+# The adapter factory (src/adapters/factory.py) will route to OpenRouterClassifier
+# / OpenRouterLLM automatically — no pipeline code changes required.
+
+# Gemini Flash — fast and cheap, comparable to Haiku for SLM tasks
+# ModelAssignment(
+#     task_id='domain_router', provider='openrouter',
+#     model_id='google/gemini-flash-1.5',
+#     adapter_class='src.adapters.openrouter.OpenRouterDomainRouter',
+#     ...same fields as above...
+# )
+
+# Llama 3.1 70B — strong open-source option for Tier 3b (Sonnet replacement)
+# ModelAssignment(
+#     task_id='llm_tier3b', provider='openrouter',
+#     model_id='meta-llama/llama-3.1-70b-instruct',
+#     adapter_class='src.adapters.openrouter.OpenRouterLLM',
+#     ...
+# )
+
+# To run a full A/B test between Haiku and Gemini Flash on the domain router:
+#   1. Set task_id='domain_router', provider='openrouter', model_id='google/gemini-flash-1.5'
+#   2. Set OPENROUTER_API_KEY in .env
+#   3. Restart server — no other changes needed
+
+
 def get_model_id(task_id: str) -> str:
     """Return the current model_id for a task, or raise KeyError if unknown."""
     return MODEL_REGISTRY[task_id].model_id

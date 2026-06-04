@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     # Anthropic
     anthropic_api_key: Optional[SecretStr] = None   # required when using real SLM/LLM
 
+    # OpenRouter — OpenAI-compatible endpoint routing to 200+ models
+    # Get key at: https://openrouter.ai/keys
+    # Used when ModelAssignment.provider = 'openrouter'
+    openrouter_api_key: Optional[SecretStr] = None
+
     # External APIs
     khoj_base_url:          str = ""
     odin_base_url:          str = ""
