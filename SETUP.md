@@ -69,12 +69,23 @@ FE / curl               │  Classification         Processing        Response  
 | `LANGCHAIN_TRACING_V2` | `false` | Enable LangSmith traces |
 | `LANGCHAIN_API_KEY` | — | smith.langchain.com → Settings → API Keys (`ls__...`) |
 | `LANGCHAIN_PROJECT` | `housing-bot-local` | LangSmith project name |
-| `BOT_ENV` | `local` | `mock` / `local` / `staging` / `production` |
+| `BOT_ENV` | `dev` | `mock` / `dev` / `local` / `staging` / `production` (see table below) |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for verbose pipeline logs |
 | `LLM_MAX_CONCURRENT` | `20` | Max parallel Anthropic calls |
 | `LLM_QUEUE_MAX` | `50` | Max queued requests before 429 |
 
-### External APIs (only needed with `BOT_ENV=local`, not `mock`)
+### BOT_ENV modes
+
+| Value | SLM / LLM | Tool executor | VPN needed? | Use when |
+|---|---|---|---|---|
+| `mock` | Keyword router + canned text | None | No | CI, offline work, no API key |
+| `dev` | Real Anthropic (Haiku) | `DevExecutor` — contextual mock data generated from query params | No | **Default for local dev** — tests real classification + LLM quality |
+| `local` | Real Anthropic | `HttpToolExecutor` → real Housing APIs | Yes | Integration testing against live data |
+| `staging` / `production` | Real Anthropic | Real Housing APIs | Yes | Staging / prod |
+
+> **`dev` is the recommended default.** It uses real Anthropic SLM + LLM calls (so you catch classification regressions and prompt quality issues) but generates mock Housing API responses internally from the query params — realistic 2BHK listings for Bandra, locality data for Powai, etc. — without needing VPN.
+
+### External APIs (only needed with `BOT_ENV=local`, not `mock` or `dev`)
 
 All of these are internal Housing.com services reachable only over VPN.
 In `BOT_ENV=mock` mode the pipeline uses fixture JSON files instead,
@@ -96,9 +107,9 @@ so you can develop and run tests without VPN or real API access.
 
 ---
 
-## Quick Start (mock mode — no VPN, no external APIs needed)
+## Quick Start (`BOT_ENV=dev` — recommended, no VPN needed)
 
-This mode runs the full 19-node pipeline with Anthropic calls mocked locally.
+Uses real Anthropic SLM + LLM calls with contextually generated mock Housing API data.
 You need Docker and an Anthropic API key; no VPN required.
 
 ```bash
@@ -110,13 +121,14 @@ cd chat-bot
 cp .env.example .env
 ```
 
-Edit `.env` and fill in the three required fields:
+Edit `.env` — the three required fields plus the two local-dev overrides:
 
 ```
 ANTHROPIC_API_KEY=sk-ant-api03-...
 POSTGRES_PASSWORD=mypassword
 SECRET_KEY=<run: python3 -c "import secrets; print(secrets.token_hex(32))">
-BOT_ENV=mock
+BOT_ENV=dev
+POSTGRES_PORT=5432   # connect directly to postgres; pgbouncer is incompatible with asyncpg locally
 ```
 
 ```bash
@@ -131,17 +143,47 @@ make up
 # 5. Wait for services to be healthy (usually 15-30 seconds)
 make health
 
-# 6. Create Kafka topics and run database migrations (one-time)
-make setup-local
+# 6. Run database migrations (one-time)
+make migrate
 
-# 7. Fire a dry-run — no server needed, runs the pipeline in-process
+# 7. Start the FastAPI server
+make run   # starts on port 8001
+
+# 8. Send a message and watch the SSE stream
+curl -s -N -X POST http://localhost:8001/api/v1/chat/send-message-streamed \
+  -H "Content-Type: application/json" \
+  -H "X-Session-Token: any-token" \
+  -d '{
+    "conversationId": "test-001",
+    "sender": {"type": "user"},
+    "messageType": "text",
+    "content": {"text": "show me 2bhk in bandra under 2 crore"},
+    "responseRequired": true
+  }'
+
+# 9. Or open the playground UI
+open http://localhost:8001/playground
+```
+
+## Quick Start (mock mode — no Anthropic API key needed)
+
+All SLM/LLM calls are replaced with keyword routing and canned responses.
+Useful for CI, offline work, or developing without an API key.
+
+```bash
+# Same as dev setup but set BOT_ENV=mock in .env (no ANTHROPIC_API_KEY needed)
+BOT_ENV=mock
+POSTGRES_PASSWORD=mypassword
+SECRET_KEY=<...>
+POSTGRES_PORT=5432
+
+make up && make migrate && make run
+```
+
+Or run a single pipeline turn without starting the server:
+
+```bash
 make dry-run MSG="show me 2bhk in powai"
-
-# 8. (Optional) Start the FastAPI server
-uvicorn src.main:app --reload
-
-# 9. Hit the health endpoint
-curl http://localhost:8000/health
 ```
 
 ---
@@ -157,6 +199,7 @@ Use this when you need to test against live Housing data APIs.
 cp .env.example .env
 # Fill in: ANTHROPIC_API_KEY, POSTGRES_PASSWORD, SECRET_KEY
 # Set BOT_ENV=local
+# Set POSTGRES_PORT=5432
 # Fill in all *_BASE_URL variables
 
 # 3. Install dependencies
@@ -167,14 +210,14 @@ pip install -r requirements-dev.txt
 # 4. Start infrastructure
 make up
 
-# 5. Run migrations and create Kafka topics
-make setup-local
+# 5. Run migrations
+make migrate
 
 # 6. (Optional) Seed the database with a sample conversation
 make seed
 
 # 7. Start the server
-uvicorn src.main:app --reload
+make run   # port 8001
 
 # 8. Verify everything is up
 make health
@@ -325,6 +368,137 @@ Inside you'll find:
 
 ## Troubleshooting
 
+### `ANTHROPIC_API_KEY` is set in `.env` but the server logs say "Could not resolve authentication method"
+
+**Root cause:** `pydantic-settings` reads `.env` into the `Settings` object but does *not* export
+variables to `os.environ`. The Anthropic SDK's `AsyncAnthropic()` reads `ANTHROPIC_API_KEY` from
+`os.environ`, so it never sees the value from `.env`.
+
+**Fix:** `src/main.py` calls `_configure_anthropic(settings)` on startup, which does:
+```python
+os.environ.setdefault("ANTHROPIC_API_KEY", settings.anthropic_api_key.get_secret_value())
+```
+This is already wired — if you see this error the key in `.env` is blank or mis-named.
+
+---
+
+### SLM/LLM classifier returns JSON parse error (`Expecting value: line 1 column 1`)
+
+**Root cause:** Claude sometimes wraps its JSON output in markdown code fences
+(`` ```json ... ``` ``) even when the prompt says "no prose". This makes `json.loads`
+fail because the string starts with a backtick.
+
+**Fix:** Both `AnthropicDomainRouter._call_api` and `AnthropicClassifier._call_api` call
+`_strip_code_fence(raw)` before parsing. If you add a new adapter that parses LLM JSON,
+apply the same helper.
+
+---
+
+### Classifier returns `sub_intent = "property_search/filter_search"` (full path) instead of `"filter_search"`
+
+**Root cause:** The intent taxonomy block shown to the model lists intents as
+`property_search/filter_search (tier 3a)`. The model copies this format verbatim into
+the `sub_intent` field instead of extracting just the sub-intent part.
+
+**Fix:** `validate_slm_node` strips the `"main_intent/"` prefix before checking the
+INTENT_REGISTRY:
+```python
+if si.startswith(f"{mi}/"):
+    c["sub_intent"] = si[len(mi) + 1:]
+```
+This is already in place. If you rename intents in the registry, the normalization
+handles it automatically.
+
+---
+
+### Domain classifier prompts return rich markdown instead of JSON
+
+**Root cause:** The files in `prompts/slm/domains/*.md` were placeholder stubs
+(`[AUTO-GENERATED from INTENT_REGISTRY at startup — do not edit]`, 162 chars) that
+contained no instructions whatsoever. The model received a nearly empty system prompt
+and defaulted to a helpful markdown analysis.
+
+**Fix:** Each domain file now contains a proper classifier system prompt: JSON output
+rules, the required schema, and domain-specific extraction hints. The intent and filter
+taxonomy is injected on top via `build_intent_taxonomy_block()` + `build_filter_delta_block()`.
+
+If you add a new domain, you must write a corresponding `prompts/slm/domains/<domain>.md`.
+
+---
+
+### `DOMAIN_TAXONOMY_PROMPTS` was loading empty stub files
+
+**Root cause:** `classification.py` populated `DOMAIN_TAXONOMY_PROMPTS` by calling
+`_load_template("prompts/slm/domains/property_search.md")` — the same placeholder files
+described above.
+
+**Fix:** `DOMAIN_TAXONOMY_PROMPTS` now calls the registry builders at import time:
+```python
+DOMAIN_TAXONOMY_PROMPTS = {
+    domain: _build_taxonomy_prompt(domain)
+    for domain in ["property_search", "property_detail", "locality", "project_research", "portfolio"]
+}
+```
+where `_build_taxonomy_prompt` calls `build_intent_taxonomy_block()` + `build_filter_delta_block()`.
+The taxonomy stays in sync with the registry automatically.
+
+---
+
+### `postgres_unavailable_on_startup` / `DuplicatePreparedStatementError` on health check
+
+**Root cause:** The app's `database_url` defaults to port 5433 (pgbouncer). pgbouncer
+in **transaction pool mode** does not support prepared statements, but SQLAlchemy's
+asyncpg dialect creates prepared statements for internal introspection queries
+(`select pg_catalog.version()`, `select current_schema()`). This causes a clash when
+pgbouncer reuses a backend connection that still has stale prepared statement names.
+
+**Fix for local dev:** Set `POSTGRES_PORT=5432` in `.env`. The app then connects directly
+to Postgres, bypassing pgbouncer. pgbouncer is still started by Docker Compose and is
+available on port 5433 for any tooling that needs it.
+
+```
+POSTGRES_PORT=5432   # add this line to your .env
+```
+
+For **Alembic migrations**, `alembic/env.py` always uses `_direct_url()` (port 5432)
+regardless of `POSTGRES_PORT`, so migrations work correctly even when the app is pointed
+at pgbouncer.
+
+**Note:** `src/db/engine.py` also sets `connect_args={"statement_cache_size": 0}` as
+defense-in-depth — this disables asyncpg's prepared statement cache so the error cannot
+recur even if port 5433 is used in the future.
+
+---
+
+### Classifier JSON is truncated mid-output (`Unterminated string`)
+
+**Root cause:** `max_tokens=160` was too small for the full classification JSON,
+which includes `filter_delta` with multiple keys, `entities_mentioned` as a list,
+and a `reasoning` field. The response got cut off mid-string.
+
+**Fix:** Classifier `max_tokens` is now 400. Domain router is 40 (its output is just
+`{"domain": "...", "confidence": 0.98}` — 20–30 tokens).
+
+If you add new fields to the classification schema, check that 400 tokens is still enough
+by running `make dry-run MSG="..." SLM=real` and checking for truncation.
+
+---
+
+### Domain router or classifier times out on every request
+
+**Root cause:** The original timeouts (domain router: 500 ms, classifier: 2 s) were
+tuned for warm production traffic. Cold Anthropic API calls — first call after server
+start, or after a period of inactivity — typically take 1–3 s for Haiku.
+
+**Fix:** Timeouts are now:
+- Domain router: **2 s** (was 0.5 s)
+- Classifier: **10 s** (was 2 s; the larger domain taxonomy prompt adds ~500 ms)
+
+The production values should be tightened back once the prompt cache is warm. The
+router p95 target is 150 ms and the classifier p95 is 500 ms in steady-state traffic.
+
+---
+
 ### Kafka not starting / topics not created
 
 ```
@@ -410,4 +584,4 @@ brew link --force libpq   # adds pg_isready / psql to PATH
 ```
 
 Alternatively, use `make migrate` directly once Docker's Postgres healthcheck
-reports healthy.
+reports healthy (`docker compose ps postgres` shows `(healthy)`).
