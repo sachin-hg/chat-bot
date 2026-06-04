@@ -838,7 +838,7 @@ async def llm_node(state: BotState, llm: LLMPort, emit_sse: Callable, executor=N
 # ---------------------------------------------------------------------------
 
 
-async def validate_output_node(state: BotState) -> dict:
+async def validate_output_node(state: BotState, emit_sse=None) -> dict:
     """Validate and clean LLM text output, stripping prohibited content.
 
     Removes URLs and phone numbers unconditionally.
@@ -870,9 +870,17 @@ async def validate_output_node(state: BotState) -> dict:
             validation.violations.remove('markdown_table_detected')  # allowed
 
     if validation.violations:
-        log.warn('output_validation_violations',
-                 violations=validation.violations,
+        log.warn('output_validation_violations', violations=validation.violations,
                  request_id=state.get('request_id'))
+
+    if emit_sse:
+        emit_sse("pipeline_step", {
+            "step": "node_result", "node": "validate_output",
+            "violations": validation.violations,
+            "text_len_before": len(raw_text),
+            "text_len_after":  len(cleaned_text),
+            "truncated": llm_resp.get('stop_reason') == 'max_tokens',
+        })
     return {'validated_text': cleaned_text}
 
 
@@ -1263,7 +1271,7 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def experiment_node(state: BotState) -> dict:
+async def experiment_node(state: BotState, emit_sse=None) -> dict:
     """Resolve active A/B experiment for this session. Hot-reloads config/experiments.yaml every 60s."""
     from src.pipeline.experiment_loader import resolve_experiment_for_session
 
@@ -1272,6 +1280,9 @@ async def experiment_node(state: BotState) -> dict:
     )
 
     if experiment is None:
+        if emit_sse:
+            emit_sse("pipeline_step", {"step": "node_result", "node": "experiment",
+                                       "status": "no_experiment_active"})
         return {'experiment_id': None}
 
     result = {
@@ -1286,9 +1297,13 @@ async def experiment_node(state: BotState) -> dict:
         routing['model_override_task'] = model_override
         result['routing'] = routing
 
-    log.info('experiment_resolved',
-             session_id=state['session'].get('session_id'),
-             experiment_id=experiment['experiment_id'],
-             variant=experiment['variant']['id'])
+    log.info('experiment_resolved', session_id=state['session'].get('session_id'),
+             experiment_id=experiment['experiment_id'], variant=experiment['variant']['id'])
 
+    if emit_sse:
+        emit_sse("pipeline_step", {"step": "node_result", "node": "experiment",
+                                   "status": "active",
+                                   "experiment_id": experiment['experiment_id'],
+                                   "variant": experiment['variant']['id'],
+                                   "model_override": model_override})
     return result

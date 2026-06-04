@@ -95,6 +95,25 @@
     .pg-node .nd-ms   { margin-left:auto; color:#333; font-size:8px; font-weight:400; }
     .pg-node.done .nd-ms { color:#22c55e60; }
     .pg-node.active .nd-ms { color:#fbbf24; }
+    .pg-node.done:hover, .pg-node.error:hover { filter:brightness(1.3); cursor:pointer; }
+
+    /* Node detail popup */
+    .node-popup {
+      position:fixed; z-index:1000; background:#0d0d0d; border:1px solid #333;
+      border-radius:8px; padding:12px 14px; min-width:260px; max-width:380px;
+      max-height:400px; overflow-y:auto; box-shadow:0 8px 32px rgba(0,0,0,.7);
+      font-size:10px; font-family:var(--font-mono);
+    }
+    .node-popup .np-title { font-size:11px; font-weight:700; color:#aaa; margin-bottom:8px; letter-spacing:0.5px; text-transform:uppercase; }
+    .node-popup .np-close { float:right; cursor:pointer; color:#555; font-size:13px; margin-top:-2px; }
+    .node-popup .np-close:hover { color:#aaa; }
+    .node-popup .np-kv { display:grid; grid-template-columns:auto 1fr; gap:2px 8px; }
+    .node-popup .np-k { color:#444; white-space:nowrap; }
+    .node-popup .np-v { color:#7ec8e3; word-break:break-all; }
+    .node-popup .np-v.hi { color:#22c55e; }
+    .node-popup .np-v.warn { color:#f59e0b; }
+    .node-popup .np-v.err { color:#ef4444; }
+    .node-popup pre { font-size:9px; color:#6b9eb5; white-space:pre-wrap; word-break:break-all; margin-top:6px; }
     @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.6; } }
     .pg-arrow { color:#1e1e1e; font-size:8px; padding:0 8px; }
     .pg-exit { font-size:9px; font-family:var(--font-mono); color:#555; padding:1px 7px; margin-top:1px; font-style:italic; }
@@ -259,10 +278,12 @@
         </div>
         <div class="dbg-card-body">
           <div class="kv">
-            <div class="k">domain</div>    <div class="v hi"  id="dr_domain">—</div>
-            <div class="k">confidence</div><div class="v"     id="dr_conf">—</div>
-            <div class="k">latency</div>   <div class="v dim" id="dr_ms">—</div>
-            <div class="k">cost</div>      <div class="v"     id="dr_cost">—</div>
+            <div class="k">model</div>     <div class="v purple" id="dr_model">—</div>
+            <div class="k">provider</div>  <div class="v dim"    id="dr_provider">—</div>
+            <div class="k">domain</div>    <div class="v hi"     id="dr_domain">—</div>
+            <div class="k">confidence</div><div class="v"        id="dr_conf">—</div>
+            <div class="k">latency</div>   <div class="v dim"    id="dr_ms">—</div>
+            <div class="k">cost</div>      <div class="v"        id="dr_cost">—</div>
             <div class="k">tokens in/out</div><div class="v dim" id="dr_tokens">—</div>
           </div>
           <div class="sec-lbl">Prompt sent to model</div>
@@ -283,6 +304,7 @@
         </div>
         <div class="dbg-card-body">
           <div class="kv">
+            <div class="k">model</div>          <div class="v purple" id="clf_model">—</div>
             <div class="k">main_intent</div>    <div class="v hi"   id="clf_main">—</div>
             <div class="k">sub_intent</div>     <div class="v"      id="clf_sub">—</div>
             <div class="k">pivot</div>           <div class="v"      id="clf_pivot">—</div>
@@ -410,7 +432,83 @@
   </aside>
 </div>
 
+<!-- Node detail popup (shown on flowchart node click) -->
+<div class="node-popup" id="nodePopup" style="display:none;">
+  <span class="np-close" onclick="closeNodePopup()">✕</span>
+  <div class="np-title" id="npTitle">Node</div>
+  <div class="np-kv" id="npKv"></div>
+  <pre id="npJson" style="display:none;"></pre>
+</div>
+
 <script>
+// ── Per-node detail storage (populated by node_result events) ─────────────
+let nodeDetails = {};   // nodeName → detail dict from pipeline_step node_result
+
+function storeNodeDetail(data) {
+  const node = data.node;
+  if (!node) return;
+  nodeDetails[node] = data;
+}
+
+function showNodePopup(nodeName, event) {
+  const detail = nodeDetails[nodeName];
+  if (!detail) return;
+  const popup = document.getElementById('nodePopup');
+  const title = document.getElementById('npTitle');
+  const kv    = document.getElementById('npKv');
+  const pre   = document.getElementById('npJson');
+
+  title.textContent = nodeName.toUpperCase().replace(/_/g,' ');
+
+  // Build KV display from detail fields (excluding step/node/status)
+  const skip = new Set(['step','node']);
+  kv.innerHTML = '';
+  const statusVal = detail.status || '';
+  const statusCls = statusVal.includes('error')||statusVal.includes('block')||statusVal.includes('gibber') ? 'err'
+                  : statusVal.includes('skip')||statusVal.includes('no_') ? 'warn' : 'hi';
+  kv.innerHTML += `<div class="np-k">status</div><div class="np-v ${statusCls}">${escHtml(statusVal)}</div>`;
+
+  const jsonFields = {};
+  for (const [k, v] of Object.entries(detail)) {
+    if (skip.has(k) || k === 'status') continue;
+    if (typeof v === 'object' && v !== null) {
+      jsonFields[k] = v;
+    } else {
+      const cls = k.includes('cost')?'warn':k.includes('model')?'purple':'';
+      kv.innerHTML += `<div class="np-k">${escHtml(k)}</div><div class="np-v ${cls}">${escHtml(String(v??'—'))}</div>`;
+    }
+  }
+  if (Object.keys(jsonFields).length) {
+    pre.textContent = JSON.stringify(jsonFields, null, 2);
+    pre.style.display = 'block';
+  } else {
+    pre.style.display = 'none';
+  }
+
+  // Position near the clicked element
+  const rect = event.currentTarget.getBoundingClientRect();
+  popup.style.display = 'block';
+  const pw = 380, ph = 400;
+  let left = rect.right + 8;
+  let top  = rect.top;
+  if (left + pw > window.innerWidth) left = rect.left - pw - 8;
+  if (top + ph > window.innerHeight) top = window.innerHeight - ph - 8;
+  popup.style.left = Math.max(4, left) + 'px';
+  popup.style.top  = Math.max(4, top)  + 'px';
+}
+
+function closeNodePopup() {
+  document.getElementById('nodePopup').style.display = 'none';
+}
+
+// Close popup when clicking outside
+document.addEventListener('click', (e) => {
+  const popup = document.getElementById('nodePopup');
+  if (popup && popup.style.display !== 'none' && !popup.contains(e.target) && !e.target.closest('.pg-node')) {
+    popup.style.display = 'none';
+  }
+});
+
 // ── Pipeline node definitions ─────────────────────────────────────────────
 const NODES = [
   'safety','normalize','route_domain','classify','validate_slm',
@@ -458,7 +556,8 @@ function buildFlowchart() {
   const el = document.getElementById('pipelineGraph');
   el.innerHTML = NODES.map(n => `
     <div class="pg-row">
-      <div class="pg-node pending" id="nd_${n}">
+      <div class="pg-node pending" id="nd_${n}"
+           onclick="if(nodeDetails['${n}']) showNodePopup('${n}', event)">
         <div class="nd-dot"></div>
         <span>${n.replace('_',' ')}</span>
         <span class="nd-ms" id="ndms_${n}"></span>
@@ -549,7 +648,8 @@ function setStatus(t) {
 // ── Reset per turn ────────────────────────────────────────────────────────
 function resetTurn() {
   llmChunks = 0; tlCount = 0; tcCount = 0; currentTurnCost = 0; llmStartTime = 0;
-  nodeState = {}; nodeTiming = {};
+  nodeState = {}; nodeTiming = {}; nodeDetails = {};
+  closeNodePopup();
   NODES.forEach(n => { setNode(n, 'pending', null); document.getElementById('ndms_' + n).textContent = ''; });
   setEl('pgCostTotal', '');
   // Reset dots
@@ -558,8 +658,8 @@ function resetTurn() {
   ['DR','CLF','FLT','RT','BP','TC','LLM','TL'].forEach(s => setEl('b'+s,'—'));
   setEl('bTC','0'); setEl('bTL','0');
   // Reset KV fields
-  ['dr_domain','dr_conf','dr_ms','dr_cost','dr_tokens','dr_prompt','dr_user'].forEach(s=>setEl(s,'—'));
-  ['clf_main','clf_sub','clf_pivot','clf_clarify','clf_entities','clf_reason','clf_ms','clf_cost','clf_tokens','clf_user'].forEach(s=>setEl(s,'—'));
+  ['dr_model','dr_provider','dr_domain','dr_conf','dr_ms','dr_cost','dr_tokens','dr_prompt','dr_user'].forEach(s=>setEl(s,'—'));
+  ['clf_model','clf_main','clf_sub','clf_pivot','clf_clarify','clf_entities','clf_reason','clf_ms','clf_cost','clf_tokens','clf_user'].forEach(s=>setEl(s,'—'));
   setHtml('clf_fd','—');
   setHtml('flt_after','—'); setHtml('flt_delta','—');
   ['rt_tier','rt_model','rt_auth'].forEach(s=>setEl(s,'—'));
@@ -585,10 +685,20 @@ function handleStep(d) {
     setNode(node, 'done', d.latency_ms);
   }
 
+  if (step === 'node_result') {
+    storeNodeDetail(d);
+    // Tooltip shows on click; dot already set by the domain_router/classifier step
+    return;
+  }
+
   if (step === 'domain_router') {
     const conf = d.confidence != null ? Math.round(d.confidence * 100) + '%' : '—';
     setDot('dDR', d.domain === 'out_of_scope' ? 'yellow' : 'green');
     setEl('bDR', d.domain + ' · ' + conf);
+    // Model name — strip date suffix for display: claude-haiku-4-5-20251001 → haiku4.5
+    const modelShort = (d.model_id||'—').replace('claude-','').replace(/-20\d{6}$/,'').replace(/-4-5$/,'4.5').replace(/-4-6$/,'4.6');
+    setEl('dr_model',    modelShort, 'purple');
+    setEl('dr_provider', d.provider||'—', 'dim');
     setEl('dr_domain', d.domain, d.domain==='out_of_scope'?'warn':'hi');
     setEl('dr_conf',   conf, parseFloat(conf)<70?'warn':'');
     setEl('dr_ms',     d.latency_ms + 'ms', 'dim');
@@ -607,6 +717,8 @@ function handleStep(d) {
     const sub  = d.sub_intent  || '—';
     setDot('dCLF', main==='out_of_scope'?'yellow':'green');
     setEl('bCLF', main + '/' + sub);
+    const clfShort = (d.model_id||'—').replace('claude-','').replace(/-20\d{6}$/,'').replace(/-4-5/,'4.5').replace(/-4-6/,'4.6');
+    setEl('clf_model', clfShort, 'purple');
     setEl('clf_main',    main, 'hi');
     setEl('clf_sub',     sub);
     setEl('clf_pivot',   d.pivot ? '⚡ YES' : 'no', d.pivot?'warn':'dim');

@@ -201,7 +201,7 @@ def _build_out_of_scope_response(classification: dict) -> str:
 # Node 1: safety_node
 # ---------------------------------------------------------------------------
 
-async def safety_node(state: BotState) -> dict:
+async def safety_node(state: BotState, emit_sse=None) -> dict:
     """Tier 0 content safety check — regex only, no AI call.
 
     Input:  state['raw_message']
@@ -213,16 +213,16 @@ async def safety_node(state: BotState) -> dict:
 
     if safety_result["blocked"]:
         reason = safety_result.get("reason")
-        log.warning(
-            "safety_blocked",
-            reason=reason,
-            request_id=state.get("request_id"),
-        )
-        return {
-            "safety_result": safety_result,
-            "bot_response":  _canned_safety_response(reason),
-        }
+        log.warning("safety_blocked", reason=reason, request_id=state.get("request_id"))
+        if emit_sse:
+            emit_sse("pipeline_step", {"step": "node_result", "node": "safety",
+                                       "status": "blocked", "reason": reason,
+                                       "message_len": len(raw_message)})
+        return {"safety_result": safety_result, "bot_response": _canned_safety_response(reason)}
 
+    if emit_sse:
+        emit_sse("pipeline_step", {"step": "node_result", "node": "safety",
+                                   "status": "passed", "message_len": len(raw_message)})
     return {"safety_result": safety_result}
 
 
@@ -230,7 +230,7 @@ async def safety_node(state: BotState) -> dict:
 # Node 2: normalize_node
 # ---------------------------------------------------------------------------
 
-async def normalize_node(state: BotState) -> dict:
+async def normalize_node(state: BotState, emit_sse=None) -> dict:
     """Minimal pre-processing — unicode NFC normalisation and trim only.
 
     Does NOT pre-extract prices or amounts.  Regex cannot distinguish
@@ -244,16 +244,16 @@ async def normalize_node(state: BotState) -> dict:
     normalized = _normalize_text(raw_message)
 
     if _is_gibberish(normalized):
-        log.info(
-            "normalize_gibberish",
-            message_len=len(normalized),
-            request_id=state.get("request_id"),
-        )
-        return {
-            "normalized_message": normalized,
-            "bot_response": "I didn't catch that — could you describe what you're looking for?",
-        }
+        log.info("normalize_gibberish", message_len=len(normalized), request_id=state.get("request_id"))
+        if emit_sse:
+            emit_sse("pipeline_step", {"step": "node_result", "node": "normalize",
+                                       "status": "gibberish", "raw": raw_message[:100]})
+        return {"normalized_message": normalized,
+                "bot_response": "I didn't catch that — could you describe what you're looking for?"}
 
+    if emit_sse and raw_message != normalized:
+        emit_sse("pipeline_step", {"step": "node_result", "node": "normalize",
+                                   "status": "ok", "raw": raw_message[:120], "normalized": normalized[:120]})
     return {"normalized_message": normalized}
 
 
@@ -312,6 +312,8 @@ async def route_domain_node(state: BotState, router: object, emit_sse=None) -> d
         usage = result.get("_usage", {}) if isinstance(result, dict) else {}
         _HAIKU_IN, _HAIKU_OUT = 0.80, 4.00
         cost_usd = (usage.get("input_tokens", 0) * _HAIKU_IN + usage.get("output_tokens", 0) * _HAIKU_OUT) / 1_000_000
+        from src.registries.model_registry import MODEL_REGISTRY
+        _dr = MODEL_REGISTRY.get("domain_router")
         emit_sse("pipeline_step", {
             "step":          "domain_router",
             "domain":        domain,
@@ -319,6 +321,8 @@ async def route_domain_node(state: BotState, router: object, emit_sse=None) -> d
             "latency_ms":    latency_ms,
             "coerced":       coerced,
             "prev_domain":   session.get("last_domain"),
+            "model_id":      _dr.model_id if _dr else "unknown",
+            "provider":      _dr.provider if _dr else "unknown",
             "input_tokens":  usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
             "cost_usd":      round(cost_usd, 6),
@@ -381,6 +385,7 @@ async def classify_node(state: BotState, classifier: object, emit_sse=None) -> d
     latency_ms = int((_time.monotonic() - t0) * 1000)
 
     if emit_sse:
+        from src.registries.model_registry import MODEL_REGISTRY as _MR
         usage = classification.pop("_usage", {}) or {}
         _HAIKU_IN, _HAIKU_OUT = 0.80, 4.00
         cost_usd = (usage.get("input_tokens", 0) * _HAIKU_IN + usage.get("output_tokens", 0) * _HAIKU_OUT) / 1_000_000
@@ -401,6 +406,7 @@ async def classify_node(state: BotState, classifier: object, emit_sse=None) -> d
             "cost_usd":             round(cost_usd, 6),
             "system_prompt_chars":  usage.get("system_prompt_chars", 0),
             "user_content":         state.get("normalized_message", "")[:200],
+            "model_id":             (_MR.get(f"intent_classifier_{domain}") or _MR.get("intent_classifier_property_search") or type('x', (), {'model_id': 'unknown'})()).model_id,
         })
 
     return {"classification": classification}
@@ -410,7 +416,7 @@ async def classify_node(state: BotState, classifier: object, emit_sse=None) -> d
 # Node 3c: validate_slm_node
 # ---------------------------------------------------------------------------
 
-async def validate_slm_node(state: BotState) -> dict:
+async def validate_slm_node(state: BotState, emit_sse=None) -> dict:
     """Validates Stage 2 SLM JSON output before any downstream node consumes it.
 
     Three successive guardrail checks:
@@ -543,4 +549,13 @@ async def validate_slm_node(state: BotState) -> dict:
         if len(words) > 30:
             c['reasoning'] = ' '.join(words[:30])
 
+    if emit_sse:
+        emit_sse("pipeline_step", {
+            "step": "node_result", "node": "validate_slm",
+            "status": "ok",
+            "main_intent": c.get("main_intent"), "sub_intent": c.get("sub_intent"),
+            "entity_count": len(c.get("entities_mentioned") or []),
+            "entity_refs_count": len(c.get("entity_refs") or []),
+            "coercions_applied": bool(c.get("_coercions")),
+        })
     return {"classification": c}

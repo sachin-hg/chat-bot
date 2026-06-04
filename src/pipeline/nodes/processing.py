@@ -246,7 +246,7 @@ def sanitize_filters_on_pivot(classification: dict, session: dict) -> dict:
 # Node: sanitize_node  (CHAT-P-009)
 # ---------------------------------------------------------------------------
 
-async def sanitize_node(state: BotState) -> dict:
+async def sanitize_node(state: BotState, emit_sse=None) -> dict:
     """Clear filters that don't make sense after an intent pivot.
 
     Runs only when classification['pivot'] is True; no-ops otherwise.
@@ -257,13 +257,21 @@ async def sanitize_node(state: BotState) -> dict:
     """
     c = state.get("classification") or {}
     if c.get("pivot"):
+        before = dict((state["session"].get("active_filters") or {}))
         session = sanitize_filters_on_pivot(c, dict(state["session"]))
-        log.info(
-            "sanitize_node_ran",
-            new_intent=c.get("main_intent"),
-            request_id=state.get("request_id"),
-        )
+        after  = dict((session.get("active_filters") or {}))
+        cleared = [k for k in before if k not in after]
+        log.info("sanitize_node_ran", new_intent=c.get("main_intent"), request_id=state.get("request_id"))
+        if emit_sse:
+            emit_sse("pipeline_step", {"step": "node_result", "node": "sanitize",
+                                       "status": "pivot_sanitized",
+                                       "new_intent": c.get("main_intent"),
+                                       "cleared_keys": cleared,
+                                       "filters_after": after})
         return {"session": session, "sanitized": True}
+    if emit_sse:
+        emit_sse("pipeline_step", {"step": "node_result", "node": "sanitize",
+                                   "status": "no_pivot_skipped"})
     return {}
 
 
@@ -400,7 +408,7 @@ def _resolve_ordinal_from_carousel(ordinal: int, carousel: dict) -> dict | None:
     return item
 
 
-async def resolve_entities_node(state: BotState, executor=None) -> dict:
+async def resolve_entities_node(state: BotState, executor=None, emit_sse=None) -> dict:
     """Pre-resolve locality/project entities before the LLM call.
 
     Also handles ordinal carousel references ("second property", "third one"):
@@ -513,8 +521,21 @@ async def resolve_entities_node(state: BotState, executor=None) -> dict:
 
     if all_resolved:
         session.setdefault("resolved_entity_map", {}).update(all_resolved)
+        if emit_sse:
+            emit_sse("pipeline_step", {
+                "step": "node_result", "node": "resolve_entities",
+                "status": "resolved",
+                "entities": {k: {"uuid": v.get("uuid"), "confidence": v.get("confidence"),
+                                 "display_name": v.get("display_name"), "entity_type": v.get("entity_type")}
+                             for k, v in all_resolved.items()},
+                "active_property_id": session.get("active_property_id"),
+                "active_locality_id": session.get("active_locality_id"),
+            })
         return {"resolved_entities": all_resolved, "session": session}
 
+    if emit_sse:
+        emit_sse("pipeline_step", {"step": "node_result", "node": "resolve_entities",
+                                   "status": "no_entities"})
     return {}
 
 
@@ -800,7 +821,7 @@ async def resolve_landmark_anchor(anchor_text: str, session: dict) -> dict:  # n
 # Node: derive_node  (CHAT-P-010a)
 # ---------------------------------------------------------------------------
 
-async def derive_node(state: BotState) -> dict:
+async def derive_node(state: BotState, emit_sse=None) -> dict:
     """Convert derived filter signals to concrete API params.
 
     Amount strings are already numeric by the time this node runs
@@ -862,6 +883,10 @@ async def derive_node(state: BotState) -> dict:
         filters["localities"] = upgraded
 
     session["active_filters"] = filters
+    if emit_sse and derived:
+        emit_sse("pipeline_step", {"step": "node_result", "node": "derive",
+                                   "status": "derived", "derived_filters": derived,
+                                   "active_filters": filters})
     return {"session": session, "derived_filters": derived}
 
 
