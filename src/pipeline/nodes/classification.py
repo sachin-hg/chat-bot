@@ -382,6 +382,7 @@ async def classify_node(state: BotState, classifier: object, emit_sse=None) -> d
             "sub_intent":           classification.get("sub_intent"),
             "filter_delta":         classification.get("filter_delta") or {},
             "entities_mentioned":   classification.get("entities_mentioned") or [],
+            "entity_refs":          classification.get("entity_refs") or [],
             "pivot":                classification.get("pivot", False),
             "clarification_needed": classification.get("clarification_needed"),
             "reasoning":            classification.get("reasoning", ""),

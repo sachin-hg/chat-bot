@@ -46,9 +46,16 @@ PIVOT RULES:
     "only 3bhk please" → pivot=false + filter_delta: {bhk: [3]}
 
 CLARIFICATION RULES:
-  Set clarification_needed to a question string when the message is ambiguous and needs info.
-  "show me properties" (no location, no BHK, no price) → clarification_needed: "Which city are you looking in?"
-  Set null when you have enough to perform a search.
+  IMPORTANT: Do NOT ask for information already present in ACTIVE_FILTERS.
+  If ACTIVE_FILTERS already has city → do NOT ask for city.
+  If ACTIVE_FILTERS already has bhk → do NOT ask for BHK.
+  If ACTIVE_FILTERS already has transaction_type → do NOT ask for buy/rent.
+  Only ask for info that is MISSING from ACTIVE_FILTERS AND cannot be inferred.
+
+  "show me properties" (ACTIVE_FILTERS has city=Mumbai) → null (city known; proceed)
+  "2bhk" (ACTIVE_FILTERS has city=Bangalore) → null (city known from filters; search)
+  "show me properties" (ACTIVE_FILTERS empty, no context) → "Which city are you looking in?"
+  Set null when you have enough to perform a search (city is the minimum required).
 
 EXAMPLES:
 Input: "show me 2bhk in bandra under 2 crore"

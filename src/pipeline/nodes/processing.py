@@ -155,9 +155,11 @@ async def filter_apply_node(state: BotState, emit_sse=None) -> dict:
     clarification_needed = c.get("clarification_needed")
     session = dict(state["session"])
 
-    if filter_delta and not clarification_needed:
+    if filter_delta:
+        # Apply known filters regardless of whether clarification is needed.
+        # Clarification asks for MORE info — it should not discard what is already known.
+        # E.g. "something in Bangalore" → city=Bangalore is known even if BHK is unclear.
         filters_before = dict(session.get("active_filters") or {})
-        # Parse tagged amount strings before writing to session.
         filter_delta = dict(filter_delta)
         for key in ("price_min", "price_max", "price_per_sqft"):
             if isinstance(filter_delta.get(key), str):
@@ -168,15 +170,17 @@ async def filter_apply_node(state: BotState, emit_sse=None) -> dict:
         log.info(
             "filter_apply_node_applied",
             keys=list(filter_delta.keys()),
+            clarification_pending=bool(clarification_needed),
             request_id=state.get("request_id"),
         )
         if emit_sse:
             emit_sse("pipeline_step", {
-                "step":           "filters",
-                "before":         filters_before,
-                "delta":          filter_delta,
-                "after":          dict(session.get("active_filters") or {}),
-                "pivot":          c.get("pivot", False),
+                "step":                  "filters",
+                "before":                filters_before,
+                "delta":                 filter_delta,
+                "after":                 dict(session.get("active_filters") or {}),
+                "pivot":                 c.get("pivot", False),
+                "clarification_pending": bool(clarification_needed),
             })
         return {"session": session, "filter_delta_applied": True}
 
@@ -414,60 +418,82 @@ async def resolve_entities_node(state: BotState, executor=None) -> dict:
     entities    = c.get("entities_mentioned") or []
     session     = dict(state["session"])
 
-    # ── Ordinal resolution ─────────────────────────────────────────────
-    # Check for ordinal references ("second property", "third one") and resolve
-    # against session['carousel_state'] so the pipeline can fetch the right item.
-    carousel    = session.get("carousel_state") or {}
-    turn_count  = session.get("turn_count", 0)
-    carousel_turn = carousel.get("stored_at_turn", -999)
-    carousel_fresh = (turn_count - carousel_turn) <= 6  # expire after 6 turns
+    # ── entity_refs resolution ─────────────────────────────────────────────
+    # entity_refs is output by the SLM as structured references to session-stored
+    # context ("looking_for":"property", "by":"cardinality", "value":2).
+    # The orchestrator resolves them here — the LLM never sees carousel items.
+    # This keeps token cost near zero for reference resolution.
+    #
+    # Supported ref types:
+    #   by="cardinality": ordinal index into session['carousel_state'] (1-based; -1=last)
+    #   by="active":      the currently active entity (session['active_property_id'] etc.)
+    #   by="recent":      the most-recently-stored carousel item (index -1)
+    #
+    # Backwards compat: also handles legacy inferred_type="ordinal_property" entities.
 
-    ordinal_resolved = {}
-    if carousel_fresh and carousel.get("items"):
+    entity_refs   = c.get("entity_refs") or []
+    carousel      = session.get("carousel_state") or {}
+    turn_count    = session.get("turn_count", 0)
+    carousel_age  = turn_count - carousel.get("stored_at_turn", -999)
+    carousel_live = carousel_age <= 6  # expire after 6 turns
+
+    ordinal_resolved: dict = {}
+
+    def _apply_carousel_ref(ref_key: str, item: dict, ctype: str) -> None:
+        entity_id = item.get("id") or item.get("uuid", "")
+        if not entity_id:
+            return
+        if ctype == "property":
+            session["active_property_id"] = entity_id
+            ordinal_resolved[ref_key] = {
+                "uuid": entity_id, "display_name": item.get("title", ref_key),
+                "entity_type": "property", "confidence": 1.0, "property_id": entity_id,
+            }
+            log.info("entity_ref_resolved_property", ref=ref_key, id=entity_id)
+        elif ctype == "locality":
+            session["active_locality_id"] = entity_id
+            ordinal_resolved[ref_key] = {
+                "uuid": entity_id, "display_name": item.get("name", ref_key),
+                "entity_type": "locality", "confidence": 1.0,
+            }
+            log.info("entity_ref_resolved_locality", ref=ref_key, id=entity_id)
+
+    # 1. Process structured entity_refs (new schema)
+    for ref in entity_refs:
+        looking_for = ref.get("looking_for", "property")
+        by          = ref.get("by", "cardinality")
+        value       = ref.get("value")
+        ref_key     = f"ref:{looking_for}:{by}:{value}"
+
+        if by == "cardinality" and carousel_live and carousel.get("type") == looking_for:
+            idx = int(value) if value is not None else 1
+            item = _resolve_ordinal_from_carousel(idx, carousel)
+            if item:
+                _apply_carousel_ref(ref_key, item, looking_for)
+
+        elif by in ("active", "recent"):
+            if looking_for == "property" and session.get("active_property_id"):
+                pass   # already set — no-op
+            elif by == "recent" and carousel_live and carousel.get("type") == looking_for:
+                items = carousel.get("items") or []
+                if items:
+                    _apply_carousel_ref(ref_key, items[-1], looking_for)
+
+    # 2. Backwards-compat: legacy inferred_type="ordinal_*" in entities_mentioned
+    if carousel_live and carousel.get("items"):
         for entity in entities:
             inferred = entity.get("inferred_type", "")
             name     = entity.get("name", "")
-            # Detect ordinal by inferred_type or by parsing the name word
-            is_ordinal = inferred in ("ordinal", "ordinal_property", "ordinal_locality")
-            ordinal_num = _parse_ordinal(name)
-            if not is_ordinal and ordinal_num is not None:
-                is_ordinal = True
-            if is_ordinal and ordinal_num is None:
-                ordinal_num = 1  # default to first if can't parse
-            if is_ordinal:
-                item = _resolve_ordinal_from_carousel(ordinal_num, carousel)
+            is_ord   = inferred in ("ordinal", "ordinal_property", "ordinal_locality")
+            ord_num  = _parse_ordinal(name)
+            if not is_ord and ord_num is not None:
+                is_ord = True
+            if is_ord:
+                num = ord_num or 1
+                ctype = carousel.get("type", "property")
+                item = _resolve_ordinal_from_carousel(num, carousel)
                 if item:
-                    ctype = carousel.get("type", "property")
-                    if ctype == "property":
-                        prop_id = item.get("id") or item.get("uuid")
-                        if prop_id:
-                            session["active_property_id"] = prop_id
-                            # Synthesise a resolved entity so fetch_data_node can use it
-                            ordinal_resolved[name] = {
-                                "uuid":         prop_id,
-                                "display_name": item.get("title", name),
-                                "entity_type":  "property",
-                                "confidence":   1.0,
-                                "property_id":  prop_id,
-                            }
-                            log.info("ordinal_resolved_property",
-                                     ordinal=ordinal_num, property_id=prop_id, name=name)
-                    elif ctype == "locality":
-                        loc_id = item.get("id") or item.get("uuid")
-                        if loc_id:
-                            session["active_locality_id"] = loc_id
-                            ordinal_resolved[name] = {
-                                "uuid":         loc_id,
-                                "display_name": item.get("name", name),
-                                "entity_type":  "locality",
-                                "confidence":   1.0,
-                            }
-                            log.info("ordinal_resolved_locality",
-                                     ordinal=ordinal_num, locality_id=loc_id)
-
-    # Also inject carousel items into session for LLM context
-    if carousel_fresh and carousel.get("items") and not session.get("_carousel_injected"):
-        session["_carousel_injected"] = True  # avoid re-injection every turn
+                    _apply_carousel_ref(name, item, ctype)
 
     # Non-ordinal entities: resolve names via autosuggest when needed
     named_entities = [
@@ -906,6 +932,17 @@ async def clarify_node(state: BotState, emit_sse=None) -> dict:
         }
         bot_response = {"template_id": "nested_qna", "data": nested_qna_payload}
         _emit_bot_response(bot_response, state, emit_sse)
+
+        # Persist session NOW — clarify_node short-circuits and followup_node won't run.
+        # Without this, any filter updates from filter_apply_node (e.g. city=Bangalore)
+        # are lost: the next turn loads a blank session from Redis.
+        session = state.get("session") or {}
+        try:
+            from src.pipeline.nodes.response import update_session_state
+            await update_session_state(session, c, [])
+        except Exception as exc:
+            log.warn("clarify_session_persist_failed", error=str(exc))
+
         return {
             "bot_response": bot_response,
             "clarification_emitted": True,

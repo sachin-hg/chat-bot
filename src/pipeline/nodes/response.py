@@ -567,21 +567,11 @@ def _append_data_context(system: str, state: 'BotState', c: dict, session: dict)
         if len(data_lines) > 1:
             parts.append("\n".join(data_lines))
 
-    # Inject recent carousel for ordinal reference resolution
-    # ("second property", "third locality" etc.)
-    carousel = session.get('carousel_state') or {}
-    carousel_items = carousel.get('items') or []
-    carousel_turn  = carousel.get('stored_at_turn', -999)
-    cur_turn       = session.get('turn_count', 0)
-    if carousel_items and (cur_turn - carousel_turn) <= 6:
-        ctype = carousel.get('type', 'property')
-        parts.append(f"\n\n## RECENTLY SHOWN {ctype.upper()} CAROUSEL (use for ordinal references)")
-        parts.append("If the user says 'second property', 'the third one', 'that listing', etc., refer to this list:")
-        for item in carousel_items:
-            if ctype == 'property':
-                parts.append(f"  #{item['ordinal']}: {item.get('title','')} | {item.get('price_display','')} | {item.get('locality','')}")
-            elif ctype == 'locality':
-                parts.append(f"  #{item['ordinal']}: {item.get('name','')} | {item.get('city','')}")
+    # NOTE: Carousel items are NOT injected here.
+    # Ordinal/positional references ("second property") are resolved by
+    # resolve_entities_node (orchestrator layer) via entity_refs in the
+    # classification output. The LLM only sees the already-resolved entity data.
+    # Injecting the full carousel list here would violate SRP and waste tokens.
 
     return "\n".join(parts)
 
