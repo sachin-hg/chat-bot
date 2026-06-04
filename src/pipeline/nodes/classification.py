@@ -17,6 +17,13 @@ from typing import Optional, Set
 
 from src.observability.logging import get_logger
 from src.pipeline.state import BotState
+
+try:
+    from langsmith import traceable as _traceable
+except ImportError:
+    def _traceable(*args, **kwargs):          # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap if args and callable(args[0]) else _wrap
 from src.registries.intent_registry import INTENT_REGISTRY, get_intent_record
 
 log = get_logger(__name__)
@@ -254,6 +261,7 @@ async def normalize_node(state: BotState) -> dict:
 # Node 3a: route_domain_node
 # ---------------------------------------------------------------------------
 
+@_traceable(run_type="chain", name="domain_routing")
 async def route_domain_node(state: BotState, router: object, emit_sse=None) -> dict:
     """Stage 1 domain router.
 
@@ -325,6 +333,7 @@ async def route_domain_node(state: BotState, router: object, emit_sse=None) -> d
 # Node 3b: classify_node
 # ---------------------------------------------------------------------------
 
+@_traceable(run_type="chain", name="intent_classification")
 async def classify_node(state: BotState, classifier: object, emit_sse=None) -> dict:
     """Stage 2 domain-scoped intent classifier.
 

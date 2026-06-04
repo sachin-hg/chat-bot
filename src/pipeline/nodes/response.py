@@ -23,6 +23,15 @@ from src.pipeline.state import BotState
 
 log = get_logger(__name__)
 
+# LangSmith @traceable — same pattern as the Anthropic adapters.
+# Falls back to a no-op when langsmith is not installed or tracing is off.
+try:
+    from langsmith import traceable as _traceable
+except ImportError:
+    def _traceable(*args, **kwargs):          # type: ignore[misc]
+        def _wrap(fn): return fn
+        return _wrap if args and callable(args[0]) else _wrap
+
 # ---------------------------------------------------------------------------
 # Confidence threshold for the eagerness guard in summary_node
 # ---------------------------------------------------------------------------
@@ -162,6 +171,11 @@ async def _build_tool_params(req, state: BotState) -> dict:
     return {}
 
 
+@_traceable(
+    run_type="tool",
+    name="prefetch_tool_call",
+    # Metadata extracted dynamically from inputs; LangSmith shows tool + params
+)
 async def _execute_prefetch_stub(req, state: BotState, executor, emit_sse=None) -> tuple:
     import time as _time
     key = req.fetch_key or req.tool
@@ -692,6 +706,16 @@ async def stream_llm(llm: LLMPort, model: str, system: str, messages: list,
         return {'response': {'text': ''}, 'tool_results': []}
 
 
+@_traceable(run_type="tool", name="llm_tool_call")
+async def _traced_llm_tool_call(executor, tool: str, params: dict, ttl: int) -> Any:
+    """Thin traceable wrapper around executor.execute() for LLM-initiated tool calls.
+
+    Having a named function (not a closure) lets @traceable attach inputs/outputs
+    as a named span in LangSmith — params and result appear clearly in the trace.
+    """
+    return await executor.execute(tool, params, ttl)
+
+
 # ---------------------------------------------------------------------------
 # Node: llm_node  (CHAT-P-015a)
 # ---------------------------------------------------------------------------
@@ -755,7 +779,11 @@ async def llm_node(state: BotState, llm: LLMPort, emit_sse: Callable, executor=N
             from src.tools.executor import get_tool_cache_ttl
             ttl = get_tool_cache_ttl(tool)
             try:
-                return await asyncio.wait_for(executor.execute(tool, wired, ttl), timeout=2.0)
+                result = await asyncio.wait_for(
+                    _traced_llm_tool_call(executor, tool, wired, ttl),
+                    timeout=2.0,
+                )
+                return result
             except asyncio.TimeoutError:
                 log.warning('llm_tool_call_timeout', tool=tool)
                 return {}
