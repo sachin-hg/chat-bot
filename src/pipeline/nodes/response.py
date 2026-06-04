@@ -633,6 +633,12 @@ async def validate_output_node(state: BotState) -> dict:
     """
     llm_resp = state.get('llm_response') or {}
     raw_text = llm_resp.get('text', '')
+
+    # Warn when LLM was cut off mid-response (max_tokens reached)
+    if llm_resp.get('stop_reason') == 'max_tokens':
+        log.warning('llm_response_truncated', request_id=state.get('request_id'),
+                    text_len=len(raw_text))
+
     cleaned_text, validation = validate_bot_output(raw_text)
 
     # Markdown tables: allowed for comparison intents, blocked for all others
@@ -924,6 +930,21 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
         )
         emit_sse('chat_event', close_event.model_dump(by_alias=True))
         bot_response = None
+
+    # Persist user message to Kafka (fire-and-forget, same topic as bot messages)
+    raw_message = state.get('raw_message', '')
+    if raw_message and not raw_message.startswith('user_action:'):
+        user_event = {
+            'conversationId': conversation_id,
+            'messageId':      source_msg_id,
+            'messageType':    'text',
+            'messageState':   'COMPLETED',
+            'sourceMessageState': 'COMPLETED',
+            'sender':         {'type': 'user'},
+            'content':        {'text': raw_message},
+            'createdAt':      now,
+        }
+        await persist_to_kafka(conversation_id, [user_event])
 
     session = state['session']
     saved   = await update_session_state(session, c, state.get('tool_results') or [])

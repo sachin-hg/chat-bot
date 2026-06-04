@@ -385,6 +385,9 @@ async def validate_slm_node(state: BotState) -> dict:
         )
         return {"bot_response": "I had trouble understanding that — could you rephrase?"}
 
+    # Shallow-copy before any mutation so we don't alter the original dict
+    c = dict(c)
+
     # ── Check 2: cross-domain hallucination guard ───────────────────────
     domain: str = state.get("domain") or "out_of_scope"
     allowed_intents: set = DOMAIN_MAIN_INTENTS.get(domain, set())

@@ -80,6 +80,32 @@ class GetPropertyDetailExecutor(HttpToolExecutor):
         }
 
 
+class GetSimilarPropertiesExecutor(HttpToolExecutor):
+    """getSimilarProperties — Casa API. Returns an array of similar properties."""
+
+    def __init__(self, redis_pool, casa_base_url: str):
+        super().__init__(redis_pool)
+        self._base_url = casa_base_url.rstrip('/')
+
+    async def call(self, tool: str, params: dict) -> Any:
+        property_id = params.get('property_id') or params.get('id')
+        if not property_id:
+            return {'properties': [], 'total': 0}
+        resp = await self._http.get(
+            f'{self._base_url}/api/v1/properties/{property_id}/similar',
+            params={'limit': params.get('limit', 10)},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        properties = (
+            data.get('similar_properties') or
+            data.get('properties') or
+            data.get('data') or
+            []
+        )
+        return {'properties': properties, 'total': data.get('total', len(properties))}
+
+
 class GetNearbyLandmarksExecutor(HttpToolExecutor):
     """getNearbyLandmarks — Odin API. Returns nearby landmarks truncated to 5."""
 

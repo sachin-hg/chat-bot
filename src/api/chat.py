@@ -257,9 +257,19 @@ async def send_message_streamed(
         raw_message = body.content.text or ""
 
     handoff = body.handoff_context.model_dump(by_alias=False) if body.handoff_context else None
+
+    # Load existing session from Redis (returns {} on first turn → make_base_state uses defaults)
+    from src.session.store import RedisSessionStore
+    try:
+        loaded_session = await RedisSessionStore(get_redis()).load(conversation_id)
+    except Exception as exc:
+        log.warning("session_load_failed_using_fresh", error=str(exc), conversation_id=conversation_id)
+        loaded_session = {}
+
     state = make_base_state(
         raw_message=raw_message,
         session_id=conversation_id,
+        session=loaded_session if loaded_session else None,
         request_id=request_id,
         handoff_context=handoff,
     )
@@ -324,6 +334,7 @@ async def send_message_streamed(
 async def send_message(
     body: ChatEventFromUser,
     request: Request,
+    settings: Settings = Depends(get_settings),
 ) -> Response:
     """
     Non-streaming synchronous endpoint for silent user actions
@@ -334,10 +345,9 @@ async def send_message(
     the request.
     """
     # 1. Check LLM gate if it is wired up on app.state (optional — skip if absent)
-    llm_gate = getattr(getattr(request, "app", None), "state", None)
-    llm_gate = getattr(llm_gate, "llm_gate", None) if llm_gate is not None else None
+    llm_gate = getattr(getattr(request.app, "state", None), "llm_gate", None)
     if llm_gate is not None:
-        allowed = await llm_gate() if callable(llm_gate) else llm_gate
+        allowed = await llm_gate.acquire()
         if not allowed:
             return Response(
                 content='{"error": "rate_limited"}',
@@ -361,16 +371,24 @@ async def send_message(
     else:
         raw_message = body.content.text or ""
 
-    # 4. Build initial BotState
+    # 4. Load existing session + build BotState
+    from src.session.store import RedisSessionStore
+    try:
+        loaded_session = await RedisSessionStore(get_redis()).load(conversation_id)
+    except Exception:
+        loaded_session = {}
+
     state = make_base_state(
         raw_message=raw_message,
         session_id=conversation_id,
+        session=loaded_session if loaded_session else None,
         request_id=request_id,
     )
 
     # 5. Run the pipeline graph synchronously with a noop SSE emitter
     noop_emit = lambda *args, **kwargs: None  # silent — no SSE stream needed
-    graph = build_graph(emit_sse=noop_emit)
+    _, _, _, executor = _build_adapters(settings, get_redis())
+    graph = build_graph(emit_sse=noop_emit, executor=executor)
     await graph.ainvoke(state)
 
     # 6. Return JSON confirmation

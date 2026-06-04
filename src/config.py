@@ -38,7 +38,9 @@ class Settings(BaseSettings):
     # Application
     bot_env:    Literal["mock", "dev", "local", "staging", "production"] = "dev"
     log_level:  str              = "INFO"
-    secret_key: Optional[SecretStr] = None          # required in local/staging/prod
+    # Reserved for session token HMAC signing (Sprint 3 auth hardening).
+    # Currently unused — X-Session-Token is checked for presence only.
+    secret_key: Optional[SecretStr] = None
 
     # Housing login service
     login_service_url: str = ""

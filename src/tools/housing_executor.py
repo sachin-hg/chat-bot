@@ -98,7 +98,7 @@ _INLINE_HANDLERS = {
 
 def _build_dispatch_map(settings: Settings, redis) -> dict[str, HttpToolExecutor]:
     """Build tool_name → executor instance map from settings."""
-    from src.tools.search    import SearchPropertiesExecutor, GetPropertyDetailExecutor, GetNearbyLandmarksExecutor
+    from src.tools.search    import SearchPropertiesExecutor, GetPropertyDetailExecutor, GetNearbyLandmarksExecutor, GetSimilarPropertiesExecutor
     from src.tools.entity    import ResolveEntityExecutor
     from src.tools.locality  import GetLocalityDetailExecutor, GetTrendingLocalitiesExecutor, GetPriceTrendsExecutor
     from src.tools.project   import GetProjectDetailExecutor, GetProjectPriceTrendsExecutor
@@ -121,7 +121,7 @@ def _build_dispatch_map(settings: Settings, redis) -> dict[str, HttpToolExecutor
         ("searchProperties",          make(SearchPropertiesExecutor,         "khoj_base_url")),
         ("getPropertyDetail",         make(GetPropertyDetailExecutor,        "casa_base_url")),
         ("getNearbyLandmarks",        make(GetNearbyLandmarksExecutor,       "odin_base_url")),
-        ("getSimilarProperties",      make(GetPropertyDetailExecutor,        "casa_base_url")),  # same API
+        ("getSimilarProperties",      make(GetSimilarPropertiesExecutor,     "casa_base_url")),
         ("resolveEntity",             make(ResolveEntityExecutor,            "autosuggest_base_url")),
         ("getLocalityDetail",         make(GetLocalityDetailExecutor,        "casa_base_url")),
         ("getTrendingLocalities",     make(GetTrendingLocalitiesExecutor,    "odin_base_url")),

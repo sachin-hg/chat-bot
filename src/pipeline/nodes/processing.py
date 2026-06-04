@@ -738,4 +738,3 @@ def translate_to_wire_format(tool: str, params: dict, session: dict) -> dict:
         if p.wire_param and p.key in result:
             result[p.wire_param] = result.pop(p.key)
     return result
-    return {}
