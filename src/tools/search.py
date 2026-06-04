@@ -53,7 +53,7 @@ class GetPropertyDetailExecutor(HttpToolExecutor):
         self._base_url = casa_base_url.rstrip('/')
 
     async def call(self, tool: str, params: dict) -> Any:
-        property_id = params.get('property_id') or params.get('id')
+        property_id = params.get('property_id') or params.get('id') or params.get('uuid')
         if not property_id:
             return {}
         resp = await self._http.get(
@@ -88,7 +88,7 @@ class GetSimilarPropertiesExecutor(HttpToolExecutor):
         self._base_url = casa_base_url.rstrip('/')
 
     async def call(self, tool: str, params: dict) -> Any:
-        property_id = params.get('property_id') or params.get('id')
+        property_id = params.get('property_id') or params.get('id') or params.get('uuid')
         if not property_id:
             return {'properties': [], 'total': 0}
         resp = await self._http.get(

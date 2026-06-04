@@ -8,7 +8,7 @@ DOMAIN_TO_INTENTS: dict = {
     'property_search':  ['property_search'],
     'property_detail':  ['property_detail', 'calculator'],
     'locality':         ['locality_research', 'comparison'],
-    'project_research': ['project_research'],
+    'project_research': ['project_research', 'comparison'],
     'portfolio':        ['portfolio', 'multi_intent'],
 }
 

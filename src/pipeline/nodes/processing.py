@@ -358,18 +358,55 @@ async def _resolve_entities_real(entities: list, session: dict, executor) -> dic
     return resolved
 
 
+_ORDINAL_WORDS = {
+    "first": 1, "1st": 1,
+    "second": 2, "2nd": 2,
+    "third": 3, "3rd": 3,
+    "fourth": 4, "4th": 4,
+    "fifth": 5, "5th": 5,
+    "last": -1,  # resolve to last item
+}
+
+
+def _parse_ordinal(text: str) -> int | None:
+    """Convert an ordinal word/number to a 1-based index. Returns None if not ordinal."""
+    t = text.strip().lower()
+    if t in _ORDINAL_WORDS:
+        return _ORDINAL_WORDS[t]
+    try:
+        n = int(t)
+        return n if 1 <= n <= 20 else None
+    except ValueError:
+        return None
+
+
+def _resolve_ordinal_from_carousel(ordinal: int, carousel: dict) -> dict | None:
+    """Resolve an ordinal index against the session carousel_state.
+
+    Returns None if the carousel is stale (>6 turns ago) or index out of range.
+    """
+    items = carousel.get("items") or []
+    if not items:
+        return None
+    n = len(items)
+    idx = (n - 1) if ordinal == -1 else (ordinal - 1)  # -1 means "last"
+    if idx < 0 or idx >= n:
+        return None
+    item = items[idx]
+    return item
+
+
 async def resolve_entities_node(state: BotState, executor=None) -> dict:
     """Pre-resolve locality/project entities before the LLM call.
 
-    Reads entities from state['classification']['entities_mentioned'] and
-    resolves them to UUIDs when the intent warrants pre-resolution.
-
-    When executor is provided (Sprint 2+), calls the real resolveEntity API.
-    When executor is None (Sprint 1 stub), falls back to pre_resolve_entities.
+    Also handles ordinal carousel references ("second property", "third one"):
+    when an entity has inferred_type == 'ordinal' or 'ordinal_property',
+    look up session['carousel_state'] and resolve to the actual item ID.
+    Carousel state expires after 6 turns (context has likely moved on).
 
     Input:  state['classification'], state['session']
     Output: state['resolved_entities']  (resolved entity map)
-            state['session']            (updated resolved_entity_map)
+            state['session']            (updated with active_property_id / active_locality_id)
     """
     c = state.get("classification") or {}
     main_intent = c.get("main_intent", "")
@@ -377,13 +414,81 @@ async def resolve_entities_node(state: BotState, executor=None) -> dict:
     entities    = c.get("entities_mentioned") or []
     session     = dict(state["session"])
 
-    if requires_pre_resolution(main_intent, sub_intent) and entities:
+    # ── Ordinal resolution ─────────────────────────────────────────────
+    # Check for ordinal references ("second property", "third one") and resolve
+    # against session['carousel_state'] so the pipeline can fetch the right item.
+    carousel    = session.get("carousel_state") or {}
+    turn_count  = session.get("turn_count", 0)
+    carousel_turn = carousel.get("stored_at_turn", -999)
+    carousel_fresh = (turn_count - carousel_turn) <= 6  # expire after 6 turns
+
+    ordinal_resolved = {}
+    if carousel_fresh and carousel.get("items"):
+        for entity in entities:
+            inferred = entity.get("inferred_type", "")
+            name     = entity.get("name", "")
+            # Detect ordinal by inferred_type or by parsing the name word
+            is_ordinal = inferred in ("ordinal", "ordinal_property", "ordinal_locality")
+            ordinal_num = _parse_ordinal(name)
+            if not is_ordinal and ordinal_num is not None:
+                is_ordinal = True
+            if is_ordinal and ordinal_num is None:
+                ordinal_num = 1  # default to first if can't parse
+            if is_ordinal:
+                item = _resolve_ordinal_from_carousel(ordinal_num, carousel)
+                if item:
+                    ctype = carousel.get("type", "property")
+                    if ctype == "property":
+                        prop_id = item.get("id") or item.get("uuid")
+                        if prop_id:
+                            session["active_property_id"] = prop_id
+                            # Synthesise a resolved entity so fetch_data_node can use it
+                            ordinal_resolved[name] = {
+                                "uuid":         prop_id,
+                                "display_name": item.get("title", name),
+                                "entity_type":  "property",
+                                "confidence":   1.0,
+                                "property_id":  prop_id,
+                            }
+                            log.info("ordinal_resolved_property",
+                                     ordinal=ordinal_num, property_id=prop_id, name=name)
+                    elif ctype == "locality":
+                        loc_id = item.get("id") or item.get("uuid")
+                        if loc_id:
+                            session["active_locality_id"] = loc_id
+                            ordinal_resolved[name] = {
+                                "uuid":         loc_id,
+                                "display_name": item.get("name", name),
+                                "entity_type":  "locality",
+                                "confidence":   1.0,
+                            }
+                            log.info("ordinal_resolved_locality",
+                                     ordinal=ordinal_num, locality_id=loc_id)
+
+    # Also inject carousel items into session for LLM context
+    if carousel_fresh and carousel.get("items") and not session.get("_carousel_injected"):
+        session["_carousel_injected"] = True  # avoid re-injection every turn
+
+    # Non-ordinal entities: resolve names via autosuggest when needed
+    named_entities = [
+        e for e in entities
+        if e.get("inferred_type") not in ("ordinal", "ordinal_property", "ordinal_locality")
+        and _parse_ordinal(e.get("name", "")) is None
+    ]
+
+    named_resolved: dict = {}
+    if requires_pre_resolution(main_intent, sub_intent) and named_entities:
         if executor is not None:
-            resolved = await _resolve_entities_real(entities, session, executor)
+            named_resolved = await _resolve_entities_real(named_entities, session, executor)
         else:
-            resolved = await pre_resolve_entities(entities, session)
-        session.setdefault("resolved_entity_map", {}).update(resolved)
-        return {"resolved_entities": resolved, "session": session}
+            named_resolved = await pre_resolve_entities(named_entities, session)
+
+    all_resolved = {**named_resolved, **ordinal_resolved}
+
+    if all_resolved:
+        session.setdefault("resolved_entity_map", {}).update(all_resolved)
+        return {"resolved_entities": all_resolved, "session": session}
+
     return {}
 
 

@@ -567,6 +567,22 @@ def _append_data_context(system: str, state: 'BotState', c: dict, session: dict)
         if len(data_lines) > 1:
             parts.append("\n".join(data_lines))
 
+    # Inject recent carousel for ordinal reference resolution
+    # ("second property", "third locality" etc.)
+    carousel = session.get('carousel_state') or {}
+    carousel_items = carousel.get('items') or []
+    carousel_turn  = carousel.get('stored_at_turn', -999)
+    cur_turn       = session.get('turn_count', 0)
+    if carousel_items and (cur_turn - carousel_turn) <= 6:
+        ctype = carousel.get('type', 'property')
+        parts.append(f"\n\n## RECENTLY SHOWN {ctype.upper()} CAROUSEL (use for ordinal references)")
+        parts.append("If the user says 'second property', 'the third one', 'that listing', etc., refer to this list:")
+        for item in carousel_items:
+            if ctype == 'property':
+                parts.append(f"  #{item['ordinal']}: {item.get('title','')} | {item.get('price_display','')} | {item.get('locality','')}")
+            elif ctype == 'locality':
+                parts.append(f"  #{item['ordinal']}: {item.get('name','')} | {item.get('city','')}")
+
     return "\n".join(parts)
 
 
@@ -1046,7 +1062,61 @@ async def respond_node(state: BotState, emit_sse: Callable) -> dict:
         emit_sse('chat_event', event.model_dump(by_alias=True))
 
     await persist_to_kafka(conversation_id, [e.model_dump(by_alias=True) for e in template_events])
+
+    # Save carousel items to session for ordinal resolution in future turns
+    # ("tell me about the second property" → look up session['carousel_state'])
+    session_update = _build_carousel_state(c, template_events, state['session'])
+    if session_update:
+        return {'template_count': len(template_events), 'session': session_update}
     return {'template_count': len(template_events)}
+
+
+def _build_carousel_state(c: dict, events: list, session: dict) -> dict | None:
+    """Extract carousel items from the emitted template events and save to session.
+
+    Supports property_carousel, locality_carousel. Returns updated session dict
+    or None if nothing worth saving.  Older carousel state is overwritten — the
+    user should always be referring to the most recently shown set.
+    """
+    intent_key = (c.get('main_intent', ''), c.get('sub_intent', ''))
+    new_session = dict(session)
+    saved = False
+
+    for event in events:
+        content = event.content
+        tpl_id  = content.template_id
+        data    = content.data or {}
+
+        if tpl_id == 'property_carousel':
+            props = data.get('properties') or []
+            items = [
+                {'ordinal': i + 1, 'id': p.get('id', ''), 'title': p.get('title', ''),
+                 'price_display': p.get('price_display', ''), 'locality': (p.get('locality') or {}).get('name', '')}
+                for i, p in enumerate(props)
+            ]
+            new_session['carousel_state'] = {
+                'type': 'property',
+                'items': items,
+                'stored_at_turn': session.get('turn_count', 0),
+                'intent': f"{intent_key[0]}/{intent_key[1]}",
+            }
+            saved = True
+
+        elif tpl_id == 'locality_carousel':
+            locs = data.get('localities') or []
+            items = [
+                {'ordinal': i + 1, 'id': loc.get('id', ''), 'name': loc.get('name', ''), 'city': loc.get('city', '')}
+                for i, loc in enumerate(locs)
+            ]
+            new_session['carousel_state'] = {
+                'type': 'locality',
+                'items': items,
+                'stored_at_turn': session.get('turn_count', 0),
+                'intent': f"{intent_key[0]}/{intent_key[1]}",
+            }
+            saved = True
+
+    return new_session if saved else None
 
 
 # ---------------------------------------------------------------------------

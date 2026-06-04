@@ -349,6 +349,22 @@ INTENT_REGISTRY: list[IntentRecord] = [
   # ── project_research ─────────────────────────────────────────────────
   IntentRecord(
     main_intent='project_research',
+    sub_intent='builder_overview',
+    tier='3a',
+    model='haiku',
+    data_requirements=[
+      DataRequirement(tool='getTrendingProjects', params_source='session', parallel_group=1),
+    ],
+    residual_tools=[],
+    session_inject=['city', 'transaction_type'],
+    carry_over_keys=['transaction_type', 'city'],
+    clear_keys=['active_property_id', 'active_project_id'],
+    pre_resolve_entities=False,
+    requires_auth=False,
+    description='User asks about a builder/developer company (e.g. DLF, Lodha, Sobha) — their projects, track record, or presence in a city. No specific project named.',
+  ),
+  IntentRecord(
+    main_intent='project_research',
     sub_intent='project_overview',
     tier='3a',
     model='haiku',
