@@ -10,7 +10,7 @@ OUTPUT RULES (CRITICAL):
 OUTPUT SCHEMA:
 {
   "main_intent":          "property_search",
-  "sub_intent":           "<one of: filter_search | explore_nearby | discovery_collections>",
+  "sub_intent":           "<one of: filter_search | explore_nearby | pick_nearby_localities | discovery_collections>",
   "entities_mentioned":   [{"name": "<locality or area name>", "inferred_type": "locality"}],
   "multi_intent":         false,
   "pivot":                false,
@@ -20,9 +20,10 @@ OUTPUT SCHEMA:
 }
 
 SUB-INTENT RULES:
-  filter_search         — explicit filters (location, BHK, price, area, amenities). Default.
-  explore_nearby        — user shared/asks for location-based "near me" search.
-  discovery_collections — curated listings ("new launches", "under 50L", "ready to move").
+  filter_search           — explicit filters (location, BHK, price, area, amenities). Default.
+  explore_nearby          — user wants to expand/search beyond current localities ("nearby areas", "surrounding sectors").
+  pick_nearby_localities  — user rejected a radius expansion and explicitly wants to choose from a list of specific nearby localities ("no, show me specific localities", "let me pick the areas").
+  discovery_collections   — curated listings ("new launches", "under 50L", "ready to move").
 
 FILTER EXTRACTION RULES:
   transaction_type:   "buy" (default) or "rent". Signals: "rent", "lease" → "rent".
@@ -69,6 +70,15 @@ Input: "furnished 2bhk"
 
 Input: "show me properties near me"
 {"main_intent":"property_search","sub_intent":"explore_nearby","entities_mentioned":[],"multi_intent":false,"pivot":false,"filter_delta":{"transaction_type":"buy"},"clarification_needed":null,"reasoning":"location-based search"}
+
+Input: "show me properties in nearby localities" [PREVIOUS_INTENT: property_search/filter_search, ACTIVE_FILTERS has localities]
+{"main_intent":"property_search","sub_intent":"explore_nearby","entities_mentioned":[],"multi_intent":false,"pivot":false,"filter_delta":{},"clarification_needed":null,"reasoning":"expand search to nearby areas"}
+
+Input: "no I want specific localities only" [PREVIOUS_INTENT: property_search/explore_nearby]
+{"main_intent":"property_search","sub_intent":"pick_nearby_localities","entities_mentioned":[],"multi_intent":false,"pivot":false,"filter_delta":{},"clarification_needed":null,"reasoning":"user wants locality list to choose from"}
+
+Input: "let me pick the areas I want" [PREVIOUS_INTENT: property_search/explore_nearby]
+{"main_intent":"property_search","sub_intent":"pick_nearby_localities","entities_mentioned":[],"multi_intent":false,"pivot":false,"filter_delta":{},"clarification_needed":null,"reasoning":"user wants to select specific localities"}
 
 Input: "ab rent wale dikhao" [was previously showing buy properties]
 {"main_intent":"property_search","sub_intent":"filter_search","entities_mentioned":[],"multi_intent":false,"pivot":true,"filter_delta":{"transaction_type":"rent"},"clarification_needed":null,"reasoning":"pivot to rent"}

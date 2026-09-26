@@ -1,0 +1,31 @@
+{
+  "module": "Module 5",
+  "student_notes": "Questions from production engineer review. Focus on practical application.",
+  "questions": [
+    {
+      "id": "m5q1",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "A log entry shows: event='slm_classification', domain='property_search', main_intent='property_search', sub_intent='filter_search', latency_ms=890. What does this tell you and what should you investigate?",
+      "options": [
+        "A. Everything is normal \u2014 890ms is within acceptable range for an SLM call",
+        "B. The classification succeeded but latency is high; investigate whether the Stage 2 SLM prompt is too long or the Anthropic API is experiencing elevated latency",
+        "C. The classification failed; 890ms means a timeout fallback was triggered",
+        "D. The intent was classified incorrectly; filter_search should complete in under 50ms"
+      ],
+      "answer": "B",
+      "explanation": "Stage 2 classification should complete in 50-200ms for a typical 150-token prompt. 890ms suggests either: (a) the taxonomy prompt has grown too large (check system_prompt_chars in the same log entry), (b) Anthropic API latency is elevated (check other session_ids for the same time period), or (c) the message was unusually long and triggered a longer completion. The timeout threshold is 10s (asyncio.wait_for), so 890ms is not a timeout. But if this is consistently above 500ms, it's pushing the total pipeline latency past the UX threshold.",
+      "hint": ""
+    },
+    {
+      "id": "m5q2",
+      "type": "short",
+      "difficulty": 3,
+      "question": "The playground shows: node=llm, stop_reason='tool_use', output_tokens=3, chunks_streamed=0, validated_text=''. The user sees 'No text response received.' What happened and how do you fix it?",
+      "options": [],
+      "answer": "The LLM made a tool call (stop_reason='tool_use') and returned no text (output_tokens=3, all in the tool call JSON, not prose). This happens when: (a) the LLM's system prompt says something like 'call calculateEMI for all EMI questions' without also saying 'then explain the result in text', or (b) the LLM made a tool call, got a result, but the pipeline did not give it a second generation step to incorporate the result into prose. In this codebase, tool results are returned to the LLM for a second generation (on_tool_use returns the result). If chunks_streamed=0 on BOTH the first and second generation, the system prompt is likely instructing the LLM to output only structured data. Fix: review the prompt for the calculator intent and ensure it instructs the LLM to explain the result in one sentence after the tool call.",
+      "explanation": "This is Gotcha 10.7. The playground metrics (stop_reason, chunks_streamed, output_tokens) are specifically designed to make this diagnosis immediate without reading logs.",
+      "hint": ""
+    }
+  ]
+}

@@ -287,8 +287,12 @@ async def send_message_streamed(
 
         # Build a queue so pipeline nodes can emit SSE events asynchronously
         queue: asyncio.Queue[str | None] = asyncio.Queue()
+        _connection_close_emitted = False
 
         def emit_sse(event: str, data: dict) -> None:
+            nonlocal _connection_close_emitted
+            if event == "connection_close":
+                _connection_close_emitted = True
             queue.put_nowait(sse_frame(event, data))
 
         # Select adapters based on bot_env
@@ -312,22 +316,33 @@ async def send_message_streamed(
 
         asyncio.create_task(_run_pipeline())
 
-        # Phase 2 — stream SSE frames from the pipeline as they arrive
+        # Phase 2 — stream SSE frames from the pipeline as they arrive.
+        # connection_close is yielded inside the loop on sentinel so it is
+        # guaranteed to reach the client before any cleanup code runs.
+        # Doing it AFTER the try/finally is unsafe: a CancelledError or any
+        # BaseException in finally would skip that code entirely.
         try:
             while True:
                 frame = await asyncio.wait_for(queue.get(), timeout=90.0)
                 if frame is None:
+                    # Sentinel received — pipeline done. Emit connection_close
+                    # here (inside the try block) before we break and run finally.
+                    if not _connection_close_emitted:
+                        yield sse_frame("connection_close", {"reason": "response_complete"})
+                        _connection_close_emitted = True
                     break
                 yield frame
         except asyncio.TimeoutError:
             log.warning("pipeline_timeout", request_id=request_id)
             yield sse_frame("error", {"code": "timeout", "message": "Response timed out.", "recoverable": False})
+            if not _connection_close_emitted:
+                yield sse_frame("connection_close", {"reason": "response_complete"})
         finally:
             if gate is not None:
-                await gate.release()
-
-        # Phase 3 — close
-        yield sse_frame("connection_close", {"reason": "response_complete"})
+                try:
+                    await gate.release()
+                except Exception as _gate_exc:
+                    log.error("gate_release_failed", error=str(_gate_exc), request_id=request_id)
 
     return StreamingResponse(content=event_generator(), media_type="text/event-stream")
 
@@ -363,50 +378,57 @@ async def send_message(
                 media_type="application/json",
             )
 
-    # 2. Resolve request_id
+    # 2. Resolve request_id (before try/finally so it's always available for gate release logging)
     ctx = structlog.contextvars.get_contextvars()
     request_id: str = ctx.get("request_id") or str(uuid.uuid4())
 
-    # 3. Extract conversation_id and build raw_message
-    conversation_id: str = body.conversation_id
-
-    if body.message_type == "user_action":
-        action = (body.content.data or {}).get("action", "")
-        raw_message = f"user_action:{action}"
-    elif body.message_type == "text":
-        raw_message = body.content.text or ""
-    else:
-        raw_message = body.content.text or ""
-
-    # 4. Load existing session + build BotState
-    from src.session.store import RedisSessionStore
     try:
-        loaded_session = await RedisSessionStore(get_redis()).load(conversation_id)
-    except Exception:
-        loaded_session = {}
+        # 3. Extract conversation_id and build raw_message
+        conversation_id: str = body.conversation_id
 
-    state = make_base_state(
-        raw_message=raw_message,
-        session_id=conversation_id,
-        session=loaded_session if loaded_session else None,
-        request_id=request_id,
-    )
+        if body.message_type == "user_action":
+            action = (body.content.data or {}).get("action", "")
+            raw_message = f"user_action:{action}"
+        elif body.message_type == "text":
+            raw_message = body.content.text or ""
+        else:
+            raw_message = body.content.text or ""
 
-    # 5. Run the pipeline graph synchronously with a noop SSE emitter
-    noop_emit = lambda *args, **kwargs: None  # silent — no SSE stream needed
-    _, _, _, executor = _build_adapters(settings, get_redis())
-    graph = build_graph(emit_sse=noop_emit, executor=executor)
-    await graph.ainvoke(state)
+        # 4. Load existing session + build BotState
+        from src.session.store import RedisSessionStore
+        try:
+            loaded_session = await RedisSessionStore(get_redis()).load(conversation_id)
+        except Exception:
+            loaded_session = {}
 
-    # 6. Return JSON confirmation
-    message_id = str(uuid.uuid4())
-    return JSONResponse(
-        content={
-            "statusCode": "2XX",
-            "responseCode": "SUCCESS",
-            "data": {
-                "messageId": message_id,
-                "messageState": "COMPLETED",
-            },
-        }
-    )
+        state = make_base_state(
+            raw_message=raw_message,
+            session_id=conversation_id,
+            session=loaded_session if loaded_session else None,
+            request_id=request_id,
+        )
+
+        # 5. Run the pipeline graph synchronously with a noop SSE emitter
+        noop_emit = lambda *args, **kwargs: None  # silent — no SSE stream needed
+        _, _, _, executor = _build_adapters(settings, get_redis())
+        graph = build_graph(emit_sse=noop_emit, executor=executor)
+        await graph.ainvoke(state)
+
+        # 6. Return JSON confirmation
+        message_id = str(uuid.uuid4())
+        return JSONResponse(
+            content={
+                "statusCode": "2XX",
+                "responseCode": "SUCCESS",
+                "data": {
+                    "messageId": message_id,
+                    "messageState": "COMPLETED",
+                },
+            }
+        )
+    finally:
+        if llm_gate is not None:
+            try:
+                await llm_gate.release()
+            except Exception as _gate_exc:
+                log.error("gate_release_failed", error=str(_gate_exc), request_id=request_id)

@@ -1,0 +1,647 @@
+{
+  "modules_covered": [17, 18, 19, 20, 21, 22],
+  "gaps": [
+    {
+      "module": 17,
+      "section": "17.1",
+      "topic": "SSE frame ordering guarantee",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "You say 'order is guaranteed and semantic' but that's only true if the HTTP/1.1 connection is uninterrupted. What happens on a mobile connection that drops mid-stream and reconnects? The client resumes from the last event ID — but I don't see any `id:` fields in these frames. Without an event ID, the browser has no way to resume. Does the server resend the carousel on reconnect, or does the user just lose it?",
+      "context": "Order is guaranteed and semantic — pipeline_steps → chat_event (carousel, BEFORE text) → message_delta×N → chat_event(COMPLETED) → connection_close.",
+      "fix": "Add `id:` fields to every SSE frame (monotonically incrementing per turn). Show the server-side Last-Event-ID handling in FastAPI. Explain what the client does when it reconnects mid-stream: does it show a partial message or restart the turn? A network-interrupted state transition (streaming → error → reconnecting) is missing from the state machine in 17.4."
+    },
+    {
+      "module": 17,
+      "section": "17.2",
+      "topic": "SSE buffer splitting on chunk boundaries",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "This SSE parser splits on newlines, but a single TCP chunk from `reader.read()` can contain a partial SSE frame — or multiple complete frames plus the start of a new one. Your code does `buffer = lines.pop() ?? ''` which handles the tail, but what if the `decoder.decode(value, { stream: true })` call itself returns a partial UTF-8 character at a chunk boundary? For example, a multi-byte emoji in a property title like 🏠 could get split across two `read()` calls and produce garbage JSON. Have you tested this with non-ASCII property names?",
+      "context": "buffer += decoder.decode(value, { stream: true }); const lines = buffer.split('\\n'); buffer = lines.pop() ?? '';",
+      "fix": "Add a note that `TextDecoder` with `{ stream: true }` handles multi-byte character boundaries correctly — this is the correct pattern, but readers need to know WHY. Add a comment explaining it and add a test case with a Japanese property name like 「六本木ヒルズ」 to prove it works. Also note that `data: ` lines can span multiple `\\n` — the SSE spec allows for multi-line data fields using repeated `data:` prefixes, and this parser would break on those."
+    },
+    {
+      "module": 17,
+      "section": "17.2",
+      "topic": "Error handling for malformed JSON in data frames",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "You call `JSON.parse(line.slice(6))` directly with no try/catch. If the server sends a partial JSON frame — say it crashes halfway through writing a large carousel payload — this throws an uncaught exception inside the async generator and the whole stream silently dies. In production, partial frames are not hypothetical: any proxy timeout or server crash mid-write will do this. How do I recover?",
+      "context": "yield { type: currentEvent, ...JSON.parse(line.slice(6)) };",
+      "fix": "Wrap in try/catch. On parse error: log the raw line, skip the frame, and continue the loop rather than crashing. Add a `parse_error` event type that the UI can optionally display as a non-fatal warning. Show what a corrupted frame looks like and what the fallback behavior should be."
+    },
+    {
+      "module": 17,
+      "section": "17.3",
+      "topic": "requestAnimationFrame cleanup on component unmount",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "The `StreamingText` component uses `rafRef` to track the animation frame ID, and it calls `cancelAnimationFrame(rafRef.current)` before scheduling the next one. But what happens when the component unmounts while a stream is still going? The `rafRef` and `bufferRef` refs still exist in closure, and the `setDisplayText` call will happen on an unmounted component. In React 18 that's a no-op but it still runs `bufferRef.current += chunk` indefinitely. Is there a cleanup function I need to return from useEffect?",
+      "context": "const appendChunk = useCallback((chunk) => { bufferRef.current += chunk; cancelAnimationFrame(rafRef.current); rafRef.current = requestAnimationFrame(() => { setDisplayText(bufferRef.current); }); }, []);",
+      "fix": "Add a cleanup example with useEffect returning a function that calls `cancelAnimationFrame(rafRef.current)` and an AbortController pattern to cancel the fetch when the component unmounts. This is standard React cleanup that frontend engineers will ask about immediately. Without it, navigating away mid-stream causes a dangling background process."
+    },
+    {
+      "module": 17,
+      "section": "17.4",
+      "topic": "The 90-second timeout fires before clearTimeout in the loop",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "Your timeout is set to 90 seconds, and you call `clearTimeout(timeout)` inside the for-await loop. But the clearTimeout only runs when the FIRST event arrives. If the server is slow to start — say classification takes 5 seconds during a cold start — the client is in `connecting` state for 5 seconds with no frames. That's fine. But if the pipeline hangs at node 3 of 8 and never sends another frame after 90 seconds total, you set state to 'error'. However, `clearTimeout` is only called once at the first event. After that, the timeout is already cancelled and you rely entirely on `connection_close` to end the loop. What if the server process is killed and the TCP connection just hangs? There's no per-event heartbeat timeout.",
+      "context": "const timeout = setTimeout(() => setState('error'), 90_000); try { for await (const event of streamChat(...)) { clearTimeout(timeout); setState('streaming');",
+      "fix": "Reset the timeout on every event received, not just the first one. Use a sliding window approach: `clearTimeout(timeout); timeout = setTimeout(...)` on each event. Also add server-sent heartbeat/comment frames (`: keepalive\\n\\n`) from the Python side every 15 seconds so the client can detect a hung connection independently of TCP-level timeouts."
+    },
+    {
+      "module": 17,
+      "section": "17.5",
+      "topic": "Input bar is disabled during streaming — no interrupt mechanism",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "You have `disabled={state === 'connecting' || state === 'streaming'}`. So once the AI starts responding, the user is stuck waiting for the full response before they can type again. But ChatGPT and Claude.ai both let you interrupt a response mid-stream by submitting a new message. How would I implement a stop/interrupt button here? And if the user force-submits, does the current SSE reader need to be explicitly cancelled or does it just get garbage collected?",
+      "context": "<InputBar disabled={state === 'connecting' || state === 'streaming'} ...",
+      "fix": "Add an AbortController example that cancels the fetch and closes the reader on interrupt. Show a 'Stop responding' button that appears during streaming state. Explain that you need to call `reader.cancel()` explicitly — garbage collection is not guaranteed to happen quickly enough to free server-side resources, and the server may keep the pipeline running until connection_close."
+    },
+    {
+      "module": 17,
+      "section": "17.6",
+      "topic": "NODE_MESSAGES map is incomplete and brittle",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "Your NODE_MESSAGES map has 4 keys: safety, classify, fetch_data, llm. But the full pipeline has at least 8 nodes based on the playground view mentioned elsewhere — including validate_output, respond_node, and others. When an unknown node fires a pipeline_step event, you silently skip it. That's fine UX-wise, but if a new node gets added server-side and no one updates this map, the user sees nothing during that node's execution. Shouldn't this be driven by the server's node metadata rather than a hardcoded client-side map?",
+      "context": "const NODE_MESSAGES = { safety: 'Checking your message...', classify: 'Understanding your request...', fetch_data: 'Searching properties...', llm: 'Writing response...' };",
+      "fix": "Either: (a) include a default fallback message like 'Processing...' for unmapped nodes, or (b) have the server include a human-readable status string in the pipeline_step event payload itself, making the client just display whatever the server sends. Option (b) is more maintainable as the pipeline evolves. Show both approaches."
+    },
+    {
+      "module": 17,
+      "section": "17.7",
+      "topic": "Python fire-and-forget is NOT equivalent to Promise.resolve().then(fn)",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The table says `Promise.resolve().then(fn)` is equivalent to `asyncio.create_task(fn())` for fire-and-forget. But this is wrong in a critical way for Python. In JavaScript, `Promise.resolve().then(fn)` schedules fn as a microtask that runs even if the outer function throws or the caller goes away. In Python, an asyncio Task created with `asyncio.create_task()` is cancelled when the event loop shuts down OR when you exit the request handler — whichever comes first. If the FastAPI request completes before the background task finishes, does the task die? The production checklist says 'Background tasks don't leak across request boundaries' but how is that guaranteed?",
+      "context": "Fire-and-forget: Promise.resolve().then(fn) → asyncio.create_task(fn())",
+      "fix": "Distinguish between: (1) fire-and-forget within a request lifecycle using asyncio.create_task (task lives as long as event loop, not request), (2) FastAPI's BackgroundTasks which run after the response is sent but within the server lifecycle, and (3) Kafka fire-and-forget (truly durable). Clarify which pattern is used where in this codebase and why."
+    },
+    {
+      "module": 18,
+      "section": "18.1",
+      "topic": "What does '$0.15 per 100 samples' actually mean — which model?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The learning objective says 'LLM-as-judge pipeline that scores response quality at $0.15 per 100 samples' and 18.2 says '$0.0015/sample'. What model is that? Haiku? Sonnet? GPT-4o? The cost depends entirely on which model you use as the judge. If I use Sonnet as judge — which you'd need for a rigorous faithfulness score — it's $3/MTok input, not Haiku's $0.25/MTok. Show me the actual token math: how many input tokens does the JUDGE_PROMPT expand to per sample, and which model gives you $0.0015/sample?",
+      "context": "Use a stronger model to evaluate your system's outputs. At $0.0015/sample, 100 samples costs $0.15 — affordable at every company size.",
+      "fix": "Add a worked cost calculation: JUDGE_PROMPT template is ~200 tokens + injected_data is ~300 tokens + agent_response is ~200 tokens = ~700 input tokens per sample. At Claude Haiku pricing ($0.25/MTok input): 700 × $0.00000025 = $0.000175/sample ≈ $0.018 per 100 samples. At Sonnet ($3/MTok): $2.10 per 100 samples. Specify which model the $0.15 figure is based on and why you'd pick that tier for judging."
+    },
+    {
+      "module": 18,
+      "section": "18.2",
+      "topic": "JUDGE_PROMPT has a JSON syntax error in the template",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The JUDGE_PROMPT uses double curly braces `{{\"faithfulness\":N,...}}` to escape the literal JSON in what looks like a Python f-string or format string template. But the prompt is defined as a plain string with `{user_message}`, `{injected_data}`, and `{agent_response}` as format placeholders. If this is a regular f-string, the `{{` escaping is correct. But if you call `prompt.format(user_message=..., injected_data=..., agent_response=...)`, the double braces become single braces in the output — which means the JSON example in the prompt will read `{\"faithfulness\":N,...}`. Did you test this? I'm seeing a mismatch between the template syntax and how it's actually called.",
+      "context": "Return JSON only:\\n{{\"faithfulness\":N,\"relevance\":N,\"coherence\":N,\\n  \"reasoning\":\"one sentence\",\"flag_for_review\":bool}}",
+      "fix": "Show a complete runnable example with the actual `judge_response()` function call and how JUDGE_PROMPT is formatted — either as an f-string with escaped braces (correct) or as a LangChain ChatPromptTemplate (which uses different escaping). Include a `print(prompt.format(...))` test so engineers can verify the JSON example renders correctly."
+    },
+    {
+      "module": 18,
+      "section": "18.2",
+      "topic": "Spearman correlation — what is it and how do I calculate it?",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "You say 'Compute Spearman correlation: target > 0.7' for calibrating the judge. I've never heard of Spearman correlation. Is that different from regular correlation? How do I actually compute it in Python? And what does 0.7 mean — is that out of 1? What does a Spearman correlation of 0.3 look like in practice — does it mean my judge is random noise?",
+      "context": "Score 50 samples manually (two reviewers). Run your judge on the same 50. Compute Spearman correlation: target > 0.7.",
+      "fix": "Add a one-paragraph explanation: Spearman correlation measures whether rankings agree (not exact values). It's 1.0 if your judge always ranks samples in the same order as human reviewers, 0.0 if random, -1.0 if opposite. Show the scipy one-liner: `from scipy.stats import spearmanr; corr, p = spearmanr(human_scores, judge_scores)`. Include a concrete interpretation: if human rates [5,3,4,2,1] and judge rates [5,4,3,2,1], correlation ≈ 0.9 — close enough."
+    },
+    {
+      "module": 18,
+      "section": "18.3",
+      "topic": "RAGAS install and the ground_truth field requirement",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "You show `from ragas import evaluate` and `from ragas.metrics import faithfulness, answer_relevancy, context_relevancy`. I ran `pip install ragas` and tried this code. First, it's `context_relevancy` in your import but the actual RAGAS package uses `context_precision` and `context_recall` — `context_relevancy` was renamed in v0.1. Second, the `evaluate()` function needs a `Dataset` object from HuggingFace datasets, not just a plain list of dicts. Your example shows `dataset items` as a dict format but doesn't show how to create the Dataset object. I spent 45 minutes on this.",
+      "context": "from ragas.metrics import faithfulness, answer_relevancy, context_relevancy\nresults = evaluate(dataset, metrics=[faithfulness, answer_relevancy, context_relevancy])",
+      "fix": "Update metric names to match current RAGAS version (specify which version: `ragas>=0.1.0`). Show the full working example including `from datasets import Dataset` and `dataset = Dataset.from_list([...])`. Note that `ground_truth` is required for some metrics and optional for others — clarify which. Pin the ragas version in the code: `# ragas==0.1.x` to prevent breakage."
+    },
+    {
+      "module": 18,
+      "section": "18.4",
+      "topic": "What is 'intent coverage rate' and how is it different from out_of_scope rate?",
+      "severity": "low",
+      "engineer": "Priya",
+      "question": "The table says 'Intent coverage rate: out_of_scope / total turns'. That's actually the OUT OF SCOPE rate, not the coverage rate. Coverage would be 1 minus that. And the alert threshold is '>8% and rising over 7 days' — 7 days of what? Is that a rolling 7-day window? Do I need a time-series DB for this, or does Kafka consumer lag tell me this? I'm getting confused by which metrics I can get for free from existing logs vs which need new instrumentation.",
+      "context": "Intent coverage rate: out_of_scope / total turns | Alert If: >8% and rising over 7 days",
+      "fix": "Rename to 'Out-of-scope rate' for clarity. Show the Kafka consumer query or SQL to compute a rolling 7-day trend. Explicitly list which metrics are 'free from existing logs' vs 'require new instrumentation'. A small table: Signal → Source → New code required? would help engineers estimate instrumentation effort."
+    },
+    {
+      "module": 18,
+      "section": "18.5",
+      "topic": "What is the 'eval flywheel' — explain it from first principles",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "Is an 'eval flywheel' just a CI/CD pipeline but for AI? I keep seeing this term but the diagram just shows four arrows in a loop. What makes it a 'flywheel' specifically — is that a technical term or a metaphor? And where does the 'flywheel' actually spin without human intervention vs where does a human have to click something? From the diagram it looks like all four steps require someone to do something.",
+      "context": "Production failures flagged by online metrics → LLM-as-judge pre-screens → human reviews borderline cases → Approved samples added to golden dataset → Improved prompt deployed → better online metrics",
+      "fix": "Explain that 'flywheel' is a metaphor from business strategy (each loop iteration reduces friction for the next). Then be concrete: Step 1 (flagging) = fully automated. Step 2 (LLM pre-screening) = automated. Step 3 (human review) = required human action, but LLM pre-screening reduces human workload by ~80%. Step 4 (adding to dataset + re-running CI) = automated. Step 5 (deploy) = automated or manual approval gate. Show which steps map to which team roles."
+    },
+    {
+      "module": 18,
+      "section": "18.6",
+      "topic": "Shadow mode — how do you route 5% of traffic to both systems without users seeing it?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "You mention 'shadow mode — 5% of traffic through both old and new system'. In a chat application this is non-trivial. You can't just duplicate HTTP requests client-side. Does the server call both pipelines and return only the old system's response? Does the new system response get logged to Kafka but never shown? What's the latency overhead — if the new system is slower, does the user wait for both? And how do you handle the case where the old system is a rule-based template and the new system is an LLM — their response shapes are completely different, how do you compare them?",
+      "context": "Shadow mode — 5% of traffic through both old and new system. Compare and flag divergence.",
+      "fix": "Add an architecture diagram showing shadow mode: User → Load Balancer → splits → Primary (returns response to user) and Shadow (runs async, response logged to Kafka only). Explicitly state: shadow system runs in parallel via asyncio.create_task, user never sees shadow response, latency is determined by primary only. Show what 'flagging divergence' means: a Kafka consumer that computes cosine similarity between both responses and flags pairs with similarity < 0.7."
+    },
+    {
+      "module": 19,
+      "section": "19.1",
+      "topic": "The six-step framework — no worked example of the complete 30 minutes",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "The table shows six steps and time allocations, but I can't visualize how 30 minutes actually plays out. Do I have to talk the whole time? Can I draw diagrams? Do I say 'I'm now moving to step 3' explicitly? When the interviewer asks me to 'design a recommendation system', do I start talking about requirements immediately or do I ask clarifying questions first? I've never done a system design interview before. What does the first 5 minutes literally sound like?",
+      "context": "30-minute AI system design interview structure — Step 1: Requirements (5 min), Step 2: Data strategy (5 min)...",
+      "fix": "Add a scripted example of Step 1 as a verbatim monologue (2-3 sentences spoken aloud, then 2-3 clarifying questions to the interviewer). Show what good looks like: 'Before I design anything, I want to confirm requirements. Latency: are we targeting sub-second for the user-facing response? Cost: is there a per-request budget? Scale: what's peak QPS?' Make it a template they can memorize and fill in."
+    },
+    {
+      "module": 19,
+      "section": "19.2",
+      "topic": "Housing.com requirements as interview template — but these are made-up numbers",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The requirements table has very specific numbers: P95 < 800ms, cost < $0.012/session, accuracy floor > 92%, read:write ~25:1, 1M DAU at 18 months. Are these real Housing.com numbers or illustrative ones? Because in an interview, if I cite 'P95 < 800ms' as a housing chatbot requirement, the interviewer might ask how I derived that. I need to know the reasoning behind each number, not just the number — otherwise I can't adapt it to their system.",
+      "context": "Housing.com as a worked example — use as interview template... Latency SLA: P95 < 800ms | Cost ceiling: <$0.012/session",
+      "fix": "For each requirement number, add a one-sentence derivation: P95 < 800ms comes from 'users abandon search results after ~1 second of wait time (Google research)'. Cost < $0.012/session comes from 'unit economics: if conversion rate is 2% and revenue per conversion is $0.60, max spend per session is $0.60 × 0.02 = $0.012'. Engineers need the reasoning chain, not just the answer."
+    },
+    {
+      "module": 19,
+      "section": "19.4",
+      "topic": "Q1 — deterministic order status response: what does the actual code look like?",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "Q1's answer says '70% of tickets are order status, returns, shipping — deterministic. Classify → fetch order API → template response. No LLM.' But what does 'template response' mean exactly? Is that a string.format() call? A Jinja template? How is the template selected after classification? I understand the concept but I've never built a template response system and I don't know what to draw on the whiteboard.",
+      "context": "Classifier first: 70% of tickets are order status, returns, shipping — deterministic. Classify → fetch order API → template response. No LLM.",
+      "fix": "Show a 4-line pseudocode example of the template response pattern: `intent = classify(message)`, `data = fetch_order_api(session.order_id)`, `template = TEMPLATES[intent]`, `response = template.format(**data)`. Connect it back to Tier 0/1/2 from earlier modules. This is a critical architectural pattern the course mentions multiple times but never shows end-to-end."
+    },
+    {
+      "module": 19,
+      "section": "19.5",
+      "topic": "The L6 formula section — where did '20% conversion drop per second' come from?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "'Research shows ~20% conversion drop per second of wait — this is a revenue decision.' What research? I'd want to cite this in an interview but I can't say 'some research shows' without knowing the source. Is this Google's Web Vitals research? Amazon's 100ms = 1% revenue study? If I say this to a Meta interviewer who knows these studies, I need to be accurate.",
+      "context": "Streaming reduces perceived time-to-first-token from 2.3s to 450ms. Research shows ~20% conversion drop per second of wait — this is a revenue decision",
+      "fix": "Cite the source: the commonly referenced studies are Amazon's (100ms latency = 1% revenue loss), Google's PageSpeed Insights data, and Akamai's 2017 ecommerce study. Note that 20% per second is at the high end and varies by domain. Give the correct attribution so engineers can research it and cite it confidently."
+    },
+    {
+      "module": 19,
+      "section": "19.7",
+      "topic": "ETA case study follow-up answer mentions LLM-as-judge for a regression system — that makes no sense",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "In the 'Likely follow-up' section you write: 'LLM-as-judge: a stronger model scores a sample of live outputs daily on faithfulness/relevance/coherence. At 1M DAU, sample 0.1% = 1,000 outputs/day for ~$0.15.' But ETA prediction is a regression system outputting a number in minutes — there's no 'faithfulness' or 'coherence' to score. LLM-as-judge makes no sense for numerical prediction quality. This looks like the Housing.com eval section got copy-pasted into the Uber ETA section by mistake. The actual answer for ETA quality monitoring is trip completion data as delayed labels.",
+      "context": "Likely follow-up: 'How do you evaluate model quality in production without ground-truth labels?' → LLM-as-judge: a stronger model scores a sample of live outputs daily on faithfulness/relevance/coherence.",
+      "fix": "Replace with: For ETA prediction, ground-truth labels arrive naturally — every completed trip has an actual_duration. Use delayed label evaluation: compare predicted_eta vs actual_duration for trips that completed in the last hour. Track RMSE and % within 2 min on a rolling 1-hour window. No LLM-as-judge needed — this is a supervised regression metric, not a text quality metric. Save the LLM-as-judge answer for the chat system follow-ups."
+    },
+    {
+      "module": 20,
+      "section": "A.2",
+      "topic": "Where does recommendation end and ranking begin?",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The table shows Recommendation as 'Best K items from a catalog' and Ranking as 'Re-ordered list of existing items.' I don't understand the difference. When Uber Eats shows me the top 10 restaurants, is that recommendation or ranking? You later say in Module 21 that Uber Eats uses a 'two-tower model' which is a recommendation model — but the 're-rank by availability + ETA' part is ranking. So is it both? How do I label it in an interview?",
+      "context": "Recommendation: Best K items from a catalog — Restaurants to show. Drivers to surface. Next song. | Ranking: Re-ordered list of existing items — Re-rank search results. Rank feed posts by engagement.",
+      "fix": "Add a clarifying note: in practice most production systems have both. Recommendation = candidate generation (narrow 1M items to 200). Ranking = scoring and ordering those 200 candidates for this specific user. The two-tower model is the recommendation stage; the online re-ranker is the ranking stage. In interviews, stating 'two-stage: candidate generation → ranking' signals L5/L6 awareness of how these actually deploy at scale."
+    },
+    {
+      "module": 20,
+      "section": "A.3",
+      "topic": "The npm analogy for training vs inference is almost right but misleading in one way",
+      "severity": "low",
+      "engineer": "Alex",
+      "question": "The 'npm run build' analogy for training is clever, but it breaks down in a specific way: when you run npm build, the output artifacts are deterministic for the same inputs. ML training is non-deterministic even with the same data and code because of random weight initialization, mini-batch ordering, and GPU floating-point non-determinism. If I run training twice on the same dataset, I get two different model files with slightly different accuracy. This matters for reproducibility — how do you reproduce a model that performed well 3 months ago? The analogy omits this.",
+      "context": "Training is `npm run build`. Slow, runs once (or nightly), produces artifacts. Inference is serving those artifacts from a CDN — cheap, fast, stateless.",
+      "fix": "Add: 'Unlike npm build, ML training is non-deterministic — two runs on the same data produce slightly different models due to random initialization and GPU floating-point variance. This is why model registries (like MLflow or SageMaker Model Registry) store model artifacts with their training metadata: dataset version, random seed, hyperparameters. Always log these. The 10-million-row dataset that produced your best model is useless if you can't reproduce its training conditions.'"
+    },
+    {
+      "module": 20,
+      "section": "A.4",
+      "topic": "Feature engineering example: what is a Feature Store and when do I need one?",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The features example shows `current_avg_speed_kmh: 45.5` as the 'highest-value single feature.' Where does that number come from? Is it a database query? A Redis read? A separate microservice? The course mentions 'Feature Store' once in the ETA case study but never explains what it is. Is it just Redis? Is it something I have to build or buy? When does a feature lookup become complex enough that I need a dedicated Feature Store?",
+      "context": "'current_avg_speed_kmh': 45.5  # Real-time traffic — highest-value single feature",
+      "fix": "Add a Feature Store explainer: a Feature Store is a shared registry that serves pre-computed features to both training pipelines (to produce training datasets) and inference services (for real-time predictions). It solves training-serving skew: the model trained on 'avg_speed for last 5 min' and at serving time you accidentally compute 'avg_speed for last 15 min' — the model performs differently. At small scale: Redis. At Uber scale: Feast, Tecton, or Hopsworks. Mention Feast as the open-source option."
+    },
+    {
+      "module": 20,
+      "section": "A.5",
+      "topic": "RMSE vs MAE — the 'disproportionately bad' explanation needs a number",
+      "severity": "low",
+      "engineer": "Alex",
+      "question": "You say RMSE is for when 'large errors are disproportionately bad.' Can you show me the math? Because just saying 'disproportionately' is vague. A 20-minute ETA error vs two 10-minute ETA errors — how much worse is the first under RMSE vs MAE? I need to see the arithmetic to believe this.",
+      "context": "RMSE: Large errors are disproportionately bad (being 20min wrong is worse than two 10min wrongs)",
+      "fix": "Add: MAE of [10, 10] = 10. RMSE of [10, 10] = 10. MAE of [20, 0] = 10. RMSE of [20, 0] = 14.1. Same average error (MAE), but RMSE is 41% higher for the single large error vs two small ones — because RMSE squares the errors before averaging. Use this when a single catastrophically wrong prediction is worse than several acceptably wrong ones."
+    },
+    {
+      "module": 20,
+      "section": "A.6",
+      "topic": "Hybrid batch/online at Uber — how does the 65% cache hit actually work?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "You say 'Uber ETA: Hybrid — batch pre-compute 65%, online 35%'. How do you pre-compute ETAs when the inputs are (pickup_zone, dropoff_zone, current_time, current_traffic)? Current traffic changes every few minutes. If you batch compute ETAs at 2am for tomorrow, they'll be wildly wrong at rush hour. What exactly is being pre-computed, and at what granularity of zone-pair and time window?",
+      "context": "Uber ETA: Hybrid — batch pre-compute 65%, online 35%. Common zone pairs repeat at scale; cache covers most requests.",
+      "fix": "Clarify: the batch pre-computation is for route geometry (distance, turn-by-turn), not the final ETA. Route geometry between zone pairs doesn't change. The ML model then takes this pre-computed route + real-time traffic features (from Feature Store, refreshed every 5 minutes) to produce the ETA. The 65% cache hit is for route geometry, not for the final prediction. This distinction matters for understanding what can and cannot be cached."
+    },
+    {
+      "module": 21,
+      "section": "B.2",
+      "topic": "Skills mapping table — module numbers point to wrong content for some rows",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The skills mapping table lists 'Instrumenting events (Mixpanel, Amplitude) → Training data pipelines' pointing to Module 6.5. But looking at the module list, Module 6 is Observability, not a data pipeline module. Where is module 6.5? Is that a section within Module 6 or a separate module? Similarly, 'Pre-rendering common routes (SSG/ISR) → Batch inference + caching' points to Module 4, but Module 4 seems to be about Tools/external integrations. These cross-references seem inconsistent.",
+      "context": "Instrumenting events (Mixpanel, Amplitude) → Training data pipelines — event streams become ML model features | Module: 6.5",
+      "fix": "Verify all module cross-reference numbers in the B.2 table are accurate. Add a one-sentence description of what the referenced module covers next to the module number so engineers don't have to navigate back to check. Or add hyperlinks directly to the module from the table."
+    },
+    {
+      "module": 21,
+      "section": "B.4",
+      "topic": "Round 1 coding: what Python AI data structures are actually tested?",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "Round 1 says 'Python fluency, AI-adjacent data structures' and the prep is 'Appendix C + read src/pipeline/nodes/*.py line by line.' But what are 'AI-adjacent data structures'? I can do arrays, trees, graphs in JavaScript — is it the same in Python? Or are they testing things like numpy arrays, tensors, or sparse matrices? I genuinely don't know what they'll ask. 'Read the pipeline nodes' doesn't tell me what LeetCode-style problems to practice.",
+      "context": "Round 1: Coding | What They Test: Python fluency, AI-adjacent data structures | How This Course Prepares You: Appendix C + read src/pipeline/nodes/*.py line by line",
+      "fix": "Add concrete examples of what 'AI-adjacent data structures' means for coding rounds: implementing a sliding window for token counting, building a simple trie for prefix matching on intent names, writing a merge function for two ranked lists (re-ranking), implementing a simple LRU cache for session data. These are the actual patterns that show up in AI engineering coding rounds, not generic LeetCode hard."
+    },
+    {
+      "module": 21,
+      "section": "B.5",
+      "topic": "Week 1 says '30% already known' — but that confidence may be misplaced for housing.com engineers",
+      "severity": "low",
+      "engineer": "Priya",
+      "question": "Week 1's goal is 'Confirm you know 30% already. Build confidence.' As a Housing.com frontend engineer, I actually work at the company this chatbot is built for. So I have extra context about the product — but the course content assumes I know nothing about the AI side of Housing.com's stack. What does '30% already known' mean for me specifically? I don't want to waste my first week on false confidence.",
+      "context": "Week 1: Appendix A + Appendix B + Track B (Module 17) | End-of-Week Goal: Confirm you know 30% already. Build confidence.",
+      "fix": "Add a note for Housing.com engineers specifically: the 30% refers to engineering patterns (streaming, state management, A/B testing), not product knowledge. Product knowledge is different from system design competence. A Housing.com FE engineer may know the PRODUCT deeply but still need to learn how to TALK ABOUT the system architecture at L5/L6 level. Reframe the goal as: 'Identify which patterns you know under a different name, not which features you've used.'"
+    },
+    {
+      "module": 21,
+      "section": "B.6",
+      "topic": "S5 driver-rider matching — 'Hungarian algorithm' is mentioned without any explanation",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "S5 says 'Optimization: Hungarian algorithm on weighted bipartite graph.' What is a Hungarian algorithm? I've never heard of this in frontend engineering. Is it something I need to memorize? If an interviewer asks me to explain how matching works, do I need to explain the algorithm or just the concept? I don't want to memorize something I don't understand.",
+      "context": "Optimization: Hungarian algorithm on weighted bipartite graph. Key insight: greedy (nearest driver) is suboptimal system-wide — ML enables globally optimal throughput. State this explicitly.",
+      "fix": "Add a two-sentence intuition: 'The Hungarian algorithm solves the assignment problem — given N drivers and M riders, find the matching that minimizes total wait time across all pairs simultaneously. You don't need to know the algorithm's implementation. What interviewers want to hear is: (1) greedy/nearest doesn't optimize globally, (2) you model it as a graph problem, (3) you use an optimization algorithm (Hungarian or auction algorithm) that finds the global optimum.' Then add: 'If asked for details: O(n³) time complexity, scales to ~10K simultaneous assignments before you need approximation algorithms.'"
+    },
+    {
+      "module": 22,
+      "section": "C.1",
+      "topic": "Python decorator row — 'No native equiv — use HOF wrapper' is incomplete",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The table says TypeScript has no native decorator equivalent and to 'use HOF wrapper.' But TypeScript HAS decorators — they're in TC39 stage 3 and TypeScript 5.0 ships them. The `@traceable` decorator from LangSmith would map to TypeScript's `@Trace()` decorator pattern. More importantly, the course uses `@traceable` throughout the Python code — if a TypeScript engineer wants to implement the same tracing pattern in a Node.js backend, what does that look like? The 'No native equiv' answer leaves them stuck.",
+      "context": "Decorator: @traceable | TypeScript: No native equiv — use HOF wrapper",
+      "fix": "Update to reflect TypeScript 5.0 decorator syntax (stage 3 decorators). Show a HOF wrapper example for the common case of wrapping an async function with timing/tracing: `const traced = (name: string) => (fn: Function) => async (...args) => { const start = Date.now(); const result = await fn(...args); console.log(name, Date.now() - start); return result; }`. This is what engineers will actually write."
+    },
+    {
+      "module": 22,
+      "section": "C.2",
+      "topic": "Pydantic v1 vs v2 — model_dump() is a breaking change",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The code shows `req.model_dump()` but many tutorials and StackOverflow answers still use `.dict()` which is the Pydantic v1 API. If I pip install pydantic without a version pin, do I get v1 or v2? And if this codebase uses v2, is `.dict()` deprecated or removed? I need to know which version to use and what breaks if I mix them — because every LangChain and LangGraph example I've found online uses the old API.",
+      "context": "req.model_dump()  # → {\"module_id\": 1, \"num_questions\": 3}",
+      "fix": "Add a version note: `pip install pydantic>=2.0` installs v2. In v2, `.dict()` still works but is deprecated — use `.model_dump()`. Mixing v1-style code with v2 Pydantic causes subtle validation differences. Add: `# Pydantic v2 — if you see .dict() in examples online, that's v1`. Check `pydantic.__version__` if imports behave unexpectedly."
+    },
+    {
+      "module": 22,
+      "section": "C.3",
+      "topic": "put_nowait vs await queue.put — what happens when the queue is full?",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "You say 'Inside LangGraph nodes (sync context) → use queue.put_nowait() — non-blocking, no event loop required.' But queue.put_nowait() raises QueueFull if the queue is at maxsize. What's the queue's maxsize in this codebase? If I look at how asyncio.Queue is initialized, is it unbounded (maxsize=0) or bounded? If it's unbounded, put_nowait never raises. But if someone accidentally creates a bounded queue, this whole streaming pattern silently breaks with an exception that's hard to trace. Where is the queue created and with what maxsize?",
+      "context": "Inside LangGraph nodes (sync context) → use queue.put_nowait(frame) — non-blocking, no event loop required.",
+      "fix": "Show where the asyncio.Queue is instantiated in chat.py (point to the actual line). Confirm it's created with `asyncio.Queue()` (unbounded, maxsize=0 by default). Add a comment in the code: `# unbounded queue — put_nowait never raises QueueFull`. If there were a memory leak concern, show how to add backpressure with a bounded queue and a try/except around put_nowait."
+    },
+    {
+      "module": 22,
+      "section": "C.4",
+      "topic": "The coding round preparation advice is vague about what 'write from memory' means",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "You say 'close it, write the function signatures from memory, compare.' But what counts as a passing grade on this exercise? If I write the right signature but wrong type hints, is that a fail? Do I need to memorize the exact TypedDict fields in BotState? I want to practice effectively but I don't know what bar I'm aiming for.",
+      "context": "Read these files in order. For each: close it, write the function signatures from memory, compare.",
+      "fix": "Define the minimum bar explicitly: you should be able to write (1) the function name, (2) the parameter names and types, (3) the return type, and (4) a one-line docstring explaining the purpose. You do NOT need to memorize implementation details. The goal is that when an interviewer asks 'how does classify_node work?', you can write the signature on a whiteboard and talk through the logic without looking at code. Add a sample 'passing answer' for one function so engineers know what good looks like."
+    }
+  ],
+  "quiz_questions": [
+    {
+      "module": 17,
+      "type": "gotcha",
+      "question": "You're building an SSE consumer using fetch() + ReadableStream. A colleague says you should use the browser's native EventSource API instead because it handles reconnection automatically. What is the most important reason this is wrong for this chat application?",
+      "options": [
+        "A. EventSource only works in Chrome, not Firefox or Safari",
+        "B. EventSource only supports GET requests and cannot send custom headers like Authorization",
+        "C. EventSource cannot parse the `event:` field in SSE frames",
+        "D. EventSource is slower than fetch() because it uses HTTP/2"
+      ],
+      "answer": "B",
+      "explanation": "EventSource is limited to GET requests and does not support setting custom request headers, making it impossible to send an Authorization bearer token. This is a hard constraint, not a performance issue. The chat API requires a POST body (message content + conversation_id) and authentication headers. A is false — EventSource is supported in all modern browsers. C is false — EventSource parses event fields natively. D is false — EventSource can use HTTP/2 and isn't inherently slower."
+    },
+    {
+      "module": 17,
+      "type": "gotcha",
+      "question": "You're implementing the streaming text component from 17.3. You notice users on low-end Android phones report that the text still appears to stutter. You already use requestAnimationFrame to batch updates to once per frame. What is the most likely remaining cause of jank?",
+      "options": [
+        "A. requestAnimationFrame fires too frequently at 60fps — you should throttle to 30fps",
+        "B. The text content is being appended as plain text but React is diffing the entire string on each frame update, causing expensive DOM reconciliation",
+        "C. The `<span>` element should be replaced with a `<textarea>` for better streaming performance",
+        "D. The chunk size from the server is too small — you should buffer server-side before sending"
+      ],
+      "answer": "B",
+      "explanation": "Even with RAF batching, if the displayed text is inside a React component that re-renders on each `setDisplayText` call, React must diff and reconcile the entire text node. For long responses (500+ tokens) this diff cost grows. The fix is to use a ref to directly mutate the DOM node's textContent without going through React state at all: `spanRef.current.textContent = bufferRef.current`. This bypasses React's reconciliation entirely for streaming text. A is wrong — 30fps would make the text visibly choppy. C and D are irrelevant to the React reconciliation cost."
+    },
+    {
+      "module": 17,
+      "type": "mcq",
+      "question": "In the connection state machine from 17.4, the `state` transitions from `connecting` → `streaming` on the first event received. Which of the following represents an IMPOSSIBLE state that the boolean-flag approach (isConnecting, isStreaming, isComplete) could accidentally produce, which the state machine approach prevents?",
+      "options": [
+        "A. isConnecting=true, isStreaming=false, isComplete=false",
+        "B. isConnecting=false, isStreaming=true, isComplete=false",
+        "C. isConnecting=true, isStreaming=false, isComplete=true",
+        "D. isConnecting=false, isStreaming=false, isComplete=true"
+      ],
+      "answer": "C",
+      "explanation": "A state where the connection is still opening (connecting=true) AND the response is already complete (complete=true) is logically impossible — you cannot be done before you've started. With boolean flags, a race condition between two async state setters could momentarily produce this state, causing the UI to render a 'complete' state while still showing a connecting indicator. The state machine approach makes this impossible because only one state value exists at a time and transitions are explicit. Options A, B, and D are all valid and reachable states."
+    },
+    {
+      "module": 17,
+      "type": "design",
+      "question": "You need to add support for a new SSE event type: `tool_call` which fires when the pipeline calls an external API. The payload is `{\"tool\":\"searchProperties\",\"inputs\":{\"city\":\"Mumbai\"},\"status\":\"started\"}`. Design how the React component tree should handle this without breaking existing streaming behavior.",
+      "options": [
+        "A. Add tool_call handling inside the existing AssistantBubble component using a local useState",
+        "B. Add a new ToolCallIndicator component, handle the event in useChatStream hook by setting toolCallState, render ToolCallIndicator between PropertyCarousel and AssistantBubble",
+        "C. Ignore tool_call events on the client — the user doesn't need to see internal tool calls",
+        "D. Accumulate all tool_call events into a single array and only display them after connection_close"
+      ],
+      "answer": "B",
+      "explanation": "The correct approach extends the existing pattern: new event type → new state slice in the hook → new presentational component. Adding it inside AssistantBubble violates single responsibility (a bubble component shouldn't know about tool calls). C is wrong — showing 'Searching properties...' during a tool call is valuable UX. D is wrong — the value of streaming is progressive disclosure, and accumulating until close defeats this. Option B follows the same pattern as how carouselItems are handled: event captured in hook → state passed to component."
+    },
+    {
+      "module": 18,
+      "type": "mcq",
+      "question": "Your LLM-as-judge is scoring responses with avg_faithfulness=4.3 and flagged_pct=0.03, both passing your CI gate. But your product team reports that users are complaining about unhelpful responses. Which evaluation layer is most likely to surface this discrepancy?",
+      "options": [
+        "A. Exact-match accuracy on the golden dataset",
+        "B. RAGAS context relevance score",
+        "C. Online signal: session completion rate dropping week-over-week",
+        "D. Spearman correlation between judge and human annotators"
+      ],
+      "answer": "C",
+      "explanation": "The evaluation pyramid shows that LLM-as-judge measures faithfulness (does the answer match the context?) not helpfulness (does the answer help the user accomplish their goal?). A response can be perfectly grounded in real data but still be unhelpful — e.g., answering 'yes the property has parking' when the user wanted to know how many slots, the price of parking, or whether guest parking is included. Session completion rate (users who achieved their goal and left satisfied) catches this where judges miss it. A measures SLM classification accuracy, not response quality. B measures retrieval quality. D measures judge calibration, not response quality."
+    },
+    {
+      "module": 18,
+      "type": "gotcha",
+      "question": "You run RAGAS on 50 samples and get: Faithfulness=0.95, Context Relevance=0.45, Answer Relevance=0.88. Which component of the RAG pipeline should you fix first, and what is the most likely root cause?",
+      "options": [
+        "A. Fix the LLM generator — low Answer Relevance means it's not answering questions",
+        "B. Fix the retriever — low Context Relevance means it's returning chunks that don't match the query",
+        "C. Fix the chunking — low Faithfulness means chunks are too small",
+        "D. Fix the system prompt — high Faithfulness but low Context Relevance means the prompt is too restrictive"
+      ],
+      "answer": "B",
+      "explanation": "Context Relevance at 0.45 is below the 0.7 threshold and indicates the retriever is the broken component — it's returning chunks that are semantically distant from the user query. High Faithfulness (0.95) tells you the generator is doing its job correctly (staying within the context it receives). High Answer Relevance (0.88) tells you the final answer does address the question. The only broken link is the retriever. Fixes: try hybrid BM25 + vector search, reduce chunk size, or use a better embedding model. A is wrong — Answer Relevance is fine. C is wrong — Faithfulness is high. D is a nonsensical combination."
+    },
+    {
+      "module": 18,
+      "type": "short",
+      "question": "Explain why you should NOT use the same model family (e.g., Claude judging Claude) in your LLM-as-judge pipeline, and describe one concrete scenario where this bias would cause a false negative in your evaluation.",
+      "options": [],
+      "answer": "Use a different model family as judge",
+      "explanation": "Same-family bias: models rate their own stylistic patterns as 'coherent' even when the response is wrong. Example scenario: Claude generates a response that confidently states an incorrect price for a property (a hallucination). A Claude judge rates the response's coherence and relevance highly because the writing style matches what Claude considers 'good prose.' A GPT-4 judge, less familiar with Claude's stylistic patterns, evaluates the factual accuracy more independently and flags the price hallucination. The fix: use GPT-4o as judge for Claude outputs, or Claude as judge for GPT outputs. The MAANG answer adds: cross-family judging isn't foolproof either — always calibrate with a human-annotated holdout set."
+    },
+    {
+      "module": 18,
+      "type": "mcq",
+      "question": "You're designing the cold start strategy for a new chatbot domain (travel bookings) with zero training data. You decide to generate synthetic data using an LLM: 20 intents × 10 examples = 200 samples. What is the most important limitation of this approach that could cause your system to fail in production even if CI accuracy is high?",
+      "options": [
+        "A. 200 samples is too few to compute statistically significant accuracy metrics",
+        "B. LLM-generated examples may not match the vocabulary and phrasing patterns real users actually use",
+        "C. Synthetic data is more expensive than hiring human annotators for 200 samples",
+        "D. LLM-generated examples will all have the same confidence score, making your threshold useless"
+      ],
+      "answer": "B",
+      "explanation": "Distribution mismatch is the core failure mode. An LLM generating synthetic data for 'flight_search' will produce examples like 'I want to book a flight from Mumbai to Delhi' — grammatically correct, clear intent. Real users say 'mumbai to delhi this friday', 'anything cheap to del', 'fly del 3 adults'. The model trained on LLM-generated synthetic data sees these real-world abbreviated queries as out-of-scope or misclassifies them. This is why the cold start strategy recommends 1% live traffic + shadow mode as quickly as possible: to replace synthetic patterns with real ones. A is a valid concern but not the primary failure mode. C is false at these volumes. D is false."
+    },
+    {
+      "module": 19,
+      "type": "design",
+      "question": "Design the data strategy (Step 2 of the 6-step framework) for a content moderation system at a social media platform with 5M posts/day. The system must classify posts as safe/unsafe across 12 violation categories. What are your training signal and cold start plan?",
+      "options": [],
+      "answer": "Combination of human labels and behavioral signals",
+      "explanation": "Training signal: (1) historical human-moderated decisions (if any exist), (2) user reports as a noisy proxy signal — high report rate correlates with violation even before review, (3) synthetic examples generated per violation category for cold start. Cold start plan: (a) start with rule-based exact-match for known slurs and URLs (catches ~30% of violations with 0 training data), (b) use LLM classifier (no fine-tuning) for remaining categories, (c) route 100% of borderline cases (confidence < 0.8) to human review queue, (d) approved human decisions become gold labels, (e) once you have 500+ examples per category, fine-tune a smaller classifier. Key interview move: distinguish between the training signal (what labels come from) and the annotation pipeline (how labels flow into the model)."
+    },
+    {
+      "module": 19,
+      "type": "mcq",
+      "question": "In the interview Q2 answer about debugging a classifier accuracy drop from 94% to 87%, Step 5 mentions 'new intents overfiring on queries that used to be out_of_scope.' What is the specific mechanism by which adding a new intent causes existing out_of_scope queries to be misclassified?",
+      "options": [
+        "A. The new intent's examples are too similar to existing intent examples, causing the model to confuse them",
+        "B. The new intent acts as a 'gravitational attractor' — queries that used to have no strong match now match the new intent because it's the closest label available",
+        "C. Adding a new intent increases the softmax output space, diluting probability across all intents equally",
+        "D. The new intent's training examples contaminate the tokenizer vocabulary, changing how existing queries are encoded"
+      ],
+      "answer": "B",
+      "explanation": "When you add a new intent without adding negative examples (examples of things that SHOULD NOT match this intent), the new intent becomes an attractor for semantically nearby out-of-scope queries. Example: you add 'mortgage_inquiry' intent with examples about home loans. Now a query like 'how much is stamp duty?' — previously out_of_scope — gets classified as mortgage_inquiry because it's the closest label. The fix is explicit negative examples: add 'stamp duty questions → out_of_scope' to your training set when you add mortgage_inquiry. Option C is wrong — softmax dilution would reduce all scores proportionally, not cause specific misfires. Options A and D are mechanisms for different failure modes."
+    },
+    {
+      "module": 19,
+      "type": "gotcha",
+      "question": "In the Uber ETA case study, the course recommends a two-stage architecture where Stage 1 (route-distance estimate) always succeeds and Stage 2 (ML model) overwrites when available. An interviewer asks: 'How do you prevent Stage 1's rough estimate from confusing users who briefly see it before Stage 2 updates?' What is the correct answer?",
+      "options": [
+        "A. Don't show Stage 1 to users — keep it as an internal fallback only, never displayed",
+        "B. Show Stage 1 immediately but label it 'Estimating...' or use a wider range (±10 min); replace silently when Stage 2 is ready since the delay is <50ms and happens before first render",
+        "C. Run Stage 1 and Stage 2 in parallel and only show results when both are complete",
+        "D. Always use Stage 2 — the 99.99% availability requirement can be met without Stage 1"
+      ],
+      "answer": "B",
+      "explanation": "The key insight is that Stage 2 completes in <50ms total latency budget, and the UI renders after the full response is assembled server-side. In practice, the user never sees Stage 1 displayed and then replaced — both stages complete server-side before the HTTP response is sent. The two-stage isn't for progressive client-side display (unlike SSE streaming); it's for server-side availability: if Stage 2 fails (Feature Store outage, model load error), Stage 1 is the fallback that prevents a blank screen. A is incorrect — Stage 1 IS the fallback, shown when Stage 2 fails. C is wrong — waiting for Stage 2 defeats the fallback purpose. D is wrong — at 99.99% availability you cannot rely solely on the ML model, which will have deploy windows, cache misses, and Feature Store latency spikes."
+    },
+    {
+      "module": 19,
+      "type": "short",
+      "question": "An interviewer asks: 'Your AI agent has been in production for 6 months. Model accuracy on the golden dataset is 93%, but users are reporting worse results. What's your first hypothesis and how do you test it?' Answer in 3-4 sentences.",
+      "options": [],
+      "answer": "Distribution shift — test with production traffic sampling",
+      "explanation": "First hypothesis: distribution shift — the golden dataset reflects user behavior from 6 months ago, but users ask different questions now (new features, seasonal patterns, new terminology). The model still performs well on the old test distribution but degrades on the new one. Test: sample 200 production queries from the last 7 days that the model handles with low confidence (< 0.7). Run them through the golden dataset CI — if they score low, you've confirmed the dataset is stale. Fix: add the new production patterns to the golden dataset and re-evaluate. The L6 framing: golden dataset accuracy is a lagging indicator — the eval flywheel (active learning on low-confidence production queries) is the leading indicator that catches this before users notice."
+    },
+    {
+      "module": 20,
+      "type": "mcq",
+      "question": "A product manager asks you to add an ETA estimate to Uber's new airport shuttle service. The shuttle follows fixed routes on a schedule, running every 20 minutes. The PM wants an AI model for 'better accuracy.' What is the correct response?",
+      "options": [
+        "A. Build a regression model with features: current_time, scheduled_departure, current_location",
+        "B. Build a classification model predicting which 5-minute bucket the shuttle will arrive in",
+        "C. This is not an ML problem — a simple formula (scheduled_departure - current_time) is more accurate and requires no training data",
+        "D. Use a transformer model to learn the complex temporal patterns in shuttle delays"
+      ],
+      "answer": "C",
+      "explanation": "This is the most important ML skill: recognizing when ML is the wrong tool. A fixed-schedule shuttle with defined routes has deterministic ground truth (the schedule) plus delay patterns that can be captured by simple rules (average delay for this route = 2 min). An ML model adds complexity, requires training data, and won't outperform the schedule formula on fixed routes. The correct engineering answer is: use the schedule formula, add a simple delay correction factor from historical averages, and skip ML entirely. This signals engineering maturity — junior engineers reach for ML; senior engineers match tool to problem. Options A, B, D all apply ML to a problem that doesn't need it."
+    },
+    {
+      "module": 20,
+      "type": "gotcha",
+      "question": "You're explaining the training vs inference distinction. A junior engineer says 'we should run training continuously in production so the model always has the latest data.' What is the main reason this is a bad idea?",
+      "options": [
+        "A. Continuous training is too expensive — GPU costs would be prohibitive",
+        "B. Continuous training without evaluation gates causes the model to silently degrade from data poisoning or distribution shift, with no checkpoint to roll back to",
+        "C. The model can't train and serve simultaneously on the same hardware",
+        "D. Continuous training violates GDPR because it uses user data without explicit consent"
+      ],
+      "answer": "B",
+      "explanation": "This is called 'catastrophic forgetting' combined with a lack of rollback point. If you train continuously and a batch of poisoned or anomalous data enters the training stream, the model silently degrades with no clean checkpoint to restore. In a point-in-time training setup, you can roll back to the last known-good model file in the model registry. Continuous training removes this safety net. The correct pattern is online learning with evaluation gates: the model can learn from new data, but every N updates trigger the CI evaluation gate and a human sign-off before the new weights replace production. Option A is a valid concern but secondary. Option C is false — shadow training is common. Option D is a real concern but not the PRIMARY engineering reason."
+    },
+    {
+      "module": 20,
+      "type": "mcq",
+      "question": "Your classification model for intent detection has Precision=0.95 and Recall=0.72 on the `safety_concern` intent (detecting messages where a user might be describing an unsafe housing situation). Which metric should you optimize, and why?",
+      "options": [
+        "A. Optimize Precision — a false alarm on safety is worse than missing one, because false alarms erode user trust",
+        "B. Optimize Recall — missing a genuine safety concern is worse than occasionally flagging an innocent message, because the cost of a missed safety event is catastrophic",
+        "C. Optimize F1 — safety and false alarms are equally bad so you need a balanced metric",
+        "D. Neither — 95% precision and 72% recall is already excellent for a classification model"
+      ],
+      "answer": "B",
+      "explanation": "For safety classification, the cost asymmetry is extreme: a missed genuine safety concern (false negative) may result in harm to a person. A false alarm (false positive — flagging a safe message as concerning) is annoying but the worst outcome is a human reviewer seeing it and clearing it. Optimize Recall. In medical diagnosis, fraud detection, content moderation for harmful content, and safety systems, Recall is the primary metric — you tolerate some false alarms to ensure you miss as few true cases as possible. Option A has the asymmetry backwards. Option C treats both costs equally, which is only appropriate when false alarms and misses have the same business impact. Option D fails to account for what Recall=0.72 means: 28% of genuine safety concerns are being missed entirely."
+    },
+    {
+      "module": 21,
+      "type": "mcq",
+      "question": "You're preparing for the ML Fundamentals interview round (Round 4). The interviewer asks: 'When would you use fine-tuning over RAG?' Which answer demonstrates L5/L6-level thinking?",
+      "options": [
+        "A. Fine-tuning is always better because the knowledge is baked into the model weights and faster at inference time",
+        "B. RAG is always better because you can update it without retraining",
+        "C. Fine-tuning when you need the model to learn new reasoning patterns or output formats; RAG when the knowledge changes frequently or is per-user/per-tenant. At Housing.com, property data changes daily so RAG is correct — fine-tuning would snapshot stale listings at training time",
+        "D. Fine-tuning when you have more than 10,000 training examples; RAG when you have fewer"
+      ],
+      "answer": "C",
+      "explanation": "L5/L6 answers always include the decision criterion AND a concrete example with reasoning. 'Fine-tuning changes behavior, RAG changes knowledge' is the key distinction. The Housing.com example demonstrates you can apply the framework to your specific domain: daily-updated listings cannot be fine-tuned because the model would be trained on stale data. Option A is wrong — fine-tuning is not 'always better' and the reasoning about inference speed, while true, ignores training cost and stale knowledge. Option B is wrong for the same reason (ignores new-behavior use case). Option D conflates data volume with the actual decision criterion."
+    },
+    {
+      "module": 21,
+      "type": "short",
+      "question": "Using the transition narrative structure from B.3, write the opening two sentences of your answer to 'Why are you moving from frontend to AI engineering after 7 years?'",
+      "options": [],
+      "answer": "Specific FE connection + deliberate learning evidence",
+      "explanation": "Strong opening example: 'In 7 years at [Company], I've owned the systems that display AI predictions — ETAs on the map, personalized recommendations, real-time pricing indicators. I've spent years managing the latency and reliability of what ML models produce, and through that I developed deep curiosity about the systems upstream: how the model decides what to show.' The two required elements: (1) specific FE work that touched AI outputs (not generic 'I've been interested in AI'), (2) a through-line from existing experience to the new role that signals continuity, not escape. What to avoid: 'AI is the future' (generic), 'I want to learn something new' (signals boredom), 'I've always been interested in ML' (implies you haven't acted on it)."
+    },
+    {
+      "module": 21,
+      "type": "gotcha",
+      "question": "In Uber scenario S2 (fraud detection), you state 'optimize recall — missing fraud costs more than a false positive.' An interviewer pushes back: 'But if your false positive rate is 10%, you're blocking 10% of legitimate transactions. At Uber's scale, that's millions of lost rides per day.' How do you respond?",
+      "options": [
+        "A. Acknowledge the tradeoff and lower the recall target to reduce false positives",
+        "B. Add a second stage: high-recall first classifier routes ambiguous cases to human review, not immediate block. Maximize recall at Stage 1, use human judgment to reduce false positive impact at Stage 2",
+        "C. Optimize F1 to balance both concerns equally",
+        "D. Run two models: one optimized for recall, one for precision, and only block when both agree"
+      ],
+      "answer": "B",
+      "explanation": "This is the key production insight: 'optimize recall' doesn't mean 'block everything above threshold.' It means: use a high-recall classifier to surface suspicious transactions, then use human review (or a stricter rule) for the flagged cases before blocking. At Uber's scale: Stage 1 catches 99% of fraud (high recall) but has 10% false positive rate → flagges 10% of transactions. Stage 2 (rules + analyst review) clears 90% of false positives → effective false positive rate at block time is 1%, effective fraud catch rate is 99%. Option A sacrifices safety for convenience — wrong asymmetry for fraud. Option C loses the careful distinction between miss cost and false alarm cost. Option D adds cost without a principled reason to require both models to agree."
+    },
+    {
+      "module": 22,
+      "type": "gotcha",
+      "question": "A TypeScript engineer reads this Python code from the course: `properties, locality = await asyncio.gather(fetch_properties(filters), fetch_locality_data(loc))`. They write the TypeScript equivalent as `const [properties, locality] = await Promise.all([fetchProperties(filters), fetchLocality(loc)])`. Is their translation correct? What is the one difference that could cause a production bug?",
+      "options": [
+        "A. The translation is correct — asyncio.gather and Promise.all are identical in behavior",
+        "B. asyncio.gather returns a list but Promise.all returns an array — different data structures",
+        "C. If one coroutine raises an exception, asyncio.gather by default cancels all other running coroutines and re-raises. Promise.all rejects with the first rejection but does NOT cancel the other promises — they continue running in the background",
+        "D. asyncio.gather runs sequentially in CPython due to the GIL, but Promise.all runs truly in parallel"
+      ],
+      "answer": "C",
+      "explanation": "This is the critical behavioral difference. In Python, `asyncio.gather` with default settings (return_exceptions=False) will cancel ALL remaining coroutines when the first one raises an exception and propagate that exception. This means if fetch_properties fails, fetch_locality_data is cancelled and no resources are leaked. In JavaScript, `Promise.all` rejects on the first rejection, but the other promises continue running until they resolve or reject — you cannot cancel them. This can cause 'ghost requests' that complete after the error is handled, potentially making stale API calls or consuming rate limit. The fix in TypeScript: use AbortController to cancel in-flight fetch requests when Promise.all rejects. Option D is wrong — asyncio is cooperative multitasking (GIL doesn't prevent concurrent I/O)."
+    },
+    {
+      "module": 22,
+      "type": "mcq",
+      "question": "You're in a coding interview and asked to write a Python function that processes a list of property search results and returns only results within a given price range. Which approach is most idiomatic Python that an AI engineering interviewer would expect?",
+      "options": [
+        "A. `def filter_by_price(results, max_price): filtered = []; for r in results: if r['price'] <= max_price: filtered.append(r); return filtered`",
+        "B. `def filter_by_price(results: list[dict], max_price: float) -> list[dict]: return [r for r in results if r['price'] <= max_price]`",
+        "C. `def filter_by_price(results, max_price): return list(filter(lambda r: r['price'] <= max_price, results))`",
+        "D. `def filter_by_price(results, max_price): return results.filter(r => r.price <= max_price)`"
+      ],
+      "answer": "B",
+      "explanation": "Option B is correct for three reasons: (1) type hints in the signature (`list[dict]`, `float`, `-> list[dict]`) signal Python fluency and make the interview whiteboard readable, (2) list comprehension is the idiomatic Python pattern (preferred over explicit loops in A or lambda+filter in C), (3) modern Python 3.9+ uses `list[dict]` not `List[Dict]` from typing. Option A works but is verbose and un-Pythonic. Option C works but lambda+filter is considered less readable than list comprehension. Option D uses JavaScript arrow function syntax (`=>`) which is a syntax error in Python — a common mistake for JS engineers transitioning to Python."
+    },
+    {
+      "module": 22,
+      "type": "short",
+      "question": "What is the practical difference between `TypedDict`, `Pydantic BaseModel`, and `@dataclass` in Python, and which would you use for (a) a LangGraph pipeline state object, (b) a FastAPI request body, and (c) an internal result object returned by a pipeline node?",
+      "options": [],
+      "answer": "TypedDict for pipeline state, Pydantic for API bodies, dataclass for internal structs",
+      "explanation": "(a) LangGraph pipeline state → TypedDict. LangGraph works with plain dicts internally and TypedDict provides type checking without runtime overhead or dict-to-object conversion. Converting to a Pydantic model would require unpacking at every node boundary. (b) FastAPI request body → Pydantic BaseModel. FastAPI natively integrates with Pydantic for request parsing, validation error messages (422 responses), and auto-generated OpenAPI documentation. (c) Internal node result → @dataclass. When you need a lightweight typed container that's not a dict and doesn't leave the Python service, dataclass gives you attribute access (`result.success`) without Pydantic's validation overhead or TypedDict's dict-only constraint. The rule: if it crosses an API boundary → Pydantic; if it flows through a graph → TypedDict; if it stays internal → dataclass."
+    }
+  ],
+  "diagram_requests": [
+    {
+      "module": 17,
+      "title": "SSE Connection Lifecycle with Reconnect Handling",
+      "description": "A sequence diagram showing: (1) Client opens fetch() connection, (2) Server sends SSE frames with id: fields, (3) TCP connection drops mid-stream, (4) Client reconnects with Last-Event-ID header, (5) Server resumes from that event ID or restarts the turn. Current course shows only the happy path. Engineers need to see the reconnect path, what happens to partially-received carousel data, and what the server must maintain to support resume. This is critical for mobile users on cellular connections."
+    },
+    {
+      "module": 17,
+      "title": "React Component Tree with Data Flow Annotation",
+      "description": "A component tree diagram showing ConversationView → Turn → [UserBubble, PropertyCarousel, AssistantBubble] with arrows indicating which data comes from which SSE event type. Annotate: 'carousel populated by chat_event(type=property_carousel)', 'text populated by message_delta', 'isStreaming controlled by state machine'. Currently the JSX is shown but the data flow mapping is implicit. Engineers need to see the explicit connection between SSE frame types and which props/state changes in which component."
+    },
+    {
+      "module": 17,
+      "title": "Python async/await Event Loop Context Map",
+      "description": "A diagram showing the two execution contexts in the streaming pipeline: (1) LangGraph nodes (sync context) using queue.put_nowait(), (2) FastAPI async endpoint using await queue.get(), and the asyncio Queue bridging them. Show that the event loop is shared but the LangGraph nodes do NOT block it because they use put_nowait (non-blocking). This is the hardest concept in Module 17 for engineers coming from JavaScript's single event-loop model, and the course only explains it in text inside a callout box."
+    },
+    {
+      "module": 18,
+      "title": "Evaluation Pyramid with Tool/Code Coverage",
+      "description": "A visual pyramid diagram (not just a table) showing the four evaluation layers stacked by frequency vs cost. At base: Online signals (continuous, free, millions of data points). Second layer: Exact-match accuracy (every CI run, near-zero cost, hundreds of samples). Third layer: LLM-as-judge (per deploy, $0.15/100 samples). Apex: Human evaluation (monthly, $0.50/sample). Add arrows showing 'feeds annotations to' between layers. The current table format loses the intuition that lower layers are wider and more frequent."
+    },
+    {
+      "module": 18,
+      "title": "RAGAS Metric Diagnostic Flowchart",
+      "description": "A flowchart: Start → Check Faithfulness. If <0.7: lower temperature, add 'only use context' instruction, check temperature setting. If ≥0.7: Check Context Relevance. If <0.7: fix retriever (smaller chunks, hybrid search, better embedding). If ≥0.7: Check Answer Relevance. If <0.7: fix prompt (add 'answer the specific question asked'), check if turn_history dilutes intent. All pass → RAG pipeline is healthy. Engineers need a decision tree, not just a table of symptoms. When they see three scores, they don't know which one to fix first."
+    },
+    {
+      "module": 18,
+      "title": "Evaluation Flywheel with Human vs Automated Steps",
+      "description": "A circular flow diagram where each step is labeled either AUTOMATED (green) or HUMAN REQUIRED (orange). Step 1: Production monitoring flags failures → AUTOMATED. Step 2: LLM-as-judge pre-screens → AUTOMATED. Step 3: Human reviews borderline cases → HUMAN REQUIRED (this is the bottleneck). Step 4: Approved samples added to dataset → AUTOMATED. Step 5: CI gate re-runs → AUTOMATED. Step 6: Improved prompt deployed → AUTOMATED (or human approval gate). Engineers currently can't tell from the diagram which steps require headcount."
+    },
+    {
+      "module": 19,
+      "title": "6-Step Framework as a Timeline with Whiteboard Usage Guide",
+      "description": "A horizontal timeline showing the 30 minutes of an AI system design interview. Mark each phase with estimated minutes. Show what to draw on the whiteboard at each phase: Phase 1 (0-5 min): write requirements as a bullet list while talking. Phase 2 (5-10 min): draw data flow diagram (user query → model → response). Phase 3 (10-18 min): draw architecture boxes (classifier, feature store, model server, fallback). Phase 4-6 (18-30 min): annotate with latency numbers, metrics, monitoring. Engineers need to know what physical artifacts to produce, not just what to say."
+    },
+    {
+      "module": 19,
+      "title": "RAG vs Fine-tuning vs Zero-shot Decision Tree (Visual)",
+      "description": "A visual binary decision tree (not a text tree) for the RAG vs fine-tuning vs zero-shot choice. Nodes: 'Data changes frequently?' → YES: RAG. NO: 'Data private per-user?' → YES: RAG. NO: 'Need new behavior/reasoning style?' → YES: Fine-tuning. NO: 'Knowledge fits in prompt?' → YES: Zero-shot. NO: Fine-tuning. The current text-based decision tree in the course is hard to scan quickly during interview prep. A visual tree can be memorized as an image."
+    },
+    {
+      "module": 20,
+      "title": "Training vs Inference Infrastructure Diagram",
+      "description": "Side-by-side infrastructure diagrams: LEFT: Training infrastructure (GPU cluster, training dataset in S3/GCS, model registry, batch job runner, evaluation gate). RIGHT: Inference infrastructure (model server, Feature Store, prediction API, monitoring). Connect them with: 'trained model artifact' arrow from training to inference, 'new training labels' arrow from inference (trip completions, user feedback) back to training. This diagram makes concrete the otherwise abstract distinction between the two modes and shows how they connect in production."
+    },
+    {
+      "module": 20,
+      "title": "Precision vs Recall Tradeoff Visualization",
+      "description": "A 2x2 confusion matrix diagram (TP, FP, TN, FN) with color coding. Then show two threshold settings side by side: LOW THRESHOLD (high recall, low precision): large TP area, large FP area. HIGH THRESHOLD (high precision, low recall): smaller TP area, smaller FP area. Annotate each with real Housing.com/Uber examples: 'Low threshold for safety_concern: catch everything, route false alarms to human review. High threshold for property_recommendation: only show highly confident listings.' The formula notation in the current table is correct but not intuitive for engineers who've never studied this."
+    },
+    {
+      "module": 21,
+      "title": "FE Skills → AI Engineering Skills Mind Map",
+      "description": "A visual mind map (not a table) with 'Frontend Engineering' on the left and 'AI Engineering' on the right. Draw explicit arrows between analogous concepts: State management (Redux) → Pipeline state (BotState/TypedDict). React component lifecycle → LangGraph node execution order. A/B test with metrics → Prompt A/B test with LLM-as-judge scoring. Error boundary + fallback UI → Graceful degradation + fallback model tier. P95 latency per component → Latency budget per pipeline node. Visualizing these as a connected graph makes the mental model more memorable than reading a table."
+    },
+    {
+      "module": 22,
+      "title": "TypedDict vs Pydantic vs Dataclass When-to-Use Flowchart",
+      "description": "A decision flowchart: START → 'Does it cross an HTTP API boundary?' YES → Pydantic BaseModel. NO → 'Does it flow through a LangGraph pipeline?' YES → TypedDict. NO → 'Is it a simple internal data container?' YES → @dataclass. NO → 'Does it need complex validation/serialization?' YES → Pydantic. The current course just has a rule-of-thumb callout. A flowchart makes the decision mechanical so engineers don't have to re-derive it during an interview or code review."
+    }
+  ]
+}

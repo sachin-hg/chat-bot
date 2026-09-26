@@ -95,7 +95,7 @@ def build_graph(
     graph.add_node('validate_slm',     partial(validate_slm_node,   emit_sse=emit_sse))
     graph.add_node('filter_apply',     _no_op_safe(partial(filter_apply_node,  emit_sse=emit_sse)))
     graph.add_node('sanitize',         _no_op_safe(partial(sanitize_node,      emit_sse=emit_sse)))
-    graph.add_node('derive',           partial(derive_node,         emit_sse=emit_sse))
+    graph.add_node('derive',           partial(derive_node,         emit_sse=emit_sse, executor=executor))
     graph.add_node('clarify',          _no_op_safe(partial(clarify_node,       emit_sse=emit_sse)))
     graph.add_node('resolve_entities', _no_op_safe(partial(resolve_entities_node, executor=executor, emit_sse=emit_sse)))
     graph.add_node('route',            partial(route_node,          executor=executor,  emit_sse=emit_sse))

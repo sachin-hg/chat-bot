@@ -1,0 +1,66 @@
+{
+  "module": "Module 1 — High-Level Design",
+  "student_notes": "Three concepts students typically misremember: (1) the sentinel gotcha — easy to assume finally always runs cleanup safely; (2) that reliability, not cost, is the primary reason for two-stage SLM; (3) that put_nowait (not await put) is used inside nodes because nodes are sync, and mixing up sync/async here would deadlock.",
+  "questions": [
+    {
+      "id": "m1q1",
+      "type": "mcq",
+      "difficulty": 2,
+      "question": "Why is SSE preferred over WebSockets for AI chat streaming?",
+      "options": [
+        "SSE supports binary frames, WebSockets do not",
+        "SSE is unidirectional and works over HTTP/1.1 without special load balancer config",
+        "SSE has lower latency than WebSockets",
+        "WebSockets require TLS, SSE does not"
+      ],
+      "answer": "1",
+      "explanation": "AI chat is server-speaks, client-listens — unidirectional. SSE fits naturally and avoids the infra overhead of bidirectional WebSocket upgrades and load balancer configuration.",
+      "hint": "Think about who does the speaking in an AI chat response."
+    },
+    {
+      "id": "m1q2",
+      "type": "short",
+      "difficulty": 3,
+      "question": "LangGraph is synchronous, but FastAPI needs to stream SSE frames asynchronously. Describe the bridge pattern used and the role of each component.",
+      "options": [],
+      "answer": "A shared asyncio.Queue bridges them. Pipeline nodes call emit_sse() → queue.put_nowait() (sync-safe). The FastAPI async generator awaits queue.get() and yields frames to the browser. The pipeline runs as a background asyncio.create_task.",
+      "explanation": "The queue decouples the sync LangGraph world from the async HTTP world. put_nowait is non-blocking so nodes don't stall; await queue.get() yields control back to the event loop between frames.",
+      "hint": "What Python primitive lets sync code hand off to async code without blocking?"
+    },
+    {
+      "id": "m1q3",
+      "type": "gotcha",
+      "difficulty": 4,
+      "question": "Where exactly must the connection_close frame be yielded when the sentinel (None) is detected, and what breaks if you place it in the finally block instead?",
+      "options": [],
+      "answer": "Inside the while loop upon detecting the sentinel. If placed after try/finally, any exception in the finally block prevents that line from executing — the client never receives the close signal.",
+      "explanation": "Python's execution model: if finally raises, control transfers to the exception handler and code following the try/finally is skipped entirely. This burned us in production when Redis decr failed.",
+      "hint": "Think about what happens to code *after* a try/finally block when the finally block itself raises."
+    },
+    {
+      "id": "m1q4",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "The two-stage SLM design costs ~$0.0001 vs ~$0.005 for a single large LLM call. What is the PRIMARY architectural reason for splitting into two stages rather than cost alone?",
+      "options": [
+        "Stage 1 needs a different model provider than Stage 2",
+        "A small model trained for structured JSON output is more reliable than prompting a large general model",
+        "Two stages allow parallel execution, halving latency",
+        "The taxonomy is too long to fit in one prompt"
+      ],
+      "answer": "1",
+      "explanation": "Reliability is the key architectural reason: a small model trained for structured JSON classification is more consistent. Cost (50x) and speed (10-20x) are additional benefits, not the primary design driver.",
+      "hint": "What does a small model specifically trained for a narrow task do better than a general-purpose large model?"
+    },
+    {
+      "id": "m1q5",
+      "type": "short",
+      "difficulty": 3,
+      "question": "Stage 2 receives the domain taxonomy as part of its prompt rather than inferring structure on its own. Why?",
+      "options": [],
+      "answer": "Providing the taxonomy constrains the output space, making the small Haiku model more reliable. Without it, the model would hallucinate intent names or produce inconsistent schemas. The taxonomy acts as a structured contract the model must conform to.",
+      "explanation": "Small models lack the generalization of large models — grounding them with explicit allowed values dramatically reduces output variance and keeps token usage low.",
+      "hint": "What happens to a small model when it has to 'invent' structure vs being given explicit allowed values?"
+    }
+  ]
+}

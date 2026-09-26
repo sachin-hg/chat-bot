@@ -1,0 +1,46 @@
+{
+  "module": "Module 2",
+  "student_notes": "Questions from production engineer review. Focus on practical application.",
+  "questions": [
+    {
+      "id": "m2q1",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "clarify_node explicitly calls update_session_state() before returning when it short-circuits the pipeline. Why? What breaks if you remove that call?",
+      "options": [
+        "A. The bot_response won't be emitted to the client",
+        "B. The LangSmith trace won't capture the clarification event",
+        "C. Filter updates from filter_apply_node (e.g., city='Bangalore' was already known) will be lost because followup_node never runs",
+        "D. The A/B experiment assignment won't be persisted"
+      ],
+      "answer": "C",
+      "explanation": "The pipeline is linear: filter_apply_node runs BEFORE clarify_node. If a user says 'show me something affordable in Bangalore' \u2014 city=Bangalore gets merged into active_filters in filter_apply_node, then clarify_node short-circuits to ask about budget. Without explicit session persistence in clarify_node, the city filter is in memory but never written to Redis. On the next turn (when user answers the budget question), make_base_state loads the old session from Redis \u2014 city is gone, the user has to specify it again. This is a subtle but production-breaking bug.",
+      "hint": ""
+    },
+    {
+      "id": "m2q2",
+      "type": "short",
+      "difficulty": 3,
+      "question": "The route_node has a tier system from 0 to 3b. A new intent 'schedule_site_visit' needs to: authenticate the user, call a booking API, and return a confirmation. Describe which tier this belongs to and precisely what route_node should do for it.",
+      "options": [],
+      "answer": "This is Tier 1 with requires_auth=True. route_node first checks requires_auth \u2014 since no auth_token exists in the session, it short-circuits to build_login_template_response() before tier routing. Once authenticated, on the next turn route_node sees auth_token present and routes to Tier 1: execute_tier1_action() calls the booking API and returns a confirmation template. No LLM is involved. The key point: auth check happens before tier routing, not inside the tier 1 executor.",
+      "explanation": "The requires_auth check is a pre-routing gate. This design means you never accidentally execute a Tier 1 action for an unauthenticated user \u2014 the check is in one place (route_node), not scattered across tier executors.",
+      "hint": ""
+    },
+    {
+      "id": "m2q3",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "A user says 'tell me more about the second property' after a carousel has been shown. Which node resolves 'second' to an actual property_id and how?",
+      "options": [
+        "A. classify_node \u2014 the SLM resolves ordinal references during classification",
+        "B. resolve_entities_node \u2014 it reads entity_refs from the classification and looks up carousel_state.items[1]",
+        "C. fetch_data_node \u2014 it fetches the property_id from the Housing API using 'second' as a search term",
+        "D. llm_node \u2014 the LLM resolves ordinal references using its built-in world knowledge"
+      ],
+      "answer": "B",
+      "explanation": "resolve_entities_node processes entity_refs (the SLM outputs entity_refs: [{looking_for: 'property', by: 'cardinality', value: 2}]). It looks up carousel_state.items[1] (0-indexed), gets the property_id, and stores it in session.active_property_id. The LLM never sees carousel items directly \u2014 the orchestrator resolves the reference and injects the property context into the system prompt. This keeps LLM token cost near zero for reference resolution.",
+      "hint": ""
+    }
+  ]
+}

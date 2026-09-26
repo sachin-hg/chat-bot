@@ -1,0 +1,21 @@
+{
+  "module": "Module 6",
+  "student_notes": "Questions from production engineer review. Focus on practical application.",
+  "questions": [
+    {
+      "id": "m6q1",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "An A/B experiment has traffic_pct=10 and two variants (50/50 split). Session 'abc123' is assigned. On turn 3, session 'abc123' makes a new request. Which variant does it get?",
+      "options": [
+        "A. It might get a different variant \u2014 assignment is turn-level, not session-level",
+        "B. The same variant as before \u2014 assignment uses hash(session_id + experiment_id) % 100 which is deterministic",
+        "C. It re-evaluates based on current traffic_pct, which may have changed since turn 1",
+        "D. It always gets the control variant after turn 2"
+      ],
+      "answer": "B",
+      "explanation": "hash(session_id + experiment_id) % 100 is a deterministic, session-level assignment. The same session_id always hashes to the same number, so the same variant is selected regardless of turn count or when the request arrives. This is critical for experiment validity: showing a user Haiku on turn 1 and Sonnet on turn 3 would produce confounded measurements. The experiment framework stores experiment_id and experiment_variant in state for every turn so they're emitted to Kafka even if the variant doesn't change.",
+      "hint": ""
+    }
+  ]
+}

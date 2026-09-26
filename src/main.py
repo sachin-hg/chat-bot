@@ -4,9 +4,10 @@ from contextlib import asynccontextmanager
 import structlog.contextvars
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from src.api import chat, health, playground
+from src.api import chat, course, health, playground
 from src.config import get_settings
 from src.db.engine import close_engine, get_engine
 from src.kafka.producer import init_producer, stop_producer
@@ -106,7 +107,15 @@ async def request_id_middleware(request: Request, call_next):
     return response
 
 
+@app.get("/module/{module_id}")
+async def redirect_old_module_url(module_id: int):
+    """Redirect legacy /module/{id} URLs to /learn/module/{id}."""
+    return RedirectResponse(url=f"/learn/module/{module_id}", status_code=302)
+
+
 app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(playground.router)
+app.mount("/learn/assets", StaticFiles(directory="src/static/course-build/assets"), name="course-assets")
+app.include_router(course.router)
 app.mount("/static", StaticFiles(directory="src/static"), name="static")

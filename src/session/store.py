@@ -22,6 +22,7 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _SESSION_KEY  = "session:{session_id}"           # TTL 24h
+_VERSION_KEY  = "session:{session_id}:ver"       # TTL 24h — tiny version-only key for fast CAS
 _CONTEXT_KEY  = "conv:context:{conversation_id}" # TTL 24h
 _TURNS_KEY    = "conv:turns:{conversation_id}"   # TTL 7d (list, max 20)
 _SUMMARY_KEY  = "conv:summary:{conversation_id}" # TTL 7d
@@ -43,17 +44,28 @@ _MAX_TURNS    = MAX_TURNS
 # ---------------------------------------------------------------------------
 
 _SAVE_SCRIPT = """
-local key = KEYS[1]
-local expected = tonumber(ARGV[1])
-local new_value = ARGV[2]
-local ttl = tonumber(ARGV[3])
+local key     = KEYS[1]
+local ver_key = KEYS[2]
+local expected    = tonumber(ARGV[1])
+local new_value   = ARGV[2]
+local ttl         = tonumber(ARGV[3])
 
-local current = redis.call('GET', key)
-local current_version = 0
-if current then
-    local ok, data = pcall(cjson.decode, current)
-    if ok and data and data.version then
-        current_version = tonumber(data.version)
+-- Fast path: version stored as a separate tiny key (1-3 bytes).
+-- Avoids GET + cjson.decode of the full session blob (which grows each turn).
+local stored_ver = redis.call('GET', ver_key)
+local current_version
+if stored_ver then
+    current_version = tonumber(stored_ver)
+else
+    -- Migration fallback: first write for sessions created before this schema.
+    -- Reads and parses the full session JSON once; after this write ver_key
+    -- exists and all future saves use the fast path.
+    local blob = redis.call('GET', key)
+    if blob then
+        local ok, data = pcall(cjson.decode, blob)
+        current_version = (ok and data and data.version) and tonumber(data.version) or 0
+    else
+        current_version = 0
     end
 end
 
@@ -62,6 +74,7 @@ if current_version ~= expected then
 end
 
 redis.call('SETEX', key, ttl, new_value)
+redis.call('SETEX', ver_key, ttl, tostring(expected + 1))
 return 1
 """
 
@@ -132,11 +145,12 @@ class RedisSessionStore:
         The stored document gets version = expected_version + 1.
         """
         r = self._get_redis()
-        key = _SESSION_KEY.format(session_id=session_id)
+        key     = _SESSION_KEY.format(session_id=session_id)
+        ver_key = _VERSION_KEY.format(session_id=session_id)
         new_state = {**state, "version": expected_version + 1}
         new_value = json.dumps(new_state)
         result = await r.eval(
-            _SAVE_SCRIPT, 1, key,
+            _SAVE_SCRIPT, 2, key, ver_key,
             expected_version, new_value, _SESSION_TTL,
         )
         if result == 0:

@@ -1,0 +1,31 @@
+{
+  "module": "Module 4",
+  "student_notes": "Questions from production engineer review. Focus on practical application.",
+  "questions": [
+    {
+      "id": "m4q1",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "A new intent 'get_floor_plan' needs to fetch the property's floor plan PDF URL. The property_id is already in session.active_property_id. How should you configure the DataRequirement for this intent?",
+      "options": [
+        "A. DataRequirement(tool='getPropertyDetail', params_source='session', parallel_group=1)",
+        "B. DataRequirement(tool='getFloorPlan', params_source='entity_resolution', entity_index=0, parallel_group=1)",
+        "C. DataRequirement(tool='getFloorPlan', params_source='session', parallel_group=1) \u2014 session has active_property_id",
+        "D. No DataRequirement needed \u2014 let the LLM call getFloorPlan as a residual tool"
+      ],
+      "answer": "C",
+      "explanation": "params_source='session' passes session.active_filters to the tool call. But active_property_id is in session root, not active_filters. You would need either: (a) a new params_source type like 'active_property' that reads session.active_property_id directly, or (b) params_source='entity_resolution' if the property was resolved in this turn. The deeper lesson: the params_source taxonomy currently has three options (session, entity_resolution, filter_delta). Adding a new intent may require adding a new params_source type. This is an extension point, not a gap in the current design.",
+      "hint": ""
+    },
+    {
+      "id": "m4q2",
+      "type": "short",
+      "difficulty": 3,
+      "question": "Explain the difference between a tool's key parameter and its wire_param. Give a concrete example from the codebase and explain why this separation exists.",
+      "options": [],
+      "answer": "key is the name the LLM sees and the name used in SLM taxonomy prompts. wire_param is the actual HTTP parameter name the Housing API expects. Example: TOOL_REGISTRY has ToolParam(key='locality_uuids', wire_param='localities'). The LLM is told to call searchProperties with locality_uuids=[...]. translate_to_wire_format() renames locality_uuids to localities before the HTTP call. The separation exists because (a) the Housing API uses short internal names that aren't self-documenting to an LLM, (b) renaming internal API params doesn't require updating the LLM prompt or taxonomy, and (c) the LLM sees semantically clear names (locality_uuids makes the UUID type explicit) while the API receives its expected format.",
+      "explanation": "This pattern also provides security isolation: the LLM cannot discover or influence internal API parameter names by inspecting tool call responses.",
+      "hint": ""
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "module": "Module 7",
+  "student_notes": "Questions from production engineer review. Focus on practical application.",
+  "questions": [
+    {
+      "id": "m7q1",
+      "type": "short",
+      "difficulty": 3,
+      "question": "The LLMConcurrencyGate uses two Redis keys: llm:concurrent:count and llm:queue. Describe what happens when count=20 (at max), a new request arrives, waits in the queue for 7 seconds, and then gate.release() is called by the first completing request. Trace the exact Redis operations.",
+      "options": [],
+      "answer": "New request: Lua script runs, reads count=20, cannot INCR, checks queue length (<50), RPUSHes ticket UUID to llm:queue, returns 0. Python: result==0, enters wait loop with asyncio.wait_for(redis.blpop(llm:queue, timeout=8), timeout=9). At 7 seconds, completing request calls gate.release() which runs DECR llm:concurrent:count (now count=19). But DECR does not pop the queue \u2014 the waiting request is blocked on BLPOP which pops from the left. So the sequence is: DECR (count=19), then the waiting request's BLPOP fires, pops its ticket from the queue, then INCRs count back to 20. This means count briefly drops to 19 and rises back to 20. If DECR and BLPOP+INCR are not atomic, a third request could acquire the slot between DECR and INCR. This is a race condition in the current implementation \u2014 worth noting as a production hardening item.",
+      "explanation": "This question tests whether students understand the non-obvious race condition in the gate's release-then-BLPOP-then-INCR sequence. The correct fix is to atomically DECR-then-RPOP (not using BLPOP from the waiting side) in the release script.",
+      "hint": ""
+    },
+    {
+      "id": "m7q2",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "The Kafka writer is fire-and-forget from the API's perspective. What is the consequence if Kafka is unavailable for 2 minutes during high traffic?",
+      "options": [
+        "A. All API requests return 503 until Kafka recovers",
+        "B. Users get degraded responses because the LLM loses conversation history",
+        "C. Events during the outage are lost or buffered in the ring buffer; users are unaffected but analytics have a 2-minute gap",
+        "D. Session state is corrupted because Kafka is the primary session store"
+      ],
+      "answer": "C",
+      "explanation": "Kafka is the audit trail and analytics stream, not the session store or the API's critical path. Redis holds session state. The ring buffer absorbs burst failures. Users interact normally. The consequence is that the data team's analytics have a gap, Kafka-based summarization is delayed, and any data pipelines consuming chat.messages events miss those 2 minutes. The fire-and-forget pattern is a deliberate trade: durability vs user latency. At scale, occasional Kafka gaps are acceptable; user-facing latency from synchronous Kafka writes is not.",
+      "hint": ""
+    }
+  ]
+}

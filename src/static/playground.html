@@ -62,6 +62,8 @@
     .tpl-chip { background:#f0f0f0; border:1px solid #ddd; border-radius:10px; padding:2px 7px; font-size:10px; color:#444; }
     .locality-chips { display:flex; flex-wrap:wrap; gap:5px; margin-top:5px; }
     .locality-chip { background:#FFF0F0; border:1px solid #FFC0C0; border-radius:10px; padding:3px 10px; font-size:11px; color:#cc0000; font-weight:500; }
+    .picker-chip { cursor:pointer; transition:background 0.15s; }
+    .picker-chip.selected { background:#cc0000; color:#fff; border-color:#cc0000; }
     .login-required-box { border:2px solid var(--red); border-radius:9px; padding:10px 14px; margin-top:5px; background:#FFF8F8; text-align:center; }
     .qna-options { display:flex; flex-direction:column; gap:5px; margin-top:5px; }
     .qna-opt-btn { background:#fff; border:1.5px solid var(--red); border-radius:7px; padding:6px 11px; font-size:12px; color:var(--red); font-weight:600; cursor:pointer; text-align:left; }
@@ -559,6 +561,7 @@ const STEP_TO_NODE = {
 let convId = uuid4();
 let tokenId = uuid4();
 let isSending = false;
+let sendGen = 0;
 let showRaw = false;
 let llmChunks = 0;
 let tlCount = 0;
@@ -567,8 +570,24 @@ let currentTurnCost = 0;
 let llmStartTime = 0;
 
 // Turn history for navigation
-let turnHistory = [];   // [{debug, messages}]
+let turnHistory = [];   // [{text, debug}]
 let turnIdx = -1;       // currently viewed turn (-1 = live)
+
+// All element IDs in the pipeline panel that need save/restore for turn navigation.
+// Mirrors exactly what resetTurn() clears so nothing is missed.
+const SNAP_EL_IDS = [
+  'pgCostTotal','pgStatus',
+  'dDR','dCLF','dFLT','dRT','dBP','dTC','dLLM',
+  'bDR','bCLF','bFLT','bRT','bBP','bTC','bLLM','bTL',
+  'dr_model','dr_provider','dr_domain','dr_conf','dr_ms','dr_cost','dr_tokens','dr_prompt','dr_user',
+  'clf_model','clf_main','clf_sub','clf_pivot','clf_clarify','clf_entities','clf_reason',
+  'clf_ms','clf_cost','clf_tokens','clf_user','clf_fd',
+  'flt_after','flt_delta',
+  'rt_tier','rt_model','rt_auth',
+  'bp_file','bp_tools','bp_msgs','bp_followup','bp_tool_defs','bp_prompt',
+  'llm_model','llm_intent','llm_tools','llm_chunks','llm_tokens','llm_cost','llm_stop','llm_ms',
+  'tlList','tcList',
+];
 
 // Node state for flowchart
 let nodeState = {};     // nodeName → 'pending'|'active'|'done'|'skipped'|'error'
@@ -862,6 +881,7 @@ function handleStep(d) {
     if (ms) setEl('llm_ms', ms + 'ms', 'dim');
     setEl('llm_chunks', llmChunks, 'hi');
     setEl('bLLM', `$${d.cost_usd?.toFixed(5)||'?'} · ${d.output_tokens||'?'}tok`);
+    setNode('llm', 'done', ms);
   }
 }
 
@@ -953,6 +973,20 @@ function renderTemplate(bubble, tpl, data) {
         <div class="tpl-highlights">${(p.amenities||[]).slice(0,3).map(a=>`<span class="tpl-chip">${escHtml(a)}</span>`).join('')}</div>
       </div>`).join('');
     bubble.innerHTML += `<div class="template-cards">${html}</div>`;
+  } else if (tpl === 'locality_picker') {
+    // Multi-select locality picker. Chips toggle; Confirm sends the selection.
+    const locs = data.localities || [];
+    const question = data.question || 'Which localities would you like?';
+    if (!locs.length) return;
+    const pickerId = 'lp_' + Math.random().toString(36).slice(2);
+    const chips = locs.map(l => {
+      const name = escHtml(l.name || l);
+      return `<span class="locality-chip picker-chip" data-name="${name}" onclick="toggleLocChip(this)">${name}</span>`;
+    }).join('');
+    bubble.innerHTML += `
+      <div style="font-size:12px;color:#555;margin:6px 0 4px;">${escHtml(question)}</div>
+      <div class="locality-chips" id="${pickerId}">${chips}</div>
+      <button class="qna-opt-btn" style="margin-top:6px;" onclick="confirmLocPicker('${pickerId}')">Search these areas →</button>`;
   } else if (tpl === 'locality_carousel') {
     const locs = data.localities || [];
     if (!locs.length) return;
@@ -982,6 +1016,7 @@ async function doSend() {
 async function sendMessage(text) {
   if (isSending) return;
   isSending = true;
+  const myGen = ++sendGen;
   setSendDisabled(true);
   setStatus('Sending…');
 
@@ -1050,25 +1085,52 @@ async function sendMessage(text) {
     if (bubble && !bubble.innerText.trim()) {
       bubble.innerHTML = '<span style="color:#aaa;font-style:italic;">No text response received</span>';
     }
-    isSending = false; setSendDisabled(false); scrollBottom();
+    // Only reset if no newer turn has already taken over the input
+    if (sendGen === myGen) { isSending = false; setSendDisabled(false); }
+    scrollBottom();
   }
 }
 
 // ── Turn navigation ───────────────────────────────────────────────────────
 function captureDebugSnapshot() {
-  // Capture current debug state as JSON
+  const ids = SNAP_EL_IDS
+    .concat(NODES.map(n => 'nd_'   + n))
+    .concat(NODES.map(n => 'ndms_' + n));
+  const els = {};
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) els[id] = { i: el.innerHTML, c: el.className };
+  });
   return {
-    nodeState: {...nodeState},
+    nodeState:  {...nodeState},
     nodeTiming: {...nodeTiming},
-    cost: currentTurnCost,
+    cost:       currentTurnCost,
+    llmChunks,
+    els,
   };
+}
+
+function restoreDebugSnapshot(snap) {
+  if (!snap) return;
+  Object.entries(snap.els || {}).forEach(([id, {i, c}]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.innerHTML = i;
+    el.className  = c;
+  });
+  Object.assign(nodeState,  snap.nodeState  || {});
+  Object.assign(nodeTiming, snap.nodeTiming || {});
+  currentTurnCost = snap.cost      || 0;
+  llmChunks       = snap.llmChunks || 0;
 }
 
 function updateTurnNav() {
   const n = turnHistory.length;
-  document.getElementById('turnNavLabel').textContent = `Turn ${n} / ${n}`;
-  document.getElementById('btnPrev').disabled = n < 2;
-  document.getElementById('btnNext').disabled = true;
+  // Preserve the user's current position when a new turn is added in the background
+  const pos = turnIdx < 0 ? n : turnIdx + 1;
+  document.getElementById('turnNavLabel').textContent = `Turn ${pos} / ${n}`;
+  document.getElementById('btnPrev').disabled = pos <= 1;
+  document.getElementById('btnNext').disabled = pos >= n;
 }
 
 function navTurn(dir) {
@@ -1080,8 +1142,7 @@ function navTurn(dir) {
   document.getElementById('turnNavLabel').textContent = `Turn ${idx + 1} / ${n}`;
   document.getElementById('btnPrev').disabled = idx === 0;
   document.getElementById('btnNext').disabled = idx === n - 1;
-  // Show this turn's message in chat (simple: scroll to it)
-  // For now just update the nav label; full replay is a future enhancement
+  restoreDebugSnapshot(turnHistory[idx].debug);
 }
 
 // ── New conversation ──────────────────────────────────────────────────────
@@ -1138,6 +1199,17 @@ function setSendDisabled(d) {
   document.getElementById('chatInput').disabled = d;
 }
 function fill(t) { const el=document.getElementById('chatInput'); el.value=t; autoResize(el); el.focus(); }
+function toggleLocChip(el) { el.classList.toggle('selected'); }
+function confirmLocPicker(pickerId) {
+  const container = document.getElementById(pickerId);
+  if (!container) return;
+  const selected = [...container.querySelectorAll('.picker-chip.selected')].map(c => c.dataset.name);
+  if (!selected.length) return;
+  const msg = 'Show me properties in ' + selected.join(', ');
+  const input = document.getElementById('chatInput');
+  input.value = msg; autoResize(input);
+  doSend();
+}
 function autoResize(el) { el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,110)+'px'; }
 function handleKey(e) { if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); doSend(); } }
 </script>

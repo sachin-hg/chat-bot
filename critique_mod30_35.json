@@ -1,0 +1,680 @@
+{
+  "modules_covered": [30, 31, 32, 33, 34, 35],
+  "gaps": [
+    {
+      "module": 30,
+      "section": "30.2",
+      "topic": "GGUF quantisation mechanics",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The table shows Q4_K_M at '~1% quality loss' but there's no explanation of what 'K' and 'M' mean in Q4_K_M. Is this some k-means clustering over the weight distribution? Is 'M' a medium vs large variant? I Googled it and found Q4_K_L and Q4_K_S too. What's the actual algorithm difference, and why does the course just say 'recommended default' without explaining what we're picking between?",
+      "context": "Q4_K_M — 4 bits, ~4GB, Moderate (~1% quality loss), 3× — recommended default",
+      "fix": "Add a one-paragraph callout explaining that K-quants use k-means clustering to assign quantisation groups, and M/S/L denote Medium/Small/Large variants trading memory vs quality within the same bit-width. Add a row for Q4_0 vs Q4_K_M so readers understand why the K variant is recommended."
+    },
+    {
+      "module": 30,
+      "section": "30.3",
+      "topic": "PagedAttention — OS paging analogy depth",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The course says 'KV cache in fixed-size pages allocated on demand' and I immediately thought of OS virtual memory paging. Is this actually the same concept? In OS paging, you have a page table that maps virtual addresses to physical frames. Is vLLM doing the same thing — a page table from logical KV position to physical GPU memory frame? If so, does this also enable swapping KV pages to CPU RAM when GPU is full, the way OS pages swap to disk? The course says '2–4× more concurrent users' but gives no intuition for WHY paged allocation achieves this.",
+      "context": "vLLM is the production standard for serving open-source LLMs. Its key innovation: PagedAttention — KV cache in fixed-size pages allocated on demand, letting the same GPU serve 2–4× more concurrent requests.",
+      "fix": "Add a 4-sentence explanation: traditional KV cache pre-allocates the maximum context length for every request upfront, wasting GPU memory for short completions. PagedAttention uses a page table (directly analogous to OS virtual memory) mapping logical KV positions to physical GPU memory blocks allocated on demand. This eliminates internal fragmentation. Confirm whether CPU-RAM swapping is supported (it is, as a fallback). Include a before/after memory utilisation diagram showing fragmentation vs paged."
+    },
+    {
+      "module": 30,
+      "section": "30.3",
+      "topic": "vLLM GPU requirement — what is an A100?",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "The code says 'A100 80GB' and says it gives ~50ms first token. I've never bought a GPU before. Is A100 something I can buy on my laptop? Do I need to rent it? What does 'tensor-parallel-size 1' mean — does that mean I need exactly 1 GPU? I tried running the vllm command on my Mac and it failed immediately. Where does a frontend engineer actually get access to a GPU to try this?",
+      "context": "python -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3.1-8B-Instruct --tensor-parallel-size 1 --max-model-len 8192 --port 8000",
+      "fix": "Add a 'Getting started without an A100' callout. Point to: (1) Google Colab free T4 GPU as the zero-cost entry point, (2) Lambda Labs / Vast.ai for on-demand A100 rental at ~$1–3/hr, (3) Note that vLLM requires CUDA (Linux+NVIDIA) — it does not work on Mac. Explain that tensor-parallel-size 1 means single GPU. Without this, Mac users hit a confusing install error and assume they've done something wrong."
+    },
+    {
+      "module": 30,
+      "section": "30.5",
+      "topic": "Groq LPU architecture — what is an LPU?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The course gives me the benchmark table (10ms TTFT, 800-1200 tokens/sec) but tells me nothing about WHY Groq is faster. What is an LPU actually? Is it a tensor core chip like a GPU? Is it a neuromorphic chip? Is it some FPGA-based thing? I went to Groq's website and saw 'deterministic execution' — that implies no dynamic scheduling overhead. Is the speed advantage from eliminating memory bandwidth bottlenecks, or from a different compute model entirely? I can't reason about failure modes without understanding the mechanism.",
+      "context": "Groq's LPU (Language Processing Unit) is purpose-built for deterministic, ultra-low-latency LLM inference.",
+      "fix": "Add a 3-sentence technical callout: Groq's LPU is a SIMD streaming processor with on-chip SRAM (no DRAM bandwidth bottleneck) and a compiler that lays out all compute statically at model-load time. This eliminates dynamic scheduling overhead, making each token decode completely deterministic. Tradeoff: only supports fixed, pre-compiled model graphs — hence the limited model catalogue and no fine-tuned model deployment."
+    },
+    {
+      "module": 30,
+      "section": "30.7",
+      "topic": "Continuous batching — how it works vs static batching",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The table says 'continuous batching: inserts new requests mid-generation, 2–4× throughput improvement.' I don't understand what was happening before. Were requests just waiting in a queue until the whole batch finished? Can you show me a timeline diagram — like, request A arrives at T=0, B at T=5, and what happens in old batching vs continuous batching? The '2-4x improvement' number means nothing to me without knowing what the baseline was.",
+      "context": "Continuous batching: Inserts new requests mid-generation — 2–4× throughput improvement",
+      "fix": "Add a timeline ASCII diagram showing: static batching (GPU waits for all requests in a batch to finish before starting new ones, so a short request waits behind a long one), vs continuous batching (as soon as any sequence in the batch completes, a new request is slotted in). This is the core insight and it's a common interview question. Also mention 'iteration-level scheduling' as the alternative name."
+    },
+    {
+      "module": 30,
+      "section": "30.6",
+      "topic": "Speculative decoding — how does the draft model verification work?",
+      "severity": "low",
+      "engineer": "Alex",
+      "question": "The table says 'small draft model generates N tokens; large model verifies in one pass, 2–3× speedup when draft is often correct.' What happens when the draft is WRONG? Does the large model reject all N tokens and restart? Does it accept the prefix up to the first mismatch? And how do you pick a draft model — does it have to be in the same model family? This is a common technique and the current description is so sparse it can't be applied in practice.",
+      "context": "Speculative decoding: Small draft model generates N tokens; large model verifies in one pass — 2–3× speedup when draft is often correct",
+      "fix": "Add a callout explaining the rejection sampling mechanism: the large model processes all N draft tokens in parallel (one forward pass). For each position, it either accepts the draft token (if the large model's probability for that token is above a threshold) or rejects from that position onward, falling back to the large model's own sample. Draft model should be same family (e.g., Llama 3.1 1B drafting for 8B). Mention that vLLM supports this natively via --speculative-model flag."
+    },
+    {
+      "module": 31,
+      "section": "31.1",
+      "topic": "What fine-tuning actually IS — the weights mental model",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "I thought I was just calling an API this whole course. Now suddenly the course says I have to 'train a model.' What does that actually mean? Are we downloading a copy of Llama and running some kind of learning algorithm on our own computer? I don't understand what 'weights' are physically — are they a file? A matrix? And what's the difference between the weights before and after fine-tuning — does the file size change? Can you show me a diagram of what's staying the same vs what's changing?",
+      "context": "Level 3 — Fine-Tuning (days, moderate cost): Bake style/behaviour/domain patterns into weights",
+      "fix": "Add a 'What are weights?' primer callout before the adaptation hierarchy: model weights are a large binary file of floating-point numbers (Llama 3.1 8B = ~16GB file). They encode everything the model knows. Fine-tuning = loading this file, showing the model examples, running gradient descent to nudge the numbers so the model gives the answers you want, then saving the modified file. Include a before/after conceptual diagram showing the same architecture with modified numbers in a small subset of layers."
+    },
+    {
+      "module": 31,
+      "section": "31.3",
+      "topic": "LoRA rank decomposition — plain English explanation",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The math shows W ∈ ℝ^(d×k) frozen, ΔW = A×B where A ∈ ℝ^(d×r), B ∈ ℝ^(r×k), r << d. This IS SVD-style low-rank decomposition. But the course never says that. The claim is that the 'delta' lies in a low-rank subspace — but why would the useful fine-tuning signal be low-rank? Is this an empirical observation or does it follow from something theoretical about the pre-training loss landscape? Also: when r=16 and d=4096, you're saying the entire fine-tuning delta for a 4096×4096 matrix can be represented in rank-16. That seems like a very strong claim. What's the justification?",
+      "context": "LoRA freezes original weights and adds small trainable rank-decomposition matrices. Original weight: W ∈ ℝ^(d×k) — frozen. LoRA delta: ΔW = A × B — trained. A ∈ ℝ^(d×r), B ∈ ℝ^(r×k), where r << d",
+      "fix": "Add a 'Why does low-rank work?' callout: the empirical finding (Hu et al. 2021 LoRA paper) is that the weight change manifested during full fine-tuning has an intrinsically low 'intrinsic dimensionality' — the signal you need to adapt the model for a specific task lives in a much smaller subspace than the full parameter space. This is analogous to PCA: most meaningful variance in a dataset often lies in a few principal components. Include the Hu et al. 2021 reference. Also note: r=16 is not a universal truth — for very distinct tasks or small datasets, higher r (32, 64) sometimes performs better, and this should be validated on your eval set."
+    },
+    {
+      "module": 31,
+      "section": "31.3",
+      "topic": "What GPU do I need for LoRA? Entry point for beginners",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "The table says LoRA for Llama 3.1 8B needs ~20GB VRAM. I Googled 'how to get 20GB VRAM' and the cheapest option I found was an RTX 4090 at $1600, or renting on cloud. The course says 'A100 40GB' but doesn't say whether I can try this on a free tier anywhere. Can I run the SFTTrainer code on my laptop? Will Google Colab work? What's the minimum I need to run the code example from 31.5 without paying hundreds of dollars?",
+      "context": "LoRA VRAM (r=16): Llama 3.1 8B requires ~20GB (1× A100 40GB)",
+      "fix": "Add a 'Trying fine-tuning for free' callout: Google Colab Pro+ gives A100 access (~$50/month). For Llama 3.1 8B with QLoRA (section 31.4), you only need ~6GB VRAM — fits on Colab free T4. For the SFT pipeline in 31.5, use QLoRA + Llama 3.1 8B on Colab free tier, or use phi3-mini (3.8B) as a smaller proxy model. Point to a runnable Colab notebook link (or note that one should be added). This is the #1 blocker for beginners attempting the code."
+    },
+    {
+      "module": 31,
+      "section": "31.4",
+      "topic": "What is NF4 — how is it different from int4?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The code uses bnb_4bit_quant_type='nf4' and the comment says 'NF4 outperforms int4 for LLMs.' But why? Int4 is just a standard 4-bit integer. What is NF4? Is it a custom quantisation scheme? I looked it up and found 'Normal Float 4' — it uses a non-uniform quantisation grid designed to match the normal distribution of transformer weights. But the course doesn't say any of this. A trained ML engineer should be able to explain WHY they're using NF4, not just that it's in the code.",
+      "context": "bnb_4bit_quant_type='nf4'  # NF4 outperforms int4 for LLMs",
+      "fix": "Add a one-sentence inline comment and a callout: NF4 (Normal Float 4) uses a quantisation grid whose bins are spaced according to a normal distribution — the same distribution that pre-trained transformer weights follow. This means NF4 assigns more precision to the high-density centre of the weight distribution and less to the rare extremes, reducing rounding error compared to uniform int4. Reference: Dettmers et al. 'QLoRA' 2023."
+    },
+    {
+      "module": 31,
+      "section": "31.5",
+      "topic": "Dataset size — why 500 examples beats 5000 repetitive ones",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The comment says '500 diverse examples > 5000 repetitive ones.' I believe you, but I don't understand WHY. Is it because the model already knows most patterns and you're just nudging it? Is there a risk of overfitting if I have 5000 copies of the same query phrased identically? And what does 'diverse' mean concretely — diverse in phrasing, diverse in edge cases, diverse in intent types? How do I know if my dataset is diverse enough?",
+      "context": "# 500 diverse examples > 5000 repetitive ones. Hold out 10-20%.",
+      "fix": "Expand the dataset comment into a small callout: diversity means covering (1) varied phrasings of the same intent, (2) edge cases and ambiguous examples, (3) all intent/entity categories roughly proportionally. Repetitive examples cause overfitting — the model memorises surface patterns rather than generalising. Rule of thumb: if removing one example from your dataset wouldn't change model performance, that example isn't adding information. Also add guidance on measuring diversity: check that your dataset covers all intent categories and that no single pattern exceeds 20% of examples."
+    },
+    {
+      "module": 31,
+      "section": "31.6",
+      "topic": "RLHF vs DPO — what is 'beta' in DPOConfig?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The code has DPOConfig(beta=0.1) with a comment 'how strongly to enforce preference.' What is beta mathematically? The DPO paper defines it as the KL-divergence regularisation coefficient that controls how far the trained model can deviate from the reference SFT model. Beta=0.1 is permissive — the model can change a lot. Beta=0.5 constrains it closer to the SFT baseline. But the course just says 'how strongly to enforce preference' which is vague enough to be useless when actually tuning. What happens to model quality if I set beta too high or too low?",
+      "context": "dpo_config = DPOConfig(beta=0.1)  # how strongly to enforce preference",
+      "fix": "Replace the vague comment with a precise one: 'KL regularisation weight vs SFT reference. Low (0.05–0.1) = model can change more, higher win rate but risk of distribution shift. High (0.3–0.5) = stays close to SFT, more stable but less improvement.' Add a note that beta is the most important DPO hyperparameter to tune on your eval set, and that most practical DPO runs use 0.1–0.2 as a starting point."
+    },
+    {
+      "module": 31,
+      "section": "31.7",
+      "topic": "Catastrophic forgetting — what does it look like in practice?",
+      "severity": "low",
+      "engineer": "Priya",
+      "question": "The course mentions 'catastrophic forgetting: fine-tuning on a narrow domain degrades general capability. Mitigate with 80/20 domain+general instruction data mix.' But what does it actually look like when it happens? Does the model start refusing to answer general questions? Does it output gibberish? Does it just get worse at grammar? And what's the test — do I run MMLU and hope it doesn't drop more than 2%? How do I detect it BEFORE deploying?",
+      "context": "Catastrophic forgetting: Fine-tuning on a narrow domain degrades general capability. Mitigate with 80/20 domain+general instruction data mix.",
+      "fix": "Add a 'Detecting catastrophic forgetting' callout with 3 concrete signals: (1) MMLU drops >2% vs base model (run the MMLU benchmark on a 100-question sample — takes 5 minutes), (2) Model starts refusing off-topic questions with domain-specific refusals ('I only answer property questions'), (3) Output diversity collapse — all responses use the same sentence structure. Add the MMLU evaluation code snippet. The 80/20 mix guidance is correct but engineers need to know how to verify it's working."
+    },
+    {
+      "module": 32,
+      "section": "32.1",
+      "topic": "HuggingFace gated models — authentication friction not mentioned",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "I ran 'pipeline(text-generation, model=meta-llama/Meta-Llama-3.1-8B-Instruct)' and got a 401 error saying I need to accept a license agreement. The course doesn't mention that Llama models are gated on HuggingFace and require (1) creating an account, (2) filling out a Meta request form, (3) waiting for approval, (4) setting up HF_TOKEN. I wasted 45 minutes figuring this out. Why isn't this in the course?",
+      "context": "from transformers import pipeline\npipe = pipeline('text-generation', model='meta-llama/Meta-Llama-3.1-8B-Instruct')",
+      "fix": "Add a prerequisite callout before the code block: 'Llama models require (1) HuggingFace account at huggingface.co, (2) request access at meta-llama/Meta-Llama-3.1-8B-Instruct (usually approved within minutes), (3) huggingface-cli login or HF_TOKEN env var. For a zero-auth alternative, use microsoft/phi-3-mini-4k-instruct which has no gating.' This is a day-1 blocker that causes 80% of beginners to give up on the code example."
+    },
+    {
+      "module": 32,
+      "section": "32.2",
+      "topic": "Groq rate limits — not mentioned despite being the primary real-world constraint",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The course sells Groq as the ultra-low-latency solution but never mentions rate limits. I tried using Groq at high volume and hit errors immediately. The free tier is 30 requests/min for Llama 3.1 8B. The paid tier starts at $5/month and still has capacity constraints. The course says 'capacity constraints at peak' in the limitations section but gives NO numbers. If I'm designing a system for 10M calls/day (~115 calls/second), can Groq handle that? What is the actual enterprise capacity?",
+      "context": "Limitations: limited model selection, no fine-tuning, capacity constraints at peak.",
+      "fix": "Expand the limitations bullet with concrete numbers: free tier = 30 RPM / 14,400 tokens/min for Llama 3.1 8B. Paid tiers scale but Groq doesn't publish enterprise SLAs publicly — capacity is the primary reason Groq is not a standalone production solution at 100M+ daily tokens. The architecture recommendation is: Groq as primary for latency-sensitive paths + vLLM as fallback. Add the OpenRouter example (already in 32.4) cross-referenced here for implementing the fallback."
+    },
+    {
+      "module": 32,
+      "section": "32.3",
+      "topic": "Together.ai fine-tuning — what format does the training file need to be in?",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The code shows client.fine_tuning.create(training_file='file-abc123') — where did 'file-abc123' come from? I have my 500 ChatML examples from Module 31 as a Python list of dicts. How do I upload them to Together.ai? What file format does it expect — JSONL? JSON? Do I need to use the Together SDK to upload the file, and does it accept the same ChatML format as the SFTTrainer? The code example looks like it skips the most important step.",
+      "context": "job = client.fine_tuning.create(model='meta-llama/Meta-Llama-3.1-8B-Instruct-Reference', training_file='file-abc123', n_epochs=3, learning_rate=2e-5, suffix='housing-classifier')",
+      "fix": "Add the missing upload step before the fine-tuning call: show client.files.upload(file=open('train.jsonl','rb'), purpose='fine-tune') to get the file ID. Confirm that Together.ai expects the same ChatML JSONL format as HuggingFace/OpenAI fine-tuning. Add a 2-line snippet converting the Module 31 dataset format to JSONL. This completes the example so it's actually runnable end-to-end."
+    },
+    {
+      "module": 32,
+      "section": "32.4",
+      "topic": "OpenRouter fallback chain — how does 'route: fallback' actually work?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The code has 'route: fallback' with 'models: [claude-sonnet-4-6, gpt-4o]'. What does 'fallback' mean here — does OpenRouter try Claude first and fall back to GPT-4o on error (5xx), on timeout, or on rate limit? Is there a 'cheapest' routing option that picks the cheapest available provider? What's the latency overhead of OpenRouter's routing layer itself? And critically: if Claude returns a 200 with a bad response (e.g., empty content), does fallback kick in, or only on HTTP errors?",
+      "context": "extra_body={'route': 'fallback', 'models': ['anthropic/claude-sonnet-4-6', 'openai/gpt-4o']}",
+      "fix": "Add a callout explaining OpenRouter's routing modes: 'fallback' triggers on provider errors (5xx, timeouts, rate limits) but NOT on bad content — it's infrastructure-level fallback only. For semantic fallback (bad quality), you need application-level retry logic. Also mention 'route: cheapest' as an alternative for cost optimisation. Note that OpenRouter adds ~50–100ms latency to every call vs direct API. Include a link to OpenRouter's routing documentation."
+    },
+    {
+      "module": 32,
+      "section": "32.6",
+      "topic": "Bedrock vs SageMaker — engineers at Amazon who hit this in interviews get it wrong",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The table says Bedrock is for 'AWS-native teams, enterprise support, Guardrails' and SageMaker is for 'Full MLOps, HPO, model registry, dedicated MLOps team.' But when would you choose BOTH? And the Amazon interview question (section D.4) is about Alexa skill routing at 10M concurrent requests — would you use Bedrock for that, or would Amazon's internal stack be something completely different? The course implies all FAANG interviews involve public cloud services but Amazon actually uses its own internal infra.",
+      "context": "Amazon Bedrock: Claude, Llama, Titan, Mistral — AWS-native teams, enterprise support, Guardrails. Amazon SageMaker: Any (bring your own) — Full MLOps, HPO, model registry, dedicated MLOps team.",
+      "fix": "Add a decision callout: use Bedrock when you need managed inference with minimal ops (API-first, pay-per-token, includes Guardrails for safety). Use SageMaker when you need full control — custom training, HPO, endpoint versioning, A/B traffic splitting, batch transform. The two are complementary: SageMaker for training pipelines, Bedrock for inference APIs. For Amazon interviews specifically, note that internal teams use Alexa's proprietary NLU stack, not Bedrock — the interview question tests reasoning about distributed systems, not AWS product knowledge."
+    },
+    {
+      "module": 32,
+      "section": "32.8",
+      "topic": "MLflow vs W&B — when does self-hosting MLflow actually make sense?",
+      "severity": "low",
+      "engineer": "Priya",
+      "question": "The course says 'MLflow: self-hosted or Databricks, GDPR-safe' and 'W&B: richer visualisation, hyperparameter sweeps.' But if I'm just doing one fine-tuning run for a side project, do I really need either of these? What does experiment tracking actually give me that I couldn't get from just printing loss values and saving checkpoints with timestamps? I need a concrete use case where NOT having MLflow made something painful.",
+      "context": "MLflow: self-hosted or Databricks, GDPR-safe. W&B: richer visualisation, hyperparameter sweeps, team collaboration.",
+      "fix": "Add a 'Why experiment tracking matters' before-and-after scenario: without tracking, you run 10 LoRA experiments with different r values and learning rates — when the 11th run fails, you can't remember which hyperparameters gave the best eval accuracy 3 days ago. MLflow gives you a table of every run, its params, and its metrics, with one-click model registry. For solo projects with 1–3 runs: printing + checkpoints is fine. For anything with hyperparameter search: W&B sweeps save hours. Use MLflow when data privacy requires self-hosting."
+    },
+    {
+      "module": 33,
+      "section": "33.1",
+      "topic": "What LLM is doing the 'reasoning' in ReAct — is it the same model?",
+      "severity": "high",
+      "engineer": "Both",
+      "question": "The course shows a ReAct trace with 'Thought: I need to find current property prices...' and then 'Action: search_listings(...)'. But HOW does the LLM know to emit 'Thought:' and 'Action:' formatted text instead of just answering? Is the 'Thought' actually reasoning, or is it just text the LLM learned to produce that looks like reasoning? And is the same LLM doing both the reasoning AND the tool call parsing? We're both confused about whether there's any actual reasoning happening or if it's just pattern matching on the ReAct prompt template.",
+      "context": "ReAct interleaves reasoning (Thought) and action (Action/Observation) in the LLM context. The model narrates its reasoning before calling tools.",
+      "fix": "Add a 'How ReAct actually works mechanically' callout: (1) The ReAct prompt template (hub.pull('hwchase17/react')) includes few-shot examples of Thought/Action/Observation traces that teach the model the format via in-context learning. (2) Yes, the same LLM does both — it's prompted to generate structured text that the AgentExecutor parses by looking for 'Action:' and 'Action Input:' prefixes. (3) The 'reasoning' in Thought is the model's language generation, not a separate reasoning engine — it's the same LLM predicting tokens. This distinction matters: the model can hallucinate in the Thought section just as it can anywhere else. Reference: Wei et al. 2022 ReAct paper."
+    },
+    {
+      "module": 33,
+      "section": "33.2",
+      "topic": "ReAct failure mode — what does 'reasoning drift' actually look like in logs?",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The table says 'reasoning drift: model hallucinates tool result instead of calling tool.' I tried running the AgentExecutor example and got a confusing error. Can you show me what a reasoning drift trace looks like versus a correct trace? Like, what would I actually see in the verbose=True output when it's going wrong? Right now 'hallucinating tool result' is an abstract description — I need to see a concrete failure log.",
+      "context": "Reasoning drift: Model hallucinates tool result instead of calling tool. Mitigation: Structured output for tool calls.",
+      "fix": "Add a side-by-side trace comparison: correct trace shows 'Action: search_listings\\nAction Input: {location: Bandra}' followed by real Observation. Drift trace shows 'Thought: I searched and found 3 listings at 1.5Cr...' (the model invents the observation without actually calling the tool). Explain that AgentExecutor catches this because it tries to parse 'Action:' from the output and fails, then triggers handle_parsing_errors=True fallback. Add an example of the retry message sent back to the LLM."
+    },
+    {
+      "module": 33,
+      "section": "33.3",
+      "topic": "Plan-and-Execute — what happens when step 2 fails and the replanner is called?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The Plan-and-Execute section mentions 'Replanner: If step fails → revise remaining plan' but there's no code for the replanner. In the code example, PlanAndExecute just has a planner and executor. What triggers replanning — an exception, a failed tool call, a low-confidence output? And how does the replanner know which step failed and what to do differently? This seems like the most important part of making Plan-and-Execute robust and it's completely absent from the code.",
+      "context": "Replanner: If step fails → revise remaining plan. from langchain_experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner",
+      "fix": "Add a replanner implementation showing: (1) wrap each executor step in try/except, (2) on failure, call a replanner LLM that receives the original goal + completed steps + failed step + error message, (3) replanner returns a revised remaining plan. Alternatively, reference the LangGraph-based Plan-and-Execute pattern (the langchain_experimental version is largely unmaintained as of 2025) and show the LangGraph version with explicit replan node. This matters because the langchain_experimental import is fragile."
+    },
+    {
+      "module": 33,
+      "section": "33.4",
+      "topic": "Reflexion — what counts as a 'verifiable correctness criterion'?",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The course says Reflexion works for 'tasks with verifiable correctness (code passing tests, math problems)' and fails for 'vague tasks where self-critique has no ground truth.' But what about our housing.com use case — is 'check if this property JSON is complete' a verifiable task? Is 'did the agent find the right neighborhood' verifiable? I need a framework for deciding whether MY task qualifies for Reflexion, not just the two clean examples given.",
+      "context": "When Reflexion works: Tasks with verifiable correctness (code passing tests, math problems), clear quality criteria, reliable external scorer.",
+      "fix": "Add a decision question: 'Can you write a function that takes the agent's output and returns True/False without human judgment?' If yes → Reflexion candidate. If no → too subjective. Real estate examples: 'did the JSON parse?' (yes → verifiable), 'is the response helpful?' (no → not verifiable without an LLM-as-judge). Mention that LLM-as-judge can act as an external scorer for semi-verifiable tasks, converting subjective quality into a binary signal — but this adds cost and the scorer can be wrong."
+    },
+    {
+      "module": 33,
+      "section": "33.5",
+      "topic": "Tool selection at scale — what is the latency cost of embedding-based tool lookup?",
+      "severity": "low",
+      "engineer": "Alex",
+      "question": "The code shows a vector similarity search over 50+ tool descriptions to find the relevant 5 tools before each agent call. But that embedding lookup itself takes time — an embedding API call is 50–200ms. For latency-critical agents, this pre-tool-selection step could add more latency than the tool calls themselves. What's the recommended approach when you have 50+ tools but a strict <500ms SLA? Should the tool descriptions be cached? Should they be embedded locally?",
+      "context": "With 50+ tools: retrieve the relevant subset dynamically. tool_store = Chroma.from_documents(tool_docs, OpenAIEmbeddings())",
+      "fix": "Add a latency note: embed tool descriptions at startup and cache in-memory (Chroma is already in-memory in this example). The similarity search itself on 50 documents is <5ms. The bottleneck is the embedding API call for the query — use a local embedding model (e.g., all-MiniLM-L6-v2 runs in <10ms CPU) for the query embedding if latency matters. For very large tool sets (500+), consider pre-computing tool-category embeddings and doing two-stage lookup: category first, then tools within category."
+    },
+    {
+      "module": 34,
+      "section": "34.1",
+      "topic": "Multi-agent communication protocol — how do agents actually exchange information?",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "So the agents talk to each other — but through what protocol? Are they making HTTP calls to each other? Are they writing to a shared database? Looking at the code, I see 'state: SupervisorState' gets passed around, but this is all in-process Python. What happens in production when agent A runs on one server and agent B runs on another? How does agent A know what agent B already found? Is this all just function calls disguised as 'agents'?",
+      "context": "User query → Supervisor → Research Agent → Supervisor ↘ Analyst Agent → Supervisor → Final answer ↘ Writer Agent → Supervisor",
+      "fix": "Add a 'Multi-agent communication in practice' callout: in LangGraph, agents communicate through shared state passed as Python function arguments — in-process, no HTTP. For distributed multi-agent (agents on different servers), the state must be serialised to a persistent store (Redis, PostgreSQL) between node executions, and LangGraph supports this via checkpointers. Agents don't call each other directly — the graph framework orchestrates who runs next and what state they receive. Clarify that the 'supervisor routing' is a conditional function in the graph, not a separate running process."
+    },
+    {
+      "module": 34,
+      "section": "34.2",
+      "topic": "Supervisor architecture — how does the supervisor LLM know when work is TRULY done?",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The route function returns 'FINISH' when state['next'] == 'FINISH'. But how does the supervisor LLM reliably know to output 'FINISH'? The system prompt says 'FINISH: work is complete' but that's circular. What if the supervisor loops unnecessarily (sending to Writer, then back to Research, then Writer again) because it doesn't have a clear termination condition? Is there a max_iterations equivalent for the supervisor? What's the most common real-world failure mode here?",
+      "context": "system = 'Route to the best agent: - research: needs web search - analyst: needs numerical analysis - writer: needs to compose a final response - FINISH: work is complete'",
+      "fix": "Add a 'Supervisor termination' section: (1) the supervisor should receive the writer's output in state['messages'] and be explicitly instructed 'If a final answer has already been written, output FINISH.' (2) Always add a recursion_limit to the compiled graph: app = graph.compile(recursion_limit=25). (3) The most common failure: supervisor oscillates between writer and researcher because the writer's output doesn't explicitly signal 'done' — fix by having the writer add a sentinel message like AIMessage(content='[FINAL]'+answer, name='writer') that the supervisor prompt is trained to recognise."
+    },
+    {
+      "module": 34,
+      "section": "34.3",
+      "topic": "Hierarchical architecture — what is a 'compiled subgraph' and can it be async?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The code shows research_subgraph = research_builder.compile() then main_graph.add_node('research_team', research_subgraph). This is using a compiled LangGraph as a node — but what does that mean for debugging? If the research subgraph has 3 nodes inside it, do I see all 3 in my LangSmith trace, or just one 'research_team' node? And if I want the research_team and analysis_team to run in parallel (since they might be independent), does LangGraph support async subgraph execution?",
+      "context": "research_subgraph = research_builder.compile()\nmain_graph.add_node('research_team', research_subgraph)\nmain_graph.add_edge('orchestrator', 'research_team')\nmain_graph.add_edge('research_team', 'analysis_team')",
+      "fix": "Add a note: LangSmith traces compiled subgraphs as expandable nested traces — you see 'research_team' in the outer trace and can click to expand all inner nodes. For parallel subgraphs, the parent graph must use graph.add_edge('orchestrator', 'research_team') AND graph.add_edge('orchestrator', 'analysis_team') with a join node (graph.add_edge('research_team', 'aggregator') and graph.add_edge('analysis_team', 'aggregator')). LangGraph compiles this into async parallel execution. Show this pattern explicitly as it's a major performance win for independent pipeline stages."
+    },
+    {
+      "module": 34,
+      "section": "34.5",
+      "topic": "Handoff protocols — message passing vs structured state for beginners",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "I see two patterns: message passing (append to messages list) and structured state (typed fields). But I don't understand when to pick which. If I use message passing and the research agent returns 3,000 words of research, does ALL of that go into the messages list and get passed to the analyst AND the writer? That seems like it would blow up the context window. The structured state approach seems cleaner but the course doesn't explain how to handle cases where the analyst needs to read the research output.",
+      "context": "Message passing: Agents append to shared message list — best for Conversational multi-agent flows. Structured state: Agents read/write typed fields — best for Pipeline-style with typed outputs.",
+      "fix": "Add a decision rule: use message passing when agents are conversational and need full dialogue context. Use structured state for pipelines where each stage produces a typed artifact (research_results, analysis, final_answer) — agents read only their relevant fields, not the full history. For the context bloat concern: with structured state, the research agent writes to state['research_results'] (a list of facts/passages) and the analyst reads ONLY state['research_results'], not the full message history. This is exactly the 'context bloat' mitigation mentioned in 34.6's production table — cross-reference it explicitly."
+    },
+    {
+      "module": 34,
+      "section": "34.6",
+      "topic": "Cost explosion — how to put a hard dollar cap on a multi-agent run",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The production table says 'Per-run cost tracking; budget caps in supervisor.' But the code never shows how to implement a budget cap. If I have a supervisor + 4 specialist agents and each agent makes 3 LLM calls at ~$0.003 each, a single run is ~$0.04. Fine. But if the supervisor loops 10 times through all 4 agents, that's $1.60 per user query. I need to see actual code for: (1) tracking cumulative cost in state, (2) supervisor checking it, (3) gracefully stopping when budget exceeded.",
+      "context": "Cost explosion (N agents × M calls): Per-run cost tracking; budget caps in supervisor",
+      "fix": "Add a budget tracking code snippet: add budget_used: float and max_budget: float = 0.10 to SupervisorState. In each agent node, estimate cost from token counts (input_tokens*price + output_tokens*price) and add to state['budget_used']. In the supervisor's route function, check if state['budget_used'] >= state['max_budget'] and return END early with a 'Budget exceeded' message. Mention that LangSmith tracks per-run token usage automatically for post-hoc analysis, but real-time caps require this in-state pattern."
+    },
+    {
+      "module": 35,
+      "section": "D.3",
+      "topic": "Meta's stack — what is 'Tupperware' and how does it relate to Kubernetes?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The table says Meta uses 'PyTorch-native, FAISS, internal Tupperware.' I've never heard of Tupperware and couldn't find a public post about it. Is this their container orchestration system (like Kubernetes)? If I interview at Meta and they ask about their stack, what level of knowledge about Tupperware do they actually expect? Or is the interview question about PyTorch/FAISS and Tupperware is just trivia?",
+      "context": "Meta: Llama 3.x (open + fine-tuned), PyTorch-native, FAISS, internal Tupperware. Interview focus: Recommender systems, real-time ranking, PyTorch arch.",
+      "fix": "Add a footnote: Tupperware is Meta's internal cluster management system (analogous to Kubernetes) — interviewers do NOT expect knowledge of internal tooling. What matters for Meta interviews is (1) distributed training with PyTorch DDP/FSDP, (2) real-time feature pipelines for recommendation, (3) FAISS for billion-scale ANN search. Remove Tupperware from the table or add a parenthetical: '(internal cluster manager — not asked in interviews)' to prevent candidates from spending time researching unknowable internal systems."
+    },
+    {
+      "module": 35,
+      "section": "D.3",
+      "topic": "Apple PCC — what is it and why does it matter for AI engineering?",
+      "severity": "high",
+      "engineer": "Both",
+      "question": "The Apple row mentions 'Apple Intelligence, Core ML, PCC' but PCC isn't explained anywhere. We both Googled it and found 'Private Cloud Compute' — Apple's server-side AI processing that supposedly can't be accessed by Apple engineers. But what does this mean architecturally for an AI engineer? If PCC processes requests server-side, how is it different from just running inference on a server? Why would Apple need this if they also do on-device inference? This seems like a key Apple differentiator but the course just lists it as an acronym.",
+      "context": "Apple: Apple Intelligence, Core ML, PCC — Swift, ONNX, on-device Neural Engine. Interview focus: Privacy by design, on-device quantisation, Swift integration.",
+      "fix": "Add a 2-sentence PCC explanation: Private Cloud Compute is Apple's server-side AI infrastructure where inference code runs in cryptographically verified, privacy-isolated compute units — even Apple cannot inspect the data being processed. For AI engineers, PCC means complex requests that exceed on-device capacity are processed server-side without compromising the privacy model. Apple interview angle: PCC is the architectural answer to 'how do you scale on-device AI to harder tasks without sending user data to a traditional cloud?' This distinction is worth understanding for any Apple AI role."
+    },
+    {
+      "module": 35,
+      "section": "D.3",
+      "topic": "Netflix does NOT use a traditional LLM stack — the profile is misleading",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The Netflix row says 'Custom embeddings, Whisper' and 'Metaflow, Flink, FAISS, internal A/B platform.' This makes Netflix sound like it doesn't use any LLMs at all. Is that accurate? Netflix's recommendation system is famously embedding-based, not LLM-based. But they also have Generative AI use cases (UI copy generation, content metadata enrichment). The interview question is about 'whether the new recommendation model is actually better' — which is an A/B testing question, not really an AI engineering question. Should candidates target Netflix for AI roles at all, given this profile?",
+      "context": "Netflix: Custom embeddings, Whisper — Metaflow, Flink, FAISS, internal A/B platform. Interview focus: A/B testing rigor, metrics-driven, recommendation design.",
+      "fix": "Clarify Netflix's AI profile: Netflix's core recommendation uses two-tower neural models for retrieval + gradient boosted trees/NNs for ranking — not LLMs. LLM use at Netflix is primarily in tooling and metadata enrichment. Netflix AI interviews test ML fundamentals (embeddings, ranking, A/B), not LLM application engineering. If targeting Netflix specifically, candidates need recommender system depth (two-tower models, negative sampling, feature engineering) more than LangChain/RAG skills. Add a 'relevance for FE→AI transition' note per company."
+    },
+    {
+      "module": 35,
+      "section": "D.4",
+      "topic": "Amazon Leadership Principles — how do they interact with the technical interview?",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "The Amazon interview question says 'Design Alexa's skill routing at 10M concurrent requests' and 'Lead with Leadership Principles. Reliability, graceful degradation, customer trust.' But I've never done an Amazon interview. What does 'lead with Leadership Principles' actually mean? Do I say the LP name out loud and then do the design? Or is this just a way of saying 'think about reliability'? And is this a system design question or a behavioral question? The course seems to blur the two.",
+      "context": "Amazon: 'Design Alexa's skill routing at 10M concurrent requests.' Lead with Leadership Principles. Reliability, graceful degradation, customer trust.",
+      "fix": "Add a 'How Amazon interviews work' note: Amazon separates behavioral (LP-based STAR stories) from system design rounds, but system design answers are evaluated through an LP lens — e.g., 'Customer Obsession' means stating the user-facing reliability SLA first. For this design question: start by stating the customer impact of failure ('If skill routing fails, every Alexa request returns an error — that's a P0 customer impact'), then propose graceful degradation (fallback to a simpler classifier, then to a canned response). The LP framing is about prioritisation logic, not about literally saying 'per Ownership...' in your answer."
+    },
+    {
+      "module": 35,
+      "section": "D.5",
+      "topic": "Role archetypes — how do you know which roles you actually qualify for?",
+      "severity": "medium",
+      "engineer": "Both",
+      "question": "The table lists 5 roles with salary ranges. The callout says 'FE engineers should target AI Product Engineer or AI/ML Engineer (generalist) first.' But both of us want MAANG roles specifically. Do MAANG companies actually hire 'AI Product Engineers' or is that a startup title? At Google, would this be an L5 SWE working on an AI feature? At Meta, is it an MLE? The title mapping to actual MAANG job postings is completely unclear and this is the section we most need to get right before interviews.",
+      "context": "For FE engineers transitioning: Target 'AI Product Engineer' or 'AI/ML Engineer (generalist)' first. These roles value full-stack product intuition + AI integration over deep ML theory.",
+      "fix": "Add a MAANG title mapping table: Google = L4/L5 SWE on AI features (search 'Software Engineer, Google AI' or 'SWE, Search'), Meta = Production Engineer → MLE path or direct SWE applying to AI infra teams, Amazon = SDE II/III on Alexa/AWS AI services or Applied Scientist if you have research background, Apple = Software Engineer, ML or Software Engineer, AI/ML (Core ML team), Netflix = Senior Software Engineer on ML Platform or Recommendation Engineering team. Note that OpenAI/Anthropic hire 'Member of Technical Staff' which maps closest to Applied Scientist. Add JD links or search queries for each."
+    },
+    {
+      "module": 35,
+      "section": "D.6",
+      "topic": "Open-source stack cost comparison is misleading — ops cost not included",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The stack table says open-source at 100K DAU costs '$200–400/month vs $2,000–5,000 managed.' But the open-source estimate doesn't include engineering time to maintain vLLM, Langfuse, MLflow, and pgvector. A GPU instance for vLLM alone is ~$200–500/month. The managed figure includes zero ops overhead. This comparison is apples to oranges. At 100K DAU, is a 2-person startup ACTUALLY saving money running their own vLLM, or is the managed API cheaper once you factor in 0.5 FTE of ops work at $150K/year = $6,250/month?",
+      "context": "Cost at 100K DAU: ~$200–$400/month vs ~$2,000–$5,000 managed",
+      "fix": "Revise the cost comparison to show TCO: open-source at 100K DAU includes GPU (1× A10G at ~$150/month) + ops overhead (0.25 FTE at $150K = $3,125/month) = ~$3,275/month TOTAL — MORE expensive than managed unless team is already paying for MLOps. The cost crossover is closer to 1M DAU where API costs hit ~$20,000/month and GPU + ops stays flat. Update the table to reflect this, or explicitly note that the $200–400 figure is infrastructure-only and excludes engineering time."
+    },
+    {
+      "module": 35,
+      "section": "D.7",
+      "topic": "Learning paths are confusing — what are 'App A', 'App B', 'App C', 'App D'?",
+      "severity": "low",
+      "engineer": "Priya",
+      "question": "The learning paths table references 'App A → App B → App D → Mod 29' but I have no idea what App A through D are. Are these appendixes? Projects? Labs? Module 35 is an appendix itself (Appendix D) — so is 'App D' referring to THIS module? The table is unusable without knowing what these abbreviations refer to.",
+      "context": "FE → AI (Non-Uber / FAANG): App A → App B → App D → Mod 29 → Mod 33 → Mod 19 → App C",
+      "fix": "Replace all abbreviations with full names in the learning path table, or add a footnote key: 'App A = Appendix A (Housing.com Project Setup), App B = Appendix B (Evaluation Lab), App C = Appendix C (System Design), App D = Appendix D (this module).' Without this, the entire learning paths section is opaque to a first-time reader."
+    }
+  ],
+  "quiz_questions": [
+    {
+      "module": 30,
+      "type": "mcq",
+      "question": "You're running Llama 3.1 8B on vLLM with PagedAttention. A new request arrives while 50 other requests are mid-generation. What happens?",
+      "options": [
+        "A. The new request waits in queue until all 50 finish (static batching)",
+        "B. The new request is slotted into the next iteration step using continuous batching",
+        "C. vLLM rejects the request with a 503 error until GPU memory frees up",
+        "D. PagedAttention evicts the oldest request's KV cache pages to make room"
+      ],
+      "answer": "B",
+      "explanation": "vLLM uses continuous batching (iteration-level scheduling): new requests are added to the active batch at each decode step as soon as there is capacity, without waiting for existing requests to complete. A is static batching (the old approach vLLM replaces). C would only happen if the request queue is full AND there are no free KV pages. D describes KV cache swapping (a real vLLM feature for memory pressure), but not the primary mechanism for handling new requests."
+    },
+    {
+      "module": 30,
+      "type": "gotcha",
+      "question": "A colleague says: 'Let's use Q2_K quantisation — it's 5× faster and fits in 2.5GB, perfect for our edge deployment.' What's the critical question to ask before agreeing?",
+      "options": [
+        "A. What is the acceptable quality degradation for our task, measured on our eval set?",
+        "B. Does our hardware support Q2_K inference?",
+        "C. Is 2.5GB within the device RAM budget?",
+        "D. Which library version supports Q2_K?"
+      ],
+      "answer": "A",
+      "explanation": "The course marks Q2_K as 'Significant' quality loss and 'edge only.' Before choosing a quantisation level, the right question is: what quality loss can the task tolerate? For a property classifier outputting JSON, even 5% accuracy degradation could mean wrong intents on 1-in-20 queries. B, C, and D are implementation questions that come AFTER validating the quality tradeoff. Gotcha: the speed/size numbers are seductive — the course's lesson is always to check quality loss first."
+    },
+    {
+      "module": 30,
+      "type": "design",
+      "question": "You're building a housing.com mobile app feature that classifies property search intent offline (no network). The model must run on Android phones with 4GB RAM. Describe the complete model serving stack.",
+      "options": null,
+      "answer": "ONNX Runtime Mobile + Q4_K_M quantised Phi-3 Mini (3.8B → ~2.2GB)",
+      "explanation": "Correct path: Phi-3 Mini 3.8B because it fits in 4GB RAM with Q4_K_M quantisation (~2.2GB), Core ML is iOS-only so ONNX Runtime is required for Android cross-platform support. vLLM/Ollama are server-side tools — they don't run on mobile devices. Groq/HuggingFace Endpoints require network. The serving decision tree in 30.8 leads directly to 'Mobile / Android → ONNX Runtime Mobile' then Q4_K_M to fit device RAM constraints."
+    },
+    {
+      "module": 30,
+      "type": "mcq",
+      "question": "At which scenario does Groq LPU become a WORSE choice than self-hosted vLLM on A100?",
+      "options": [
+        "A. When you need <100ms p95 TTFT",
+        "B. When you need to deploy a LoRA fine-tuned version of Llama 3.1 8B",
+        "C. When you need 500 tokens/sec throughput",
+        "D. When your team cannot manage GPU infrastructure"
+      ],
+      "answer": "B",
+      "explanation": "Groq does not support deploying fine-tuned models — it only serves its fixed catalogue of base models. If you need a custom fine-tuned adapter (e.g., a housing-specific intent classifier trained via Module 31), Groq is completely unusable. A is a reason TO use Groq (it excels at TTFT). C is within Groq's range (800-1200 tok/sec). D is an argument for Groq (managed, no ops). The limitations paragraph states 'no fine-tuning' but this question tests whether the reader infers the deployment implication."
+    },
+    {
+      "module": 31,
+      "type": "mcq",
+      "question": "Your company wants to add current mortgage rate information to a property chatbot. The rates change weekly. Which approach is correct?",
+      "options": [
+        "A. Fine-tune the model monthly with updated rate data",
+        "B. Use RAG — store rates in a database, retrieve at query time",
+        "C. Add rates to the system prompt and redeploy weekly",
+        "D. Use DPO to train the model to prefer responses with current rates"
+      ],
+      "answer": "B",
+      "explanation": "The adaptation hierarchy rule: 'RAG for knowledge and freshness.' Fine-tuning (A) does NOT reliably inject new facts — the model hallucinates values from training rather than using the new data. DPO (D) is for preference alignment, not factual injection. Option C (system prompt) works at small scale but becomes impractical when rate tables are large and change frequently — also any system prompt modification requires a redeploy. RAG puts rates in a queryable store and injects the current value at runtime, with zero model retraining."
+    },
+    {
+      "module": 31,
+      "type": "gotcha",
+      "question": "You run SFTTrainer with r=64 (high rank) hoping for better fine-tuning quality. Your eval accuracy is slightly better than r=16. What risk have you introduced that the course warns about?",
+      "options": [
+        "A. Higher VRAM usage that may exceed your GPU capacity",
+        "B. Catastrophic forgetting — the model may lose general capability",
+        "C. Training instability due to high gradient norms",
+        "D. All of the above are possible risks"
+      ],
+      "answer": "D",
+      "explanation": "All three are real risks with high-rank LoRA. A: trainable parameters scale with r — r=64 uses 4× the VRAM of r=16. B: higher rank means more of the original weight distribution is modified, increasing the risk of catastrophic forgetting — this is why you should always run MMLU regression after fine-tuning. C: high-rank adapters with aggressive learning rates can exhibit gradient explosions. The course emphasises MMLU ≤2% drop as the regression guard, and r=16 as the safe default. The gotcha: 'slightly better eval accuracy' on YOUR task might hide 10% MMLU degradation."
+    },
+    {
+      "module": 31,
+      "type": "mcq",
+      "question": "After QLoRA fine-tuning, you call merge_and_unload(). What does this produce and why is it necessary before production deployment?",
+      "options": [
+        "A. A merged checkpoint with LoRA matrices removed to reduce file size",
+        "B. A single model file with adapter weights mathematically folded into base weights, enabling standard inference without PEFT library",
+        "C. A quantised version of the model optimised for faster inference",
+        "D. A model checkpoint that can be loaded without the original base model"
+      ],
+      "answer": "B",
+      "explanation": "merge_and_unload() computes W' = W + (alpha/r) × A×B for each LoRA layer and saves the result as a standard model file. This is critical for production because: (1) inference no longer requires the PEFT library, (2) you can serve the merged model with vLLM/Ollama without any LoRA-aware infrastructure, (3) inference speed is identical to the base model (no adapter computation overhead). A is wrong — file size typically increases slightly (the adapter delta adds mass to the base weights). C and D are incorrect — quantisation is a separate step, and the merged model is self-contained but doesn't eliminate the base model's weight structure."
+    },
+    {
+      "module": 31,
+      "type": "short",
+      "question": "Name the two most important reasons why fine-tuning is NOT the right approach for adding new factual knowledge (e.g., adding your company's product catalog) to an LLM.",
+      "options": null,
+      "answer": "1. Facts hallucinate — the model blends trained facts with invented ones, producing confidently wrong outputs. 2. Knowledge becomes stale immediately — catalog changes require expensive retraining, while RAG updates are instant.",
+      "explanation": "The course states this directly: 'Fine-tuning is NOT for: adding new facts (facts hallucinate; RAG > fine-tuning for knowledge).' The two failure modes are reliability (hallucination) and freshness (training latency). A third valid answer is evaluation difficulty — it's hard to verify that a fine-tuned model correctly absorbed a specific fact rather than hallucinating a plausible variant."
+    },
+    {
+      "module": 32,
+      "type": "mcq",
+      "question": "A fintech startup is building a fraud detection system that classifies transactions in real time. The data includes PII and financial records. They are evaluating Groq vs vLLM self-hosted. Which factor most decisively favors self-hosted vLLM?",
+      "options": [
+        "A. vLLM is cheaper at their transaction volume",
+        "B. vLLM supports fine-tuned model deployment",
+        "C. Financial PII cannot be sent to a third-party API (SOX/PCI-DSS compliance)",
+        "D. vLLM has lower latency for fraud classification"
+      ],
+      "answer": "C",
+      "explanation": "For fintech under SOX/PCI-DSS, sending transaction data to any external API is a compliance violation — the data must stay within the company's secure perimeter. This eliminates Groq (and most managed APIs) regardless of their technical merits. B is also a Groq limitation, but the course lists fine-tuning as a 'when to use' for fintech specifically (not just a nice-to-have). A and D are context-dependent and don't hold universally. The domain-specific challenge table (D.2) states explicitly: 'Closed-source API, pgvector, no data to third-party' for fintech."
+    },
+    {
+      "module": 32,
+      "type": "design",
+      "question": "Design the ML tooling stack for a 3-person startup that needs to: (1) prototype with multiple LLM providers, (2) fine-tune Llama 3.1 8B when ready, (3) serve in production without managing GPU servers. What services do you choose for each stage?",
+      "options": null,
+      "answer": "Prototype: OpenRouter (multi-provider, single API key). Fine-tuning: Together.ai (managed fine-tuning, no GPU ops). Production serving: Together.ai inference API or HuggingFace Inference Endpoints (managed, always-warm). Experiment tracking: W&B free tier.",
+      "explanation": "The 3-person constraint eliminates self-hosted vLLM (requires MLOps overhead). OpenRouter for prototyping gives access to Claude, GPT-4o, Llama in one integration. Together.ai uniquely provides BOTH managed fine-tuning AND managed inference for the resulting model — competitors like HuggingFace AutoTrain exist but Together.ai's pricing (50-70% cheaper) and API quality make it the course's recommendation. The key design principle: minimize operational overhead for small teams, accept higher per-token cost in exchange."
+    },
+    {
+      "module": 32,
+      "type": "mcq",
+      "question": "You're at a MAANG company on AWS. Your team uses Amazon Bedrock for LLM inference. The ML team wants to add custom fine-tuned Llama 3.1 70B models. What is the correct next step?",
+      "options": [
+        "A. Switch to HuggingFace Inference Endpoints for the fine-tuned model",
+        "B. Use Amazon SageMaker to train and deploy the fine-tuned model, then expose via a SageMaker endpoint",
+        "C. Deploy vLLM on EC2 instances and call it directly",
+        "D. Use Together.ai for fine-tuning, then import the model into Bedrock"
+      ],
+      "answer": "B",
+      "explanation": "Bedrock serves a fixed catalogue of models — you cannot deploy custom fine-tuned weights directly through Bedrock. SageMaker is the AWS-native path for custom model training and deployment. The combination Bedrock (managed inference for catalogue models) + SageMaker (custom models) is the correct AWS enterprise pattern. C is technically feasible but introduces ops overhead that SageMaker eliminates. D is incorrect — Bedrock doesn't import models from third-party fine-tuning services. A is viable but moves outside the AWS ecosystem, creating networking and IAM complexity."
+    },
+    {
+      "module": 33,
+      "type": "mcq",
+      "question": "An AgentExecutor is stuck calling search_listings with the same arguments repeatedly. The agent's Thought says 'I still need more data' after each call despite getting valid results. What is the root cause and best fix?",
+      "options": [
+        "A. The search_listings tool is returning results too slowly — increase timeout",
+        "B. The Observation is too long and the agent loses context — trim intermediate results",
+        "C. The agent prompt doesn't tell the model what to do when it HAS enough data to answer",
+        "D. max_iterations is not set — set it to 10 to break the loop"
+      ],
+      "answer": "C",
+      "explanation": "This is the 'infinite loop' failure mode from the ReAct failure table. The agent loops because its prompt is clear on HOW to get data but not on WHEN to stop and answer. The fix is a prompt addition: 'Once you have found relevant listings, immediately provide a Final Answer rather than searching again.' D (max_iterations) is a necessary safety guard but it's a circuit breaker, not a fix — the agent would still waste 10 calls before stopping. B is a valid mitigation for verbose overhead but not the root cause here. A is unrelated to the described behavior."
+    },
+    {
+      "module": 33,
+      "type": "gotcha",
+      "question": "You want to use Reflexion to improve a housing.com agent that recommends which neighborhood is 'best' for a user. The agent critiques its own answer after each attempt. Why will Reflexion likely fail here?",
+      "options": [
+        "A. Reflexion only works with code-generation tasks",
+        "B. 'Best neighborhood' has no objective ground truth — self-critique has nothing to verify against",
+        "C. The agent will use too many LLM calls, exceeding cost budget",
+        "D. Reflexion requires a separate judge model which is not in the course's setup"
+      ],
+      "answer": "B",
+      "explanation": "Reflexion's requirement is 'verifiable correctness criteria' — a function that returns True/False without human judgment. 'Best neighborhood' is subjective (depends on commute, budget, lifestyle preferences), so the self-critique step has no ground truth and the agent spirals, producing increasingly confident but not necessarily better answers. A is wrong — Reflexion works for any task with an external scorer. C is a concern but not the root failure. D is incorrect — the course shows Reflexion using the same LLM for critique. The correct fix: either define a verifiable sub-criterion ('does the recommendation include a price per sqft comparison?') or switch to a different architecture."
+    },
+    {
+      "module": 33,
+      "type": "design",
+      "question": "You're designing a housing.com agent that: (1) searches listings, (2) looks up EMI calculations, (3) explains the difference between RERA and non-RERA properties, (4) recommends top 3 based on user budget. You have a 3-second SLA. Which architecture do you use and why?",
+      "options": null,
+      "answer": "ReAct with max 5 iterations. Not Plan-and-Execute (overhead too high for 4 well-defined steps). Not Reflexion (no verifiable scorer for 'best recommendation').",
+      "explanation": "ReAct works well for 2–5 tool calls with branching. The 4 steps map to ~3 tool calls (search, EMI calc, RERA lookup) with straightforward reasoning. Plan-and-Execute adds a full planning LLM call before any execution — that's +1 LLM call +500ms overhead before anything useful happens. At 3-second SLA with 3 tool calls (~200ms each) + 2 LLM reasoning steps (~400ms each), you're at ~1.4s — within budget. Reflexion is inappropriate because 'best recommendation' isn't verifiable. The 'when to use agents' table confirms: 3-5 tool calls with branching = ReAct territory."
+    },
+    {
+      "module": 34,
+      "type": "mcq",
+      "question": "In a LangGraph supervisor architecture, each specialist agent (research, analyst, writer) has graph.add_edge(name, 'supervisor'). What does this mean for the system's termination behavior?",
+      "options": [
+        "A. The system can only terminate when all three agents have run at least once",
+        "B. After every agent completes, control returns to the supervisor to decide what to do next (including FINISH)",
+        "C. The agents run in parallel and all must complete before the supervisor runs",
+        "D. Each agent reports its result to all other agents before returning to supervisor"
+      ],
+      "answer": "B",
+      "explanation": "add_edge(name, 'supervisor') means every specialist agent node has a directed edge back to the supervisor node. After any agent completes, the graph transitions to supervisor, which then calls its LLM to decide the next routing. This gives the supervisor full control at each step — it can call the same agent again, call a different one, or output FINISH. A is wrong — the supervisor could output FINISH after just one agent. C describes parallel execution, which requires fan-out/fan-in edges, not add_edge from each agent to supervisor. D is not how LangGraph state passing works."
+    },
+    {
+      "module": 34,
+      "type": "gotcha",
+      "question": "Your 4-agent pipeline (supervisor + research + analyst + writer) starts giving wrong answers. Your LangSmith trace shows the research agent is called, returns results, but the analyst agent is receiving an empty context. What is the most likely cause?",
+      "options": [
+        "A. The research agent's LLM call failed silently",
+        "B. The research agent writes to state['research_results'] but the analyst reads state['context'] — field name mismatch",
+        "C. LangGraph doesn't pass state between nodes that aren't directly connected",
+        "D. The supervisor is routing to the analyst before the research agent finishes"
+      ],
+      "answer": "B",
+      "explanation": "With structured state handoff (TypedDict fields), the most common bug is a field name mismatch: the producing agent writes to one field name while the consuming agent reads a different field name — both operations succeed silently (Python dict access with wrong key returns None or KeyError depending on access pattern). A would show in the LangSmith trace as an error node. C is wrong — all nodes share the same state object in LangGraph. D would show as incorrect edge ordering in the trace. The mitigation: use type annotations for all state fields and add validation at agent boundaries."
+    },
+    {
+      "module": 34,
+      "type": "mcq",
+      "question": "You add graph.add_edge('agent_1', 'agent_2') AND graph.add_edge('agent_1', 'agent_3') in LangGraph. What is the execution behavior?",
+      "options": [
+        "A. agent_2 runs first, then agent_3 sequentially",
+        "B. The graph raises an ambiguous routing error",
+        "C. agent_2 and agent_3 run in parallel as a fan-out",
+        "D. Only the first edge (agent_1 → agent_2) is used; the second is ignored"
+      ],
+      "answer": "C",
+      "explanation": "In LangGraph, when a node has multiple outgoing edges to different nodes, it executes as a fan-out — both target nodes run concurrently in the same superstep. A join node (connected to by both agent_2 and agent_3) waits for both to complete. This is the parallel execution pattern described in 34.6's production code example. A is sequential behavior, which would require conditional edges or a sequential chain. B and D are incorrect — LangGraph's fan-out is a first-class feature, not an error or ignored edge."
+    },
+    {
+      "module": 34,
+      "type": "design",
+      "question": "Design a multi-agent system for automated content moderation at 1M posts/day. Latency budget: 500ms p95. Cost budget: $0.001/post. What architecture, how many agents, and what parallelism strategy?",
+      "options": null,
+      "answer": "Supervisor + 3 parallel specialist agents (toxicity classifier, spam detector, policy checker) running as LangGraph fan-out. Budget: $0.001/post = $1000/day for 1M posts. Use Haiku (cheapest, fast) for all agents. Parallel execution targets ~200ms total vs ~600ms sequential.",
+      "explanation": "The three checks are independent (toxicity doesn't depend on spam detection result) — fan-out all three from supervisor simultaneously. At $0.0004/Haiku call × 3 agents + 1 supervisor call = $0.0016/post — slightly over budget. Fix: use a single structured prompt for the fast checks (spam + toxicity) and only spawn a separate policy agent for borderline cases. Key MAANG interview point: always model the cost equation explicitly, then reduce agent count or use cheaper models to meet budget. The 'critic agent aggregates and deduplicates' pattern from the MAANG callout applies here for the final decision."
+    },
+    {
+      "module": 35,
+      "type": "mcq",
+      "question": "You're interviewing at Google for an AI engineering role. The interviewer asks: 'Design a real-time content recommendation system for YouTube at 2B users.' Which answer structure best demonstrates the expected technical depth?",
+      "options": [
+        "A. Describe a RAG pipeline with LangChain retrieving YouTube video metadata from a vector database",
+        "B. Describe two-tower retrieval (candidate generation) + feature-based ranking, TPU serving, ANN with ScaNN, feature store integration",
+        "C. Describe a fine-tuned GPT-4o model that outputs video recommendations based on user history",
+        "D. Describe a ReAct agent that calls YouTube search API and personalises results"
+      ],
+      "answer": "B",
+      "explanation": "Google's interview focus (from D.3): 'ML fundamentals, billion-user scale, TPU training.' The two-tower neural model is the standard industry approach for recommendation candidate generation at scale — it's what YouTube actually uses (DNN for YouTube paper, 2016, still relevant architecture-wise). A (LangChain/RAG) is completely wrong for recommendation — this is a retrieval/ranking problem, not a generation problem. C (fine-tuned GPT-4o) is absurd at 2B users latency/cost constraints. D (ReAct agent) introduces multi-second latency for a system needing <200ms. Google interviewers expect ANN retrieval (ScaNN), feature engineering, and TPU deployment fluency."
+    },
+    {
+      "module": 35,
+      "type": "gotcha",
+      "question": "The course says Apple's interview focuses on 'Privacy by design, on-device quantisation, Swift integration.' You're asked: 'Design on-device document summarisation that works offline.' A candidate answers: 'I'd use a Q4_K_M quantised Phi-3 Mini with Core ML on the Neural Engine.' What critical component is missing from this answer?",
+      "options": [
+        "A. The candidate didn't specify which version of Phi-3 Mini",
+        "B. The candidate didn't address how the model gets updated on device after deployment",
+        "C. The candidate didn't mention the ONNX conversion step before Core ML",
+        "D. The candidate should have used Llama 3.1 8B instead of Phi-3 Mini"
+      ],
+      "answer": "B",
+      "explanation": "Apple's interview focus includes 'on-device quantisation' (covered by Q4_K_M) and 'privacy by design' (covered by offline/Core ML). The missing piece is the model update mechanism — how do you ship model improvements after initial release? The correct answer includes: model updates via App Store releases or via a background download mechanism that respects Apple's privacy model (updates signed and verified, delta updates for efficiency). This is uniquely important for on-device AI because model files are large (2-4GB) and stale models degrade user experience over time. C is a valid implementation detail but not the 'critical' design concern for Apple's interview angle. D is wrong — Phi-3 Mini's 3.8B size is appropriate for mobile."
+    },
+    {
+      "module": 35,
+      "type": "mcq",
+      "question": "A frontend engineer with 5 years of React/TypeScript experience wants to target an AI engineering role at Meta. Based on the course's company profile, which skill gap is MOST critical to address?",
+      "options": [
+        "A. Learning to use the Anthropic Claude API and LangChain",
+        "B. Understanding PyTorch model architecture, recommender systems (two-tower models), and real-time feature pipelines",
+        "C. Getting certified on Amazon SageMaker",
+        "D. Learning to deploy models with vLLM on Kubernetes"
+      ],
+      "answer": "B",
+      "explanation": "Meta's interview focus (from D.3): 'Recommender systems, real-time ranking, PyTorch arch.' Meta's core AI is not LLM application engineering — it's embedding-based recommendation, real-time ranking (news feed, ads), and their internally-developed Llama models. A (Claude API/LangChain) is completely misaligned with Meta's stack. C (SageMaker) is Amazon's tool, not Meta's. D (vLLM/Kubernetes) is infrastructure work that's secondary to the ML fundamentals Meta tests. The biggest gap for a frontend engineer targeting Meta is ML fundamentals: how do embeddings work, what is a feature store, how does online/offline feature skew happen, how do two-tower models train."
+    },
+    {
+      "module": 35,
+      "type": "short",
+      "question": "The course recommends the open-source stack costs '$200-400/month vs $2,000-5,000 managed' at 100K DAU. Name two hidden costs that make the true open-source TCO higher, and state the approximate DAU scale where open-source genuinely wins.",
+      "options": null,
+      "answer": "Hidden costs: (1) Engineering ops time (~0.25-0.5 FTE) to maintain vLLM, Langfuse, pgvector. (2) GPU instance cost (~$150-500/month for A10G). Break-even: approximately 1M DAU where API costs exceed $10,000-20,000/month.",
+      "explanation": "The course's TCO calculation in 29.5 addresses this for 1M calls/day (break-even 6-8 months), but D.6 presents the $200-400 number without the ops overhead caveat. The key insight: below ~500K-1M DAU, managed APIs win on total cost when you include engineering time. Above 1M DAU, self-hosted vLLM can save $50K+/year. For 100K DAU specifically (a small product), managed APIs are almost certainly cheaper once a 0.25 FTE ops cost is factored in. This is a common MAANG system design gotcha: candidates optimise for infrastructure cost and ignore labour cost."
+    }
+  ],
+  "diagram_requests": [
+    {
+      "module": 30,
+      "title": "PagedAttention vs Traditional KV Cache Memory Layout",
+      "description": "Two side-by-side GPU memory diagrams. LEFT (traditional): 5 concurrent requests, each pre-allocated max context length (8192 tokens) worth of KV cache blocks, showing large grey 'wasted' sections where actual generation is shorter than max. Annotation: '60-70% internal fragmentation.' RIGHT (PagedAttention): Same 5 requests with dynamically-allocated 16-token page blocks, showing compact actual usage with free pages available for new requests. Annotation: '<5% fragmentation, 2-4× more concurrent users.' Arrow pointing to a new Request 6 that can be admitted in the paged layout but not in the traditional one. Caption: 'Why Priya and Alex can't run 100 concurrent users on a single A100 without PagedAttention.'"
+    },
+    {
+      "module": 30,
+      "title": "GGUF Quantisation Quality-Speed-Memory Triangle",
+      "description": "A triangle with three axes: Memory (GB), Speed (tokens/sec), Quality (%). Plot each quantisation level (fp16, Q8_0, Q6_K, Q4_K_M, Q3_K_M, Q2_K) as points on the triangle. Shade the Q4_K_M zone as the 'sweet spot.' Show the curve of quality degradation becoming nonlinear below Q4 — quality falls sharply at Q3 and Q2 while memory savings become marginal. This makes the 'why Q4_K_M is recommended' argument visual rather than just tabular."
+    },
+    {
+      "module": 30,
+      "title": "Serving Decision Tree as a Flowchart",
+      "description": "Convert the text-based decision tree in 30.8 into a proper flowchart with diamond decision nodes and rectangular outcome boxes. Decision nodes: 'Dev/prototype?', 'Data must stay on-prem?', 'Mobile/edge device?', 'GPU available?', 'Latency <100ms p95?', 'Volume >10M calls/day?'. Outcome boxes: Ollama (green), vLLM (blue), Groq (orange), HuggingFace Endpoints (purple), Core ML / ONNX (teal). The current ASCII tree is hard to follow when multiple conditions apply simultaneously."
+    },
+    {
+      "module": 31,
+      "title": "LoRA Adapter: What Changes vs What Stays Frozen",
+      "description": "A transformer block diagram with the attention layer highlighted. For the Q and V weight matrices: LEFT side shows the original W matrix (large, grey, labeled 'frozen — not updated during training'). RIGHT side shows the LoRA delta: a tall narrow A matrix (d×r, labeled 'trainable, ~2M params') multiplied by a wide flat B matrix (r×k, labeled 'trainable, ~2M params'). Arrow showing ΔW = A×B being added to W at inference. Below: a parameter count comparison bar chart — 6.7B frozen params (base model) vs 4M trained (LoRA). Caption: 'You train the small orange matrices, not the grey ones. This is why LoRA fits on one GPU.' This directly addresses Priya's 'what is changing vs staying the same' question."
+    },
+    {
+      "module": 31,
+      "title": "QLoRA Memory Stack on a Single GPU",
+      "description": "A vertical bar chart showing GPU memory consumption layers for Llama 3.1 8B QLoRA training. Stacked layers from bottom: Base model weights (NF4 4-bit quantised, ~4GB, grey), Dequantised activations for gradient computation (bf16, ~1GB, blue), LoRA adapter weights (fp32, ~100MB, orange), Optimizer states for LoRA only (fp32, ~200MB, red), KV cache / activations for current batch (~0.5GB, green). Total: ~6GB. Comparison bar next to it: Full fine-tuning on same hardware = ~80GB (off chart). Annotation: 'QLoRA makes Llama 8B trainable on an RTX 3090 ($500 GPU) instead of an A100 ($10,000+ cloud).' Directly answers Priya's question about what hardware she needs."
+    },
+    {
+      "module": 33,
+      "title": "ReAct Execution Trace: Correct vs Reasoning Drift",
+      "description": "Two vertical execution traces side by side. LEFT (correct): User query → Thought (grounded reasoning) → Action: search_listings({location: Bandra}) → Observation: [{price: 15000000, ...}] → Thought (uses observation) → Action: calculate_emi({principal: 15000000}) → Observation: {emi: 130000} → Final Answer. Each Thought box in blue, Action in green, Observation in yellow. RIGHT (drift): User query → Thought → Action: search_listings → Observation → Thought: 'Average price is 1.2Cr based on my search...' (RED — hallucinated value, no new Action was called) → Final Answer (wrong). Annotation on right: 'Reasoning drift: model invents observation instead of calling tool. AgentExecutor parse error here.' This makes abstract failure mode concrete and visible."
+    },
+    {
+      "module": 33,
+      "title": "Agent Architecture Selection Decision Tree",
+      "description": "Flowchart for choosing between: direct LLM call, ReAct, Plan-and-Execute, Reflexion. Decision nodes: 'Does the task require ANY tool calls?' (No → direct LLM call), 'Is task structure known upfront?' (Yes + >5 steps → Plan-and-Execute), 'Does the task have a verifiable correctness criterion?' (Yes → Reflexion), '2-10 tool calls with branching?' (Yes → ReAct), 'SLA < 1 second?' (Yes → direct call or simple chain, agents will miss SLA). Each outcome box includes: typical latency, typical cost, typical failure mode. This is the missing synthesis diagram for section 33.6."
+    },
+    {
+      "module": 34,
+      "title": "Supervisor Architecture: Message Flow and State Transitions",
+      "description": "Sequence diagram (swimlanes) showing: User, Supervisor (LLM), Research Agent, Analyst Agent, Writer Agent, LangGraph State. Show state mutations at each step: initial state {messages: [user_query], next: null} → supervisor call → state {messages: [...], next: 'research'} → research agent executes → state {messages: [..., research_result], next: null} → supervisor call → state {messages: [...], next: 'analyst'} → etc. → state {messages: [..., final_answer], next: 'FINISH'} → END. Emphasise that every agent returns to supervisor (not to each other). This directly answers Priya's question about 'how do agents talk to each other.'"
+    },
+    {
+      "module": 34,
+      "title": "Multi-Agent Handoff: Message Passing vs Structured State",
+      "description": "Two parallel pipeline diagrams. TOP (message passing): Research → Analyst → Writer, each step appending to a growing messages list. Show the list growing to 3000 tokens by writer stage. Red annotation: 'context bloat — writer receives full research + analysis history.' BOTTOM (structured state): Same pipeline but with TypedDict fields. Research writes ONLY to state['research_results'] (list of 5 facts). Analyst reads state['research_results'], writes to state['analysis'] (500 tokens). Writer reads state['analysis'], writes state['final_answer']. Each agent sees ONLY its input field. Green annotation: 'no context bloat — writer sees only analyst output.' Answers Priya's 'does all 3000 words go to every agent?' question."
+    },
+    {
+      "module": 35,
+      "title": "FAANG AI Stack Comparison Matrix",
+      "description": "A visual grid (companies as rows, stack layers as columns). Columns: LLM, Training Framework, Vector/ANN Search, Orchestration, Serving, Interview Focus. Rows: Google, Meta, Amazon, Apple, Netflix, OpenAI. Fill each cell with the primary technology (e.g., Google/LLM = Gemini, Meta/Training = PyTorch DDP/FSDP, Apple/Serving = Core ML + Neural Engine). Use color coding: blue = proprietary/internal, green = open-source, orange = managed cloud. Add a sixth row: 'Housing.com Stack (course project)' for reference. Marks cells where internal tooling (Tupperware, internal A/B platform) is used with a 'not asked in interviews' flag. This consolidates D.3's table into a scannable reference for interview prep."
+    },
+    {
+      "module": 35,
+      "title": "FE → AI Engineer Career Transition Skill Gap Map",
+      "description": "A Venn diagram or skills radar chart. LEFT circle: 'FE skills you already have' — TypeScript/React, API integration, async/await, state management, testing, performance optimization, accessibility, product intuition. RIGHT circle: 'New AI skills needed' — LLM API calls, prompt engineering, RAG pipelines, vector DBs, fine-tuning concepts, evaluation metrics. OVERLAP: 'Transferable to AI Engineering' — API design, latency optimization, structured data handling, UI for AI features, A/B testing. Annotate each new skill with the course module that covers it. Also show the skill-to-role mapping: which overlap+right circle skills map to AI Product Engineer vs AI/ML Engineer vs ML Engineer roles."
+    }
+  ]
+}

@@ -1,0 +1,533 @@
+{
+  "critique_summary": "The course is genuinely strong in one narrow dimension: it narrates the Housing.com codebase extremely well. Module 0-2 orientation, the queue-pattern explanation in 1.4, and the gotchas in Module 10 are best-in-class for a practitioner course. However, the course has five structural weaknesses that prevent it from achieving its stated goal of teaching students to build production AI agents from first principles rather than copy-pasting. First, testing is almost entirely absent — the codebase has a full test suite (tests/unit, tests/integration, tests/e2e, tests/model_eval) but the course never teaches students how or why to test pipelines, SLM classifiers, or prompt outputs. Second, prompt engineering — arguably the highest-leverage skill in this domain — gets zero pedagogical treatment. The course mentions prompts/*.md files exist but never teaches how they are designed, evaluated, or iterated. Third, the adapter/port pattern (the mechanism that makes the system provider-agnostic) is never explained despite being architecturally critical. Fourth, the data flow for a complete multi-turn conversation is never traced end-to-end; students are shown individual components but never a walk-through of what happens across four turns. Fifth, observability coverage stops at 'use LangSmith' without teaching students how to use traces to diagnose real bugs. Every module also suffers from missing concrete worked examples at decision points, and several modules jump from concept to code without explaining the intermediate design reasoning.",
+
+  "gaps": [
+    {
+      "module": 0,
+      "topic": "Autonomous agent failure modes and why this course deliberately avoids them",
+      "severity": "medium",
+      "fix": "The course correctly positions itself in the 'Agent' tier of the spectrum, but dismisses autonomous agents in one sentence ('for research, not shipping'). Students who later encounter agentic frameworks (LangChain agents, AutoGPT-style loops) will not understand why those fail in production. Add a concrete failure taxonomy: (1) Unbounded tool loops — the agent calls searchProperties 40 times with slightly varied params, spends $2 on one turn, returns garbage. (2) Cascading hallucination — the planner LLM invents a sub-task ('book a site visit') that a downstream agent executes against a real API. (3) Context collapse — at 80 turns the context window fills and the agent starts ignoring earlier instructions. (4) Non-determinism under load — two users running the same agentic workflow get different outcomes because the planner LLM is sensitive to token sampling. The rule is: autonomous agents are appropriate when (a) the task completion criterion is explicit and machine-verifiable, (b) you can sandbox every tool call, and (c) a human reviews before irreversible actions. Housing.com fails all three criteria for a search chatbot."
+    },
+    {
+      "module": 1,
+      "topic": "Adapter/Port pattern — the mechanism behind provider-agnostic design",
+      "severity": "high",
+      "fix": "Section 1.3 introduces LangGraph but never explains how the pipeline stays provider-agnostic. The codebase has a full adapter pattern: DomainRouterPort, ClassifierPort, LLMPort. Nodes depend only on these protocols; build_graph() injects concrete implementations via functools.partial. The adapter factory (src/adapters/factory.py) selects Anthropic vs OpenRouter based on MODEL_REGISTRY. This pattern is never mentioned in the course. Students who add a new provider (say, Google Gemini) will not know where to put the code. Add a section: 'The Port/Adapter Pattern in Practice'. Show the ClassifierPort protocol (3 lines), show AnthropicClassifier and OpenRouterClassifier both satisfying it, and show how build_graph() receives the concrete instance and injects it into nodes via functools.partial. The key insight: nodes are tested against mock ports, not against real LLMs. This is the reason the test suite can run without API keys. The pattern also means you can run A/B tests between providers at zero code change — just flip MODEL_REGISTRY and restart."
+    },
+    {
+      "module": 2,
+      "topic": "The _no_op_safe wrapper and LangGraph StateGraph update semantics",
+      "severity": "medium",
+      "fix": "The course shows the node signature 'returns a partial state update' but never explains what happens when a node returns {} (empty dict). In LangGraph 0.2.55+, returning {} raises InvalidUpdateError. The codebase solves this with _no_op_safe() wrapper in graph.py: it converts {} to None, which LangGraph treats as 'no update'. The course should show this wrapper and explain why it exists: nodes that have nothing to do (e.g., sanitize_node when pivot=False) are conventional in returning {} as a signal of 'I ran but changed nothing', but LangGraph's state merge logic treats {} as an attempted empty update. The fix is architectural: never return {} from a node if you mean 'no change'. Return None. The _no_op_safe wrapper is a belt-and-suspenders catch for the 11 nodes that haven't been migrated to explicit None returns yet. Students should know this pattern before they hit InvalidUpdateError at 2am."
+    },
+    {
+      "module": 2,
+      "topic": "The handoff_context pattern for seeding Turn 1 with gateway context",
+      "severity": "low",
+      "fix": "make_base_state() has an undocumented handoff_context parameter. When a user navigates to the chatbot from a property listing page, the gateway passes active_property_id, city, transaction_type, and handoff_summary. The make_base_state() function applies this context to the session on turn_count==0, so the first pipeline run already has the right active_property_id without the user typing anything. This is a pattern every production chatbot needs (context seeding from surrounding UI state) but the course never mentions it. Add a callout: 'Seeding context from the page the user came from'. Show the handoff_context dict structure, explain when it's populated (gateway sets it), and show how it flows into the session. The design decision: why not let the LLM infer context from the URL? Because the LLM never sees the URL. Why not ask the user? Because they just clicked on a property — they don't want to describe it again."
+    },
+    {
+      "module": 3,
+      "topic": "Testing strategy for stateful pipelines — how to test nodes without running the full graph",
+      "severity": "high",
+      "fix": "The course has zero content on testing. The actual codebase has a rich test suite (tests/unit/nodes/, tests/integration/, tests/model_eval/) but students are never taught the strategy. The core insight is: because each node takes (state: BotState, dep=None) and returns a partial state dict, unit testing is trivial — you build a BotState with pytest fixtures, call the node function directly, and assert on the returned dict. You never need to run the full LangGraph graph. Example: to test filter_apply_node with a price string, build a state with classification={'filter_delta': {'price_max': '2cr'}}, call await filter_apply_node(state), and assert returned session['active_filters']['price_max'] == 20000000. The model_eval/ directory tests the SLM classifiers against a golden dataset. This is how you catch prompt regressions before they reach production. Add a Module 3.5 section on the three-layer test strategy: (1) unit tests on node logic (no LLM), (2) model eval tests on SLM classification quality (uses real LLM, runs nightly), (3) e2e tests against a mock bot_env that verifies the full pipeline produces valid SSE output."
+    },
+    {
+      "module": 4,
+      "topic": "Prompt engineering — how to design, evaluate, and iterate SLM taxonomy prompts",
+      "severity": "high",
+      "fix": "The course mentions 'prompts/slm/domains/*.md' files contain taxonomy but never teaches prompt engineering. This is the highest-leverage skill for AI agent quality. A taxonomy prompt has four components that must work together: (1) Intent schema — defines the JSON output structure the SLM must produce, with explicit field names and types. Ambiguity here causes structural validation failures in validate_slm_node. (2) Intent taxonomy — the list of main_intent/sub_intent pairs with one-sentence descriptions. The SLM uses these descriptions for classification; vague descriptions cause hallucination. (3) Filter schema — which keys the SLM may include in filter_delta, with types and units. Missing a filter key here means the user can say 'under 2Cr' and the SLM will correctly classify it but have nowhere to put the value. (4) Few-shot examples — 3-5 input/output pairs per intent that show the SLM edge cases. Without few-shots, SLMs fail on: ordinal references ('the third one'), pivot detection ('actually, show me 2BHK instead'), disambiguation responses ('godrej' meaning the builder, not the locality). The iteration cycle is: run model_eval tests → find failing cases → add a few-shot example covering the pattern → re-run. A 'reasoning' field in the SLM output (already in this codebase's classification dict) lets you see why the SLM chose a particular classification, which dramatically speeds up debugging."
+    },
+    {
+      "module": 5,
+      "topic": "How to use LangSmith traces to diagnose actual bugs — not just 'it records things'",
+      "severity": "medium",
+      "fix": "Section 5.2 says 'LangSmith records the exact prompt sent'. This is accurate but doesn't teach students to use it. Add a concrete debugging walkthrough: Bug: user says 'show me 2BHK near the sea in Bandra under 2Cr' and gets out_of_scope response. Step 1: Find the session_id in the structured log (jq 'select(.event==\"session_loaded\") | .session_id'). Step 2: Open LangSmith, filter by session_id (it's injected as metadata on every @traceable call). Step 3: Click the domain_routing trace — you see the Stage 1 SLM received the message but the confidence was 0.42, below the 0.65 threshold, so domain was coerced to out_of_scope. Step 4: Click the actual prompt — you see the domain router's system prompt. The user's message contains 'sea' which is ambiguous (locality near the sea vs sea view amenity). Fix: add a few-shot example to domain_router.md that shows 'near the sea' routing to property_search. This is the actual debugging loop that happens dozens of times a day on a live system. LangSmith is only useful if you know this loop."
+    },
+    {
+      "module": 6,
+      "topic": "Statistical significance and minimum detectable effect for A/B experiments",
+      "severity": "medium",
+      "fix": "Section 6 explains the mechanics of A/B assignment but never addresses statistical validity. Common mistake: 20% traffic, 50/50 split, but the experiment runs for 3 days with 500 sessions. At $0.006/turn and 4 turns/session, the difference between Haiku and Sonnet is real but the sample is too small to reach statistical significance at p<0.05. Before starting an experiment: (1) Define your primary metric (session success rate, turn count reduction, CTR on carousel cards). (2) Calculate the minimum detectable effect. If you expect Sonnet to reduce turns from 4.2 to 3.9 (7% improvement), at 80% power and p<0.05 you need at least 800 sessions per arm. At 20% traffic split, 50/50, you need 8,000 total sessions, which at 500 sessions/day means 16 days minimum. (3) Only analyze after reaching minimum sample. Peeking early causes false positives. The experiment framework stores experiment_id and experiment_variant in every Kafka event — your analytics system should support sequential testing (e.g., mSPRT) if you need to stop early."
+    },
+    {
+      "module": 7,
+      "topic": "Graceful degradation strategy — what the system does when each dependency fails",
+      "severity": "high",
+      "fix": "Section 7.4 shows timeout patterns but never maps out the full degradation tree. Production systems need this explicit: (1) Redis unavailable → session load fails → make_base_state() creates a fresh session → user loses conversation context but gets a response. The chat.py endpoint already handles this (loads {} on exception). BUT: the LLM concurrency gate is Redis-backed. If Redis is down, every request fails the gate check. Fix: gate.acquire() must treat Redis errors as 'slot available' (fail open), not 'slot unavailable' (fail closed). Current code in llm_gate.py raises on Redis error. (2) Domain router SLM timeout → fallback to last_domain from session (already implemented in route_domain_node). (3) Stage 2 SLM timeout → fallback to out_of_scope (implemented in AnthropicClassifier). (4) Housing API (searchProperties) timeout → fetch_errors is populated, but the pipeline continues and the LLM prompt has no property data — the LLM will say 'I couldn't find properties' which is acceptable. (5) Kafka unavailable → fire-and-forget pattern means this is silent. The ring buffer fallback catches burst failures. This map should be a required artifact for any production AI agent, like a circuit breaker diagram."
+    },
+    {
+      "module": 8,
+      "topic": "How to write a taxonomy for a new domain — worked example from scratch",
+      "severity": "high",
+      "fix": "Section 8.2 lists 6 steps for building an agent for any domain, but gives no worked example of the hardest step: taxonomy design. Walk through the B2B SaaS example (customer support bot). Step 1: enumerate intents by interviewing support agents. What do they do 80% of the time? Password reset, check subscription status, report a bug, ask about a feature. Group into domains: account_management, billing, technical_support, product_questions. Step 2: for each intent, write the SLM taxonomy entry. Show what a good description looks like vs a bad one. BAD: 'User wants help with their account'. GOOD: 'User wants to reset their password, unlock their account, or change their email address — they provide their email and expect a reset link or verification step'. The difference: the good description includes what the user provides (input signals) and what they expect (output shape). This is what the SLM uses to distinguish 'reset password' from 'change payment method' when both mentions 'my account'. Step 3: define filter_delta keys. For billing intents: plan_id, billing_cycle, discount_code. These map directly to API params for getBillingStatus. Step 4: write 3 few-shot examples per intent, including one ambiguous case. 'I can't log in' could be password reset OR account suspension — the few-shot should show the SLM outputting clarification_needed for this case."
+    },
+    {
+      "module": 9,
+      "topic": "CI/CD pipeline for AI agents — what tests run on every PR, what runs nightly",
+      "severity": "medium",
+      "fix": "Module 9 describes what to implement in what order but says nothing about how to validate it continuously. AI agents have a unique CI/CD challenge: unit tests can run on every PR (they mock the LLM), but prompt quality regressions require running the real LLM, which costs money and takes time. Define three gates: (1) Pre-merge (every PR): pytest tests/unit + tests/integration with bot_env=mock. Runs in <30 seconds, zero API cost. Catches: node logic bugs, state management regressions, graph wiring errors. (2) Nightly (scheduled): pytest tests/model_eval — runs the SLM classifier against the golden dataset (50-100 labeled examples per domain). Costs ~$0.50 per run. Catches: prompt regressions when the taxonomy prompt is edited. Alert if accuracy drops below threshold (e.g., 90%). (3) Pre-release (manual, on tag): e2e tests against dev environment with real adapters. Verifies SSE stream produces valid events, carousel renders correctly. The golden dataset for model_eval is the most valuable asset in this system — more valuable than any code. It should be version-controlled, reviewed on every taxonomy change, and expanded when a new bug is found."
+    },
+    {
+      "module": 10,
+      "topic": "The migrate-chat endpoint and guest-to-authenticated session handoff",
+      "severity": "low",
+      "fix": "Gotcha 10.x (missing): The codebase has a migrate-chat endpoint (CHAT-A-018) that associates a guest conversation with an authenticated user. This is a subtle state management problem: when a user logs in mid-conversation, session.user_id changes, session.auth_token becomes available, and previously-Tier-0 intents (portfolio, contact seller) now unlock. The current implementation updates the session in Redis but uses a raw redis.set() without the optimistic locking Lua script — so if a pipeline turn is running concurrently with the migration, the version check is bypassed and you get a corrupted session. The fix: migrate-chat should load the session with the Lua script, increment the version, and save with version check. Additionally: the session's turn_history is for that conversation_id. After migration, the history doesn't move to the new user's profile until a Kafka consumer runs CHAT-A-010. If the user logs out and logs back in from a different device, they will not see the conversation history until the consumer has processed. This 'eventual profile consistency' behavior should be communicated to the product team."
+    }
+  ],
+
+  "quiz_questions": [
+    {
+      "module": 0,
+      "type": "mcq",
+      "question": "You are building an AI agent for an e-commerce site. A user says 'add the blue shirt to my cart'. Your pipeline classifies this as intent=add_to_cart and the action executes successfully. What tier does this belong to and why?",
+      "options": [
+        "A. Tier 3a — it uses the LLM to understand 'blue shirt'",
+        "B. Tier 1 — the orchestrator executes the action directly with zero LLM cost",
+        "C. Tier 2 — the orchestrator fetches the cart state and returns a template",
+        "D. Tier 0 — authentication is required before cart operations"
+      ],
+      "answer": "B",
+      "explanation": "Tier 1 is for direct orchestrator-executed actions. The SLM has already classified the intent and extracted the entity ('blue shirt' → product_id from carousel_state or entity resolution). The orchestrator calls addToCart(product_id) and returns a success template. No LLM is involved. This is the critical design principle: the LLM is the last resort. If the orchestrator can complete the action deterministically, it should."
+    },
+    {
+      "module": 0,
+      "type": "short",
+      "question": "The course says 'the LLM is about 15% of this codebase'. Identify three specific system components that make up the other 85% and explain what would break if each one were removed.",
+      "options": [],
+      "answer": "Sample answer: (1) The asyncio.Queue/SSE streaming infrastructure — without it, LLM output cannot reach the browser in real-time; users would see blank screens until the full response completed. (2) The Redis session store — without it, every turn is stateless; 'show me 2BHK instead' cannot change a previous filter because there are no previous filters to change. (3) The safety_node/validate_slm_node guardrails — without them, prompt injection attacks bypass classification, and malformed SLM JSON crashes downstream nodes.",
+      "explanation": "The point is that the value of an AI agent is in the surrounding system, not the model. Students who think AI agents are just 'ChatGPT with a system prompt' will build brittle systems that work in demos but fail in production."
+    },
+    {
+      "module": 0,
+      "type": "mcq",
+      "question": "A user asks 'show me properties in Bandra under 2Cr' then immediately says 'actually make it 3BHK'. The SLM output for the second message has filter_delta: {'bhk': [3]} and pivot: false. After filter_apply_node runs, what does session.active_filters contain?",
+      "options": [
+        "A. {'city': 'Mumbai', 'localities': ['Bandra'], 'price_max': 20000000, 'bhk': [3]}",
+        "B. {'bhk': [3]}",
+        "C. {'city': 'Mumbai', 'bhk': [3]}",
+        "D. The filter_delta is rejected because pivot=false and no city context"
+      ],
+      "answer": "A",
+      "explanation": "filter_apply_node merges filter_delta into the existing session.active_filters. Since pivot=false, sanitize_node does not clear any existing keys. The REPLACE semantics apply: bhk is replaced with [3]. All other keys (localities, price_max, city) persist from the previous turn. This is the multi-turn conversation memory working correctly."
+    },
+    {
+      "module": 1,
+      "type": "mcq",
+      "question": "In the asyncio.Queue pattern, why must connection_close be yielded INSIDE the while loop on sentinel, not in a finally block after the loop?",
+      "options": [
+        "A. Because finally blocks cannot yield in async generators",
+        "B. Because if gate.release() raises an exception inside the finally block, any code after the try/finally never executes",
+        "C. Because the browser disconnects before the finally block runs",
+        "D. Because LangGraph tasks cancel the generator on completion"
+      ],
+      "answer": "B",
+      "explanation": "This is Gotcha 10.1 in practice. If gate.release() calls Redis and Redis is temporarily unavailable, it throws an exception. If connection_close is after the try/finally, that exception propagates up through the finally block and Python never reaches the yield. The user's browser hangs waiting for connection_close. Moving connection_close into the while loop (on sentinel, before break) means it is guaranteed to execute regardless of what happens in the finally block."
+    },
+    {
+      "module": 1,
+      "type": "short",
+      "question": "Explain why the system uses two separate SLM classification stages (domain router + intent classifier) instead of one SLM call that classifies both domain and intent simultaneously. What specific failure mode does the two-stage approach prevent?",
+      "options": [],
+      "answer": "The two-stage approach prevents context overload. A single SLM asked to classify into all domains AND all sub-intents simultaneously would receive a taxonomy prompt covering every domain (property_search, locality_research, project_research, portfolio, etc.) plus their combined ~50 sub-intents. This 2000+ token taxonomy prompt degrades classification accuracy because the SLM must attend to too many options at once. By routing to a domain first (4-6 options, tiny prompt), Stage 2 only ever sees the taxonomy for the relevant domain (~10 sub-intents, 300-400 token prompt). This also makes adding a new domain cheap: you add a new domain file without touching existing domain prompts.",
+      "explanation": "The insight is that decomposing a hard classification problem into two easier sequential classifications is cheaper and more accurate than one hard classification. This applies beyond SLMs — it's the same reason search engines have a query understanding layer before the ranking layer."
+    },
+    {
+      "module": 2,
+      "type": "mcq",
+      "question": "clarify_node explicitly calls update_session_state() before returning when it short-circuits the pipeline. Why? What breaks if you remove that call?",
+      "options": [
+        "A. The bot_response won't be emitted to the client",
+        "B. The LangSmith trace won't capture the clarification event",
+        "C. Filter updates from filter_apply_node (e.g., city='Bangalore' was already known) will be lost because followup_node never runs",
+        "D. The A/B experiment assignment won't be persisted"
+      ],
+      "answer": "C",
+      "explanation": "The pipeline is linear: filter_apply_node runs BEFORE clarify_node. If a user says 'show me something affordable in Bangalore' — city=Bangalore gets merged into active_filters in filter_apply_node, then clarify_node short-circuits to ask about budget. Without explicit session persistence in clarify_node, the city filter is in memory but never written to Redis. On the next turn (when user answers the budget question), make_base_state loads the old session from Redis — city is gone, the user has to specify it again. This is a subtle but production-breaking bug."
+    },
+    {
+      "module": 2,
+      "type": "short",
+      "question": "The route_node has a tier system from 0 to 3b. A new intent 'schedule_site_visit' needs to: authenticate the user, call a booking API, and return a confirmation. Describe which tier this belongs to and precisely what route_node should do for it.",
+      "options": [],
+      "answer": "This is Tier 1 with requires_auth=True. route_node first checks requires_auth — since no auth_token exists in the session, it short-circuits to build_login_template_response() before tier routing. Once authenticated, on the next turn route_node sees auth_token present and routes to Tier 1: execute_tier1_action() calls the booking API and returns a confirmation template. No LLM is involved. The key point: auth check happens before tier routing, not inside the tier 1 executor.",
+      "explanation": "The requires_auth check is a pre-routing gate. This design means you never accidentally execute a Tier 1 action for an unauthenticated user — the check is in one place (route_node), not scattered across tier executors."
+    },
+    {
+      "module": 2,
+      "type": "mcq",
+      "question": "A user says 'tell me more about the second property' after a carousel has been shown. Which node resolves 'second' to an actual property_id and how?",
+      "options": [
+        "A. classify_node — the SLM resolves ordinal references during classification",
+        "B. resolve_entities_node — it reads entity_refs from the classification and looks up carousel_state.items[1]",
+        "C. fetch_data_node — it fetches the property_id from the Housing API using 'second' as a search term",
+        "D. llm_node — the LLM resolves ordinal references using its built-in world knowledge"
+      ],
+      "answer": "B",
+      "explanation": "resolve_entities_node processes entity_refs (the SLM outputs entity_refs: [{looking_for: 'property', by: 'cardinality', value: 2}]). It looks up carousel_state.items[1] (0-indexed), gets the property_id, and stores it in session.active_property_id. The LLM never sees carousel items directly — the orchestrator resolves the reference and injects the property context into the system prompt. This keeps LLM token cost near zero for reference resolution."
+    },
+    {
+      "module": 3,
+      "type": "mcq",
+      "question": "The session stores both turn_history and last_3_turns. A user is on turn 8. What does each contain and why are they different sizes?",
+      "options": [
+        "A. Both are identical — turn_history is just the full version of last_3_turns",
+        "B. turn_history has all 8 turns in Anthropic format; last_3_turns has only the last 3 turns with bot response text truncated to 400 chars",
+        "C. turn_history has the last 20 turns; last_3_turns has the last 3 turns without bot responses",
+        "D. turn_history is stored in Postgres; last_3_turns is stored in Redis"
+      ],
+      "answer": "B",
+      "explanation": "They serve different consumers: turn_history is for the LLM (llm_node), which needs full conversation context to maintain coherence over many turns. last_3_turns is for the SLM classifier (classify_node), which only needs recent context to detect pivots and disambiguation patterns. The SLM has a small context window — feeding it 8 full turns would starve it of room for the taxonomy prompt. The 400-char truncation of bot responses is critical: the SLM needs to know the bot asked 'Shapoorji or Godrej?' (short) but doesn't need the full property carousel description."
+    },
+    {
+      "module": 3,
+      "type": "short",
+      "question": "The Redis optimistic locking uses a separate version key (session:{id}:ver) instead of embedding the version in the session JSON. Why? Under what conditions does this optimization matter most?",
+      "options": [],
+      "answer": "The separate version key avoids parsing the full session JSON blob in the Lua script for every save. After turn 20 with full turn_history, the session JSON is 15-20KB. Decoding 20KB of JSON inside a Lua script (which runs on the Redis server's main thread) blocks all other Redis operations for 2-5ms per write. With 10,000 concurrent users each completing a turn every 30 seconds, that's ~333 saves/second × 3ms = nearly continuous Redis blocking. The tiny version key (1-3 bytes, no parsing) makes the CAS check a single GET of a small key. The optimization matters most at high turn counts (turns 15-20, when session JSON is largest) and high concurrency (>1000 sessions active simultaneously).",
+      "explanation": "This is a micro-optimization that becomes macro-critical at scale. The session JSON growth as turn_history fills is a non-obvious time bomb — it looks fine in testing (turn 2) and degrades gradually in production (turn 10+)."
+    },
+    {
+      "module": 4,
+      "type": "mcq",
+      "question": "A new intent 'get_floor_plan' needs to fetch the property's floor plan PDF URL. The property_id is already in session.active_property_id. How should you configure the DataRequirement for this intent?",
+      "options": [
+        "A. DataRequirement(tool='getPropertyDetail', params_source='session', parallel_group=1)",
+        "B. DataRequirement(tool='getFloorPlan', params_source='entity_resolution', entity_index=0, parallel_group=1)",
+        "C. DataRequirement(tool='getFloorPlan', params_source='session', parallel_group=1) — session has active_property_id",
+        "D. No DataRequirement needed — let the LLM call getFloorPlan as a residual tool"
+      ],
+      "answer": "C",
+      "explanation": "params_source='session' passes session.active_filters to the tool call. But active_property_id is in session root, not active_filters. You would need either: (a) a new params_source type like 'active_property' that reads session.active_property_id directly, or (b) params_source='entity_resolution' if the property was resolved in this turn. The deeper lesson: the params_source taxonomy currently has three options (session, entity_resolution, filter_delta). Adding a new intent may require adding a new params_source type. This is an extension point, not a gap in the current design."
+    },
+    {
+      "module": 4,
+      "type": "short",
+      "question": "Explain the difference between a tool's key parameter and its wire_param. Give a concrete example from the codebase and explain why this separation exists.",
+      "options": [],
+      "answer": "key is the name the LLM sees and the name used in SLM taxonomy prompts. wire_param is the actual HTTP parameter name the Housing API expects. Example: TOOL_REGISTRY has ToolParam(key='locality_uuids', wire_param='localities'). The LLM is told to call searchProperties with locality_uuids=[...]. translate_to_wire_format() renames locality_uuids to localities before the HTTP call. The separation exists because (a) the Housing API uses short internal names that aren't self-documenting to an LLM, (b) renaming internal API params doesn't require updating the LLM prompt or taxonomy, and (c) the LLM sees semantically clear names (locality_uuids makes the UUID type explicit) while the API receives its expected format.",
+      "explanation": "This pattern also provides security isolation: the LLM cannot discover or influence internal API parameter names by inspecting tool call responses."
+    },
+    {
+      "module": 5,
+      "type": "mcq",
+      "question": "A log entry shows: event='slm_classification', domain='property_search', main_intent='property_search', sub_intent='filter_search', latency_ms=890. What does this tell you and what should you investigate?",
+      "options": [
+        "A. Everything is normal — 890ms is within acceptable range for an SLM call",
+        "B. The classification succeeded but latency is high; investigate whether the Stage 2 SLM prompt is too long or the Anthropic API is experiencing elevated latency",
+        "C. The classification failed; 890ms means a timeout fallback was triggered",
+        "D. The intent was classified incorrectly; filter_search should complete in under 50ms"
+      ],
+      "answer": "B",
+      "explanation": "Stage 2 classification should complete in 50-200ms for a typical 150-token prompt. 890ms suggests either: (a) the taxonomy prompt has grown too large (check system_prompt_chars in the same log entry), (b) Anthropic API latency is elevated (check other session_ids for the same time period), or (c) the message was unusually long and triggered a longer completion. The timeout threshold is 10s (asyncio.wait_for), so 890ms is not a timeout. But if this is consistently above 500ms, it's pushing the total pipeline latency past the UX threshold."
+    },
+    {
+      "module": 5,
+      "type": "short",
+      "question": "The playground shows: node=llm, stop_reason='tool_use', output_tokens=3, chunks_streamed=0, validated_text=''. The user sees 'No text response received.' What happened and how do you fix it?",
+      "options": [],
+      "answer": "The LLM made a tool call (stop_reason='tool_use') and returned no text (output_tokens=3, all in the tool call JSON, not prose). This happens when: (a) the LLM's system prompt says something like 'call calculateEMI for all EMI questions' without also saying 'then explain the result in text', or (b) the LLM made a tool call, got a result, but the pipeline did not give it a second generation step to incorporate the result into prose. In this codebase, tool results are returned to the LLM for a second generation (on_tool_use returns the result). If chunks_streamed=0 on BOTH the first and second generation, the system prompt is likely instructing the LLM to output only structured data. Fix: review the prompt for the calculator intent and ensure it instructs the LLM to explain the result in one sentence after the tool call.",
+      "explanation": "This is Gotcha 10.7. The playground metrics (stop_reason, chunks_streamed, output_tokens) are specifically designed to make this diagnosis immediate without reading logs."
+    },
+    {
+      "module": 6,
+      "type": "mcq",
+      "question": "An A/B experiment has traffic_pct=10 and two variants (50/50 split). Session 'abc123' is assigned. On turn 3, session 'abc123' makes a new request. Which variant does it get?",
+      "options": [
+        "A. It might get a different variant — assignment is turn-level, not session-level",
+        "B. The same variant as before — assignment uses hash(session_id + experiment_id) % 100 which is deterministic",
+        "C. It re-evaluates based on current traffic_pct, which may have changed since turn 1",
+        "D. It always gets the control variant after turn 2"
+      ],
+      "answer": "B",
+      "explanation": "hash(session_id + experiment_id) % 100 is a deterministic, session-level assignment. The same session_id always hashes to the same number, so the same variant is selected regardless of turn count or when the request arrives. This is critical for experiment validity: showing a user Haiku on turn 1 and Sonnet on turn 3 would produce confounded measurements. The experiment framework stores experiment_id and experiment_variant in state for every turn so they're emitted to Kafka even if the variant doesn't change."
+    },
+    {
+      "module": 7,
+      "type": "short",
+      "question": "The LLMConcurrencyGate uses two Redis keys: llm:concurrent:count and llm:queue. Describe what happens when count=20 (at max), a new request arrives, waits in the queue for 7 seconds, and then gate.release() is called by the first completing request. Trace the exact Redis operations.",
+      "options": [],
+      "answer": "New request: Lua script runs, reads count=20, cannot INCR, checks queue length (<50), RPUSHes ticket UUID to llm:queue, returns 0. Python: result==0, enters wait loop with asyncio.wait_for(redis.blpop(llm:queue, timeout=8), timeout=9). At 7 seconds, completing request calls gate.release() which runs DECR llm:concurrent:count (now count=19). But DECR does not pop the queue — the waiting request is blocked on BLPOP which pops from the left. So the sequence is: DECR (count=19), then the waiting request's BLPOP fires, pops its ticket from the queue, then INCRs count back to 20. This means count briefly drops to 19 and rises back to 20. If DECR and BLPOP+INCR are not atomic, a third request could acquire the slot between DECR and INCR. This is a race condition in the current implementation — worth noting as a production hardening item.",
+      "explanation": "This question tests whether students understand the non-obvious race condition in the gate's release-then-BLPOP-then-INCR sequence. The correct fix is to atomically DECR-then-RPOP (not using BLPOP from the waiting side) in the release script."
+    },
+    {
+      "module": 7,
+      "type": "mcq",
+      "question": "The Kafka writer is fire-and-forget from the API's perspective. What is the consequence if Kafka is unavailable for 2 minutes during high traffic?",
+      "options": [
+        "A. All API requests return 503 until Kafka recovers",
+        "B. Users get degraded responses because the LLM loses conversation history",
+        "C. Events during the outage are lost or buffered in the ring buffer; users are unaffected but analytics have a 2-minute gap",
+        "D. Session state is corrupted because Kafka is the primary session store"
+      ],
+      "answer": "C",
+      "explanation": "Kafka is the audit trail and analytics stream, not the session store or the API's critical path. Redis holds session state. The ring buffer absorbs burst failures. Users interact normally. The consequence is that the data team's analytics have a gap, Kafka-based summarization is delayed, and any data pipelines consuming chat.messages events miss those 2 minutes. The fire-and-forget pattern is a deliberate trade: durability vs user latency. At scale, occasional Kafka gaps are acceptable; user-facing latency from synchronous Kafka writes is not."
+    },
+    {
+      "module": 8,
+      "type": "short",
+      "question": "You are adapting this framework for a travel booking agent. A user says 'I want to fly to Goa next weekend and also need a hotel near the beach'. Identify which components you must customize (vs. reuse unchanged) and what the biggest design challenge is.",
+      "options": [],
+      "answer": "Customize: (1) Domain taxonomy prompts — add flight_search, hotel_search domains. (2) Intent registry — add intents like flight_search/one_way, hotel_search/beach_hotel with appropriate data_requirements. (3) Tool registry — register searchFlights, searchHotels, getPriceCalendar tools. (4) filter_apply/derive logic — add date parsing ('next weekend' → specific dates), traveler count, cabin class. (5) Session schema — active_filters needs origin, destination, travel_dates, passengers. Reuse unchanged: SSE streaming, asyncio.Queue pattern, Redis session with optimistic locking, LangGraph pipeline structure, LangSmith observability, A/B framework. The biggest design challenge is multi-intent detection: 'fly to Goa AND need a hotel' is a single message with two intents requiring sequential execution (flight first, then hotel with arrival date from flight result). This requires the multi_intent decomposition path in the pipeline, which runs both intents and merges the responses. The course's Appendix C ('Multi-Intent Decomposition') is exactly this problem.",
+      "explanation": "This tests whether students can separate framework from domain logic and identify where multi-intent handling is genuinely complex."
+    },
+    {
+      "module": 9,
+      "type": "mcq",
+      "question": "You are in Phase 1 (skeleton) of a new agent project. You have FastAPI + SSE + minimal LangGraph (3 nodes) working. A teammate suggests adding LangSmith integration now. Is this the right time? Why or why not?",
+      "options": [
+        "A. No — LangSmith should be added in Phase 6 (production hardening), not Phase 1",
+        "B. Yes — adding LangSmith in Phase 1 means every LLM call from Day 1 is traced, making debugging 10x faster during development",
+        "C. No — LangSmith requires the full 19-node pipeline to be useful",
+        "D. Yes, but only if you have a production API key, not a development key"
+      ],
+      "answer": "B",
+      "explanation": "The course recommends LangSmith in Phase 2 (classification). In practice, adding it in Phase 1 is even better. The @traceable decorator is a 2-line change per adapter. From the moment your first SLM call runs, you can see the exact prompt, the response, the token count, and the latency in LangSmith. When your Phase 1 skeleton produces wrong classifications, you find out why in 30 seconds instead of adding log statements and re-running. The cost is $0 for development traces up to the free tier. The opportunity cost of NOT having it is hours of print-debugging."
+    },
+    {
+      "module": 9,
+      "type": "short",
+      "question": "You finish Phase 5 (LLM response pipeline working end-to-end). Before moving to Phase 6 (production hardening), what is the single most important regression test you should write, and what does it verify?",
+      "options": [],
+      "answer": "The most important test is an e2e pipeline test that verifies the SSE stream for a multi-turn conversation produces a valid connection_close event exactly once, even when a downstream component (Redis, Kafka) fails mid-pipeline. This test catches the most production-critical failure mode: a user whose request never terminates. Use bot_env=mock, inject a simulated Redis failure in the gate.release() path, invoke the pipeline via the HTTP endpoint, and assert that (a) an error event is emitted, (b) connection_close is emitted, (c) the response.body stream closes. Without this test, the connection_close trap (Gotcha 10.1) is invisible until it hits production.",
+      "explanation": "Unit tests verify individual nodes. This test verifies the system's failure handling contract — that no infrastructure failure can leave a user's connection hanging."
+    },
+    {
+      "module": 10,
+      "type": "mcq",
+      "question": "Gotcha 10.6 describes the clear_keys graveyard — a schema field defined but never consumed. What engineering practice prevents this category of bug?",
+      "options": [
+        "A. Code reviews — a reviewer should catch unused fields",
+        "B. Write the consumer code in the same PR as the schema field; never merge a schema field without its consumer",
+        "C. Static analysis — mypy will flag unused TypedDict fields",
+        "D. Integration tests — they will fail if a configured field has no effect"
+      ],
+      "answer": "B",
+      "explanation": "Code reviews catch obvious bugs but are unreliable for 'designed but not implemented' issues, especially when the field was added speculatively ('we'll implement this in Sprint 4'). Mypy checks types, not whether a field is read. Integration tests only fail if the field's absence causes a behavior change — a field that exists and is never read causes no behavior change. The only reliable prevention is the discipline of never merging a data structure field without the code that reads it. If the consumer isn't ready, don't add the field yet."
+    },
+    {
+      "module": 10,
+      "type": "short",
+      "question": "A version conflict (Gotcha 10.5) occurs when two simultaneous requests for the same session both read version=5, both try to write version=6, and one gets Lua return 0. The current code logs and continues. Why is this acceptable for 99.9% of users but what specific scenario makes it dangerous?",
+      "options": [],
+      "answer": "It is acceptable because human typing behavior is sequential — a user reads the bot's response (150ms+ reaction time) before typing the next message. Redis writes complete in 2-5ms. The probability of two genuine HTTP requests from the same session overlapping is near zero in practice. The dangerous scenario: a client with connection retry logic. If the client times out a request and immediately retries, the original request may still be running in the pipeline. Both requests share the same session_id, load the same version=5, and race to write version=6. The first writer wins; the second gets Lua return 0 and logs 'session_version_conflict' without retrying. The retried request then produces a response based on stale session state (missing filters written by the first request). The fix for Sprint 4 — exponential backoff with a full session reload on conflict — is the correct solution. The current log-and-continue is acceptable for Sprint 3 only because the conflict is logged and can be detected in monitoring.",
+      "explanation": "This question tests understanding of why concurrent systems bugs are hard to reproduce: they require the specific timing window created by client retry behavior, not just 'two requests at once'."
+    }
+  ],
+
+  "diagram_specs": [
+    {
+      "name": "Complete Request Lifecycle — Single Turn (with timing)",
+      "description": "A horizontal swimlane diagram showing all actors (Browser, FastAPI, asyncio.Queue, LangGraph Pipeline, Redis, Anthropic API, Housing APIs, Kafka) with vertical time axis. Shows the exact sequence: T+0ms connection_ack, T+20ms safety passes, T+70ms domain router returns, T+200ms classifier returns, T+220ms filter applied, T+280ms summary emitted (first SSE to browser), T+350ms fetch_data parallel group runs, T+500ms respond_node emits carousel, T+520ms LLM starts streaming (first token), T+2200ms LLM done, T+2210ms validate_output, T+2215ms connection_close, T+2220ms Redis write starts (background), T+2230ms Kafka write starts (background). Arrows between actors show which component initiates each interaction. The critical insight this makes visual: the user's perceived latency ends at T+2215ms (connection_close), not at T+2230ms (Redis) or T+2250ms (Kafka). Color the critical path (what determines total latency) in red. This diagram is the most requested visualization in production AI systems because it's the only way to identify which component to optimize next.",
+      "data": {
+        "actors": ["Browser", "FastAPI/event_generator", "asyncio.Queue", "LangGraph Pipeline", "Redis", "Anthropic API (SLM)", "Anthropic API (LLM)", "Housing APIs", "Kafka"],
+        "events": [
+          {"t_ms": 0, "from": "Browser", "to": "FastAPI/event_generator", "label": "POST /send-message-streamed"},
+          {"t_ms": 1, "from": "FastAPI/event_generator", "to": "Browser", "label": "SSE: connection_ack"},
+          {"t_ms": 2, "from": "FastAPI/event_generator", "to": "LangGraph Pipeline", "label": "asyncio.create_task(_run_pipeline)"},
+          {"t_ms": 5, "from": "LangGraph Pipeline", "to": "LangGraph Pipeline", "label": "safety_node (regex, 0ms)"},
+          {"t_ms": 5, "from": "LangGraph Pipeline", "to": "asyncio.Queue", "label": "emit_sse(pipeline_step, safety)"},
+          {"t_ms": 6, "from": "asyncio.Queue", "to": "Browser", "label": "SSE: pipeline_step(safety=passed)"},
+          {"t_ms": 8, "from": "LangGraph Pipeline", "to": "LangGraph Pipeline", "label": "normalize_node (unicode, 1ms)"},
+          {"t_ms": 10, "from": "LangGraph Pipeline", "to": "Anthropic API (SLM)", "label": "domain_router.route() — Stage 1"},
+          {"t_ms": 80, "from": "Anthropic API (SLM)", "to": "LangGraph Pipeline", "label": "domain=property_search, conf=0.92"},
+          {"t_ms": 82, "from": "LangGraph Pipeline", "to": "Anthropic API (SLM)", "label": "classifier.classify() — Stage 2"},
+          {"t_ms": 250, "from": "Anthropic API (SLM)", "to": "LangGraph Pipeline", "label": "classification JSON returned"},
+          {"t_ms": 260, "from": "LangGraph Pipeline", "to": "LangGraph Pipeline", "label": "filter_apply, sanitize, derive (pure logic)"},
+          {"t_ms": 270, "from": "LangGraph Pipeline", "to": "Housing APIs", "label": "resolveEntity('Bandra')"},
+          {"t_ms": 290, "from": "Housing APIs", "to": "LangGraph Pipeline", "label": "uuid=abc123, conf=0.95"},
+          {"t_ms": 295, "from": "LangGraph Pipeline", "to": "asyncio.Queue", "label": "emit_sse(pipeline_step, summary)"},
+          {"t_ms": 296, "from": "asyncio.Queue", "to": "Browser", "label": "SSE: message_delta('Searching for 3BHK in Bandra...')"},
+          {"t_ms": 300, "from": "LangGraph Pipeline", "to": "Housing APIs", "label": "searchProperties(bhk=3, locality_uuids=[abc123], price_max=20000000)"},
+          {"t_ms": 450, "from": "Housing APIs", "to": "LangGraph Pipeline", "label": "SearchResult: 47 properties, 10 returned"},
+          {"t_ms": 460, "from": "LangGraph Pipeline", "to": "asyncio.Queue", "label": "emit_sse(chat_event, property_carousel)"},
+          {"t_ms": 461, "from": "asyncio.Queue", "to": "Browser", "label": "SSE: chat_event(property_carousel — 10 cards)"},
+          {"t_ms": 465, "from": "LangGraph Pipeline", "to": "LangGraph Pipeline", "label": "build_prompt_node (assemble system_prompt)"},
+          {"t_ms": 480, "from": "LangGraph Pipeline", "to": "Anthropic API (LLM)", "label": "messages.stream() — Claude Haiku"},
+          {"t_ms": 510, "from": "Anthropic API (LLM)", "to": "asyncio.Queue", "label": "token stream begins"},
+          {"t_ms": 511, "from": "asyncio.Queue", "to": "Browser", "label": "SSE: message_delta(chunk 0: 'I found')"},
+          {"t_ms": 600, "from": "Anthropic API (LLM)", "to": "asyncio.Queue", "label": "... streaming tokens ..."},
+          {"t_ms": 1800, "from": "Anthropic API (LLM)", "to": "LangGraph Pipeline", "label": "stop_reason=end_turn, 180 output_tokens"},
+          {"t_ms": 1810, "from": "LangGraph Pipeline", "to": "LangGraph Pipeline", "label": "validate_output_node (strip URLs/phones)"},
+          {"t_ms": 1815, "from": "LangGraph Pipeline", "to": "asyncio.Queue", "label": "emit_sse(chat_event, COMPLETED)"},
+          {"t_ms": 1816, "from": "asyncio.Queue", "to": "Browser", "label": "SSE: chat_event(messageState=COMPLETED) ← user can read"},
+          {"t_ms": 1818, "from": "LangGraph Pipeline", "to": "asyncio.Queue", "label": "emit_sse(connection_close)"},
+          {"t_ms": 1819, "from": "asyncio.Queue", "to": "Browser", "label": "SSE: connection_close ← user can type"},
+          {"t_ms": 1820, "from": "asyncio.Queue", "to": "FastAPI/event_generator", "label": "sentinel (None) — loop exits"},
+          {"t_ms": 1822, "from": "FastAPI/event_generator", "to": "Redis", "label": "gate.release() (background)"},
+          {"t_ms": 1825, "from": "LangGraph Pipeline", "to": "Redis", "label": "session.save() with Lua CAS (background)"},
+          {"t_ms": 1830, "from": "LangGraph Pipeline", "to": "Kafka", "label": "publish('chat.messages', event) (background)"}
+        ],
+        "critical_path_end_ms": 1819,
+        "note": "User perceived latency = 1819ms. Infrastructure work (Redis, Kafka) completes by 1830ms — 11ms after user can type, well within human reaction time of 150ms+"
+      }
+    },
+    {
+      "name": "Short-circuit DAG — All 19 nodes with conditional edges",
+      "description": "A directed acyclic graph showing all 19 nodes as boxes, with two types of edges: solid arrows for 'continue' edges and dashed arrows to END for short-circuit exits. Every node except followup has a conditional edge: if bot_response is set, arrow goes directly to END. Nodes that CAN set bot_response are highlighted in amber: safety_node, normalize_node, validate_slm_node, clarify_node, derive_node (user_location_needed), route_node (tier 0/1/2 + auth), fetch_data_node (all-failed). The followup node has only a solid arrow to END (no conditional). Group the nodes visually in the three phases: Classification (nodes 1-5 in blue), Processing (nodes 6-11 in green), Response (nodes 12-19 in purple). This diagram is critical because it makes the short-circuit logic — which is buried in 19 separate if-statements across 3 files — visually comprehensible in one glance. It also makes clear that ANY node in the pipeline can abort the response, not just dedicated 'gate' nodes.",
+      "data": {
+        "nodes": [
+          {"id": "safety", "phase": "classification", "can_short_circuit": true, "short_circuit_reason": "prompt_injection, profanity, empty, too_long"},
+          {"id": "normalize", "phase": "classification", "can_short_circuit": true, "short_circuit_reason": "gibberish"},
+          {"id": "route_domain", "phase": "classification", "can_short_circuit": false},
+          {"id": "classify", "phase": "classification", "can_short_circuit": false},
+          {"id": "validate_slm", "phase": "classification", "can_short_circuit": true, "short_circuit_reason": "invalid_json, cross_domain_intent, unknown_intent_pair"},
+          {"id": "filter_apply", "phase": "processing", "can_short_circuit": false},
+          {"id": "sanitize", "phase": "processing", "can_short_circuit": false},
+          {"id": "derive", "phase": "processing", "can_short_circuit": true, "short_circuit_reason": "user_location_needed"},
+          {"id": "clarify", "phase": "processing", "can_short_circuit": true, "short_circuit_reason": "clarification_needed"},
+          {"id": "resolve_entities", "phase": "processing", "can_short_circuit": false},
+          {"id": "route", "phase": "processing", "can_short_circuit": true, "short_circuit_reason": "tier_0_out_of_scope, tier_1_action, tier_2_template, auth_required"},
+          {"id": "summary", "phase": "response", "can_short_circuit": false},
+          {"id": "experiment", "phase": "response", "can_short_circuit": false},
+          {"id": "fetch_data", "phase": "response", "can_short_circuit": true, "short_circuit_reason": "all_fetches_failed"},
+          {"id": "respond", "phase": "response", "can_short_circuit": false},
+          {"id": "build_prompt", "phase": "response", "can_short_circuit": false},
+          {"id": "llm", "phase": "response", "can_short_circuit": false},
+          {"id": "validate_output", "phase": "response", "can_short_circuit": false},
+          {"id": "followup", "phase": "response", "can_short_circuit": false, "always_ends": true}
+        ],
+        "edges": [
+          {"from": "safety", "to": "normalize", "type": "continue"},
+          {"from": "safety", "to": "END", "type": "short_circuit"},
+          {"from": "normalize", "to": "route_domain", "type": "continue"},
+          {"from": "normalize", "to": "END", "type": "short_circuit"},
+          {"from": "route_domain", "to": "classify", "type": "continue"},
+          {"from": "classify", "to": "validate_slm", "type": "continue"},
+          {"from": "validate_slm", "to": "filter_apply", "type": "continue"},
+          {"from": "validate_slm", "to": "END", "type": "short_circuit"},
+          {"from": "filter_apply", "to": "sanitize", "type": "continue"},
+          {"from": "sanitize", "to": "derive", "type": "continue"},
+          {"from": "derive", "to": "clarify", "type": "continue"},
+          {"from": "derive", "to": "END", "type": "short_circuit"},
+          {"from": "clarify", "to": "resolve_entities", "type": "continue"},
+          {"from": "clarify", "to": "END", "type": "short_circuit"},
+          {"from": "resolve_entities", "to": "route", "type": "continue"},
+          {"from": "route", "to": "summary", "type": "continue"},
+          {"from": "route", "to": "END", "type": "short_circuit"},
+          {"from": "summary", "to": "experiment", "type": "continue"},
+          {"from": "experiment", "to": "fetch_data", "type": "continue"},
+          {"from": "fetch_data", "to": "respond", "type": "continue"},
+          {"from": "fetch_data", "to": "END", "type": "short_circuit"},
+          {"from": "respond", "to": "build_prompt", "type": "continue"},
+          {"from": "build_prompt", "to": "llm", "type": "continue"},
+          {"from": "llm", "to": "validate_output", "type": "continue"},
+          {"from": "validate_output", "to": "followup", "type": "continue"},
+          {"from": "followup", "to": "END", "type": "always"}
+        ]
+      }
+    },
+    {
+      "name": "Session state evolution across 4 turns",
+      "description": "Four side-by-side JSON snapshots of session.active_filters and session.last_3_turns after each of four turns, showing exactly how state evolves through a realistic conversation. Turn 1: 'show me 3BHK in Bandra under 2Cr' → filters={bhk:[3], localities:['Bandra'], price_max:20000000}. Turn 2: 'actually make it 2BHK' → pivot=false, filters={bhk:[2], localities:['Bandra'], price_max:20000000}. Turn 3: 'tell me more about the second one' → carousel_state consulted, active_property_id set, no filter change. Turn 4: 'show me similar in Andheri' → filter delta={localities:['Andheri']}, old locality replaced. This diagram answers the question students ask most frequently: 'when does a filter get replaced vs. accumulated, and what exactly is in the session after each turn?' Draw a vertical diff-style view where changed fields are highlighted in yellow per turn. Include the corresponding SLM output (filter_delta, pivot flag) that caused each state transition.",
+      "data": {
+        "turns": [
+          {
+            "turn": 1,
+            "user_message": "show me 3BHK in Bandra under 2Cr",
+            "slm_output": {"main_intent": "property_search", "sub_intent": "filter_search", "pivot": false, "filter_delta": {"bhk": [3], "localities": ["Bandra"], "price_max": "2cr"}},
+            "active_filters_after": {"bhk": [3], "localities": ["Bandra"], "price_max": 20000000},
+            "carousel_state_after": {"type": "property", "items": [{"ordinal": 1, "id": "prop_abc", "title": "3BHK Bandra West"}, {"ordinal": 2, "id": "prop_def", "title": "3BHK Bandra East"}], "stored_at_turn": 1},
+            "last_3_turns_after": [{"user": "show me 3BHK in Bandra under 2Cr", "bot": "Found 47 properties. Here are the top ones...", "main_intent": "property_search", "sub_intent": "filter_search"}]
+          },
+          {
+            "turn": 2,
+            "user_message": "actually make it 2BHK",
+            "slm_output": {"main_intent": "property_search", "sub_intent": "filter_search", "pivot": false, "filter_delta": {"bhk": [2]}},
+            "active_filters_after": {"bhk": [2], "localities": ["Bandra"], "price_max": 20000000},
+            "carousel_state_after": {"type": "property", "items": [{"ordinal": 1, "id": "prop_xyz", "title": "2BHK Bandra West"}], "stored_at_turn": 2},
+            "last_3_turns_after": [
+              {"user": "actually make it 2BHK", "bot": "Here are 2BHK options in Bandra...", "main_intent": "property_search", "sub_intent": "filter_search"},
+              {"user": "show me 3BHK in Bandra under 2Cr", "bot": "Found 47 properties...", "main_intent": "property_search", "sub_intent": "filter_search"}
+            ]
+          },
+          {
+            "turn": 3,
+            "user_message": "tell me more about the second one",
+            "slm_output": {"main_intent": "property_detail", "sub_intent": "property_about", "pivot": true, "entity_refs": [{"looking_for": "property", "by": "cardinality", "value": 2}], "filter_delta": {}},
+            "active_filters_after": {"localities": ["Bandra"], "price_max": 20000000},
+            "session_changes": "active_property_id=prop_xyz (resolved from carousel[1]). pivot=true cleared bhk from active_filters.",
+            "carousel_state_after": {"type": "property", "items": [{"ordinal": 1, "id": "prop_xyz", "title": "2BHK Bandra West"}], "stored_at_turn": 2},
+            "last_3_turns_after": [
+              {"user": "tell me more about the second one", "bot": "This 2BHK in Bandra West is...", "main_intent": "property_detail", "sub_intent": "property_about"},
+              {"user": "actually make it 2BHK", "bot": "Here are 2BHK options...", "main_intent": "property_search", "sub_intent": "filter_search"},
+              {"user": "show me 3BHK in Bandra under 2Cr", "bot": "Found 47 properties...", "main_intent": "property_search", "sub_intent": "filter_search"}
+            ]
+          },
+          {
+            "turn": 4,
+            "user_message": "show me similar in Andheri",
+            "slm_output": {"main_intent": "property_search", "sub_intent": "filter_search", "pivot": true, "filter_delta": {"localities": ["Andheri"]}},
+            "active_filters_after": {"localities": ["Andheri"], "price_max": 20000000},
+            "session_changes": "pivot=true cleared bhk (already gone) and active_property_id. localities replaced: Bandra -> Andheri. price_max persisted (universal key).",
+            "last_3_turns_after": [
+              {"user": "show me similar in Andheri", "bot": "Found 2BHK options in Andheri under 2Cr...", "main_intent": "property_search", "sub_intent": "filter_search"},
+              {"user": "tell me more about the second one", "bot": "This 2BHK in Bandra West...", "main_intent": "property_detail", "sub_intent": "property_about"},
+              {"user": "actually make it 2BHK", "bot": "Here are 2BHK options...", "main_intent": "property_search", "sub_intent": "filter_search"}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "Adapter/Port dependency diagram",
+      "description": "A layered dependency diagram showing the three layers of the provider abstraction. Top layer: Pipeline Nodes (safety_node, classify_node, llm_node etc.) — these depend ONLY on abstract ports. Middle layer: Ports/Protocols (DomainRouterPort, ClassifierPort, LLMPort, CachedExecutorPort) — these are Python Protocol classes. Bottom layer: Concrete Adapters (AnthropicDomainRouter, OpenRouterDomainRouter, AnthropicClassifier, OpenRouterClassifier, AnthropicLLM, OpenRouterLLM, DevExecutor, HousingToolExecutor). A separate box on the right shows build_graph() receiving concrete adapters and injecting them into nodes via functools.partial. An arrow from MODEL_REGISTRY to the Adapter Factory shows how the provider selection is driven by configuration, not code. This diagram makes the Open/Closed principle concrete: adding a new provider (say, Google Gemini) means adding one new box in the bottom layer and one branch in the Adapter Factory — zero changes to the top layer (pipeline nodes). Students who don't see this diagram think they need to modify nodes to change providers.",
+      "data": {
+        "layers": [
+          {
+            "name": "Pipeline Nodes (depend on ports only)",
+            "components": ["safety_node", "normalize_node", "route_domain_node (uses DomainRouterPort)", "classify_node (uses ClassifierPort)", "fetch_data_node (uses CachedExecutorPort)", "llm_node (uses LLMPort)"]
+          },
+          {
+            "name": "Ports / Protocols",
+            "components": [
+              {"name": "DomainRouterPort", "method": "async route(input: dict) -> dict"},
+              {"name": "ClassifierPort", "method": "async classify(input: dict) -> dict"},
+              {"name": "LLMPort", "method": "async stream(system, messages, tools, on_chunk, on_tool_use) -> dict"},
+              {"name": "CachedExecutorPort", "method": "async execute(tool, params, ttl) -> dict"}
+            ]
+          },
+          {
+            "name": "Concrete Adapters",
+            "components": [
+              {"name": "AnthropicDomainRouter", "implements": "DomainRouterPort", "provider": "anthropic"},
+              {"name": "OpenRouterDomainRouter", "implements": "DomainRouterPort", "provider": "openrouter"},
+              {"name": "AnthropicClassifier", "implements": "ClassifierPort", "provider": "anthropic"},
+              {"name": "OpenRouterClassifier", "implements": "ClassifierPort", "provider": "openrouter"},
+              {"name": "AnthropicLLM", "implements": "LLMPort", "provider": "anthropic"},
+              {"name": "OpenRouterLLM", "implements": "LLMPort", "provider": "openrouter"},
+              {"name": "DevExecutor", "implements": "CachedExecutorPort", "provider": "mock"},
+              {"name": "HousingToolExecutor", "implements": "CachedExecutorPort", "provider": "housing_api"}
+            ]
+          }
+        ],
+        "wiring": {
+          "MODEL_REGISTRY": "drives provider selection (anthropic | openrouter | mock)",
+          "AdapterFactory": "build_domain_router(), build_classifier(), build_llm() — reads MODEL_REGISTRY, instantiates concrete adapter",
+          "build_graph": "receives concrete adapters, injects into nodes via functools.partial"
+        }
+      }
+    },
+    {
+      "name": "Cost breakdown per turn — where money goes",
+      "description": "A stacked bar chart showing the token cost breakdown for a typical property_search/filter_search turn, split by pipeline stage. Stage 1 (domain router): ~60 input tokens × $0.80/1M = $0.000048. Stage 2 (classifier): ~400 input tokens × $0.80/1M = $0.00032. Stage 3 LLM (Haiku): ~1200 input tokens + 180 output tokens = ($0.00096 + $0.00072) = $0.00168. Total typical turn: ~$0.002. Then show what changes with Sonnet: Stage 3 LLM (Sonnet): same tokens but $3/$15 per 1M = ($0.0036 + $0.0027) = $0.0063. Total Sonnet turn: ~$0.007. Then show prompt caching impact: if system prompt prefix is cached (Anthropic's prompt caching feature), the 1200 input tokens become 200 cache-miss + 1000 cache-hit at 10% price = $0.000016 + $0.0008 = ~$0.0008. This makes the 'data goes in system prompt for caching' decision from Section 1.5/Node 16 visually clear — it's not just an architecture preference, it directly cuts LLM input cost by 60-70%. Also add: monthly cost at 10k DAU × 4 turns/session × 30 days. Haiku: $2,400/month. Sonnet: $8,400/month. Haiku with caching: $1,100/month.",
+      "data": {
+        "typical_turn": {
+          "stage1_domain_router": {"model": "claude-haiku-4-5", "input_tokens": 60, "output_tokens": 15, "cost_usd": 0.000108},
+          "stage2_classifier": {"model": "claude-haiku-4-5", "input_tokens": 400, "output_tokens": 80, "cost_usd": 0.00064},
+          "stage3_llm_haiku": {"model": "claude-haiku-4-5", "input_tokens": 1200, "output_tokens": 180, "cost_usd": 0.00168},
+          "stage3_llm_sonnet": {"model": "claude-sonnet-4-6", "input_tokens": 1200, "output_tokens": 180, "cost_usd": 0.0063},
+          "stage3_llm_haiku_cached": {"model": "claude-haiku-4-5", "input_tokens_uncached": 200, "input_tokens_cached": 1000, "output_tokens": 180, "cost_usd": 0.00096}
+        },
+        "monthly_at_scale": {
+          "dau": 10000,
+          "turns_per_session": 4,
+          "days": 30,
+          "haiku_monthly_usd": 2400,
+          "sonnet_monthly_usd": 8400,
+          "haiku_with_caching_monthly_usd": 1100
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "module": "Module 0",
+  "student_notes": "Questions from production engineer review. Focus on practical application.",
+  "questions": [
+    {
+      "id": "m0q1",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "You are building an AI agent for an e-commerce site. A user says 'add the blue shirt to my cart'. Your pipeline classifies this as intent=add_to_cart and the action executes successfully. What tier does this belong to and why?",
+      "options": [
+        "A. Tier 3a \u2014 it uses the LLM to understand 'blue shirt'",
+        "B. Tier 1 \u2014 the orchestrator executes the action directly with zero LLM cost",
+        "C. Tier 2 \u2014 the orchestrator fetches the cart state and returns a template",
+        "D. Tier 0 \u2014 authentication is required before cart operations"
+      ],
+      "answer": "B",
+      "explanation": "Tier 1 is for direct orchestrator-executed actions. The SLM has already classified the intent and extracted the entity ('blue shirt' \u2192 product_id from carousel_state or entity resolution). The orchestrator calls addToCart(product_id) and returns a success template. No LLM is involved. This is the critical design principle: the LLM is the last resort. If the orchestrator can complete the action deterministically, it should.",
+      "hint": ""
+    },
+    {
+      "id": "m0q2",
+      "type": "short",
+      "difficulty": 3,
+      "question": "The course says 'the LLM is about 15% of this codebase'. Identify three specific system components that make up the other 85% and explain what would break if each one were removed.",
+      "options": [],
+      "answer": "Sample answer: (1) The asyncio.Queue/SSE streaming infrastructure \u2014 without it, LLM output cannot reach the browser in real-time; users would see blank screens until the full response completed. (2) The Redis session store \u2014 without it, every turn is stateless; 'show me 2BHK instead' cannot change a previous filter because there are no previous filters to change. (3) The safety_node/validate_slm_node guardrails \u2014 without them, prompt injection attacks bypass classification, and malformed SLM JSON crashes downstream nodes.",
+      "explanation": "The point is that the value of an AI agent is in the surrounding system, not the model. Students who think AI agents are just 'ChatGPT with a system prompt' will build brittle systems that work in demos but fail in production.",
+      "hint": ""
+    },
+    {
+      "id": "m0q3",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "A user asks 'show me properties in Bandra under 2Cr' then immediately says 'actually make it 3BHK'. The SLM output for the second message has filter_delta: {'bhk': [3]} and pivot: false. After filter_apply_node runs, what does session.active_filters contain?",
+      "options": [
+        "A. {'city': 'Mumbai', 'localities': ['Bandra'], 'price_max': 20000000, 'bhk': [3]}",
+        "B. {'bhk': [3]}",
+        "C. {'city': 'Mumbai', 'bhk': [3]}",
+        "D. The filter_delta is rejected because pivot=false and no city context"
+      ],
+      "answer": "A",
+      "explanation": "filter_apply_node merges filter_delta into the existing session.active_filters. Since pivot=false, sanitize_node does not clear any existing keys. The REPLACE semantics apply: bhk is replaced with [3]. All other keys (localities, price_max, city) persist from the previous turn. This is the multi-turn conversation memory working correctly.",
+      "hint": ""
+    }
+  ]
+}

@@ -239,9 +239,12 @@ class AnthropicClassifier:
             parts.append("CONVERSATION HISTORY (last 3 turns, oldest first):")
             for turn in history:
                 user_msg = turn.get("user", "")
-                intent = turn.get("main_intent", "")
-                sub = turn.get("sub_intent", "")
+                bot_msg  = turn.get("bot", "")
+                intent   = turn.get("main_intent", "")
+                sub      = turn.get("sub_intent", "")
                 parts.append(f"  USER: {user_msg}")
+                if bot_msg:
+                    parts.append(f"  BOT: {bot_msg}")
                 if intent:
                     parts.append(f"  BOT classified as: {intent}/{sub}")
             parts.append("")

@@ -527,6 +527,31 @@ def _append_data_context(system: str, state: 'BotState', c: dict, session: dict)
     import json as _json
     parts = [system]
 
+    # ── Nearby expansion context ──────────────────────────────────────────
+    # When derive_node converted a locality search to a radius search, inject
+    # an explicit note so the LLM explains the expansion rather than acting
+    # confused about why locality names are gone from the filters.
+    derived = state.get('derived_filters') or {}
+    if derived.get('expand_nearby_centroid'):
+        exp = derived['expand_nearby_centroid']
+        locs = ', '.join(exp.get('from_localities') or [])
+        parts.append(
+            f"\n\n## SEARCH EXPANSION\n"
+            f"The user asked to expand beyond {locs}. Search has been switched to a "
+            f"{exp.get('radius_m', 5000) // 1000}km radius centred on {locs}. "
+            f"Tell the user you've broadened the search to nearby areas and present results."
+        )
+    elif derived.get('expand_nearby_fallback'):
+        exp = derived['expand_nearby_fallback']
+        locs = ', '.join(exp.get('from_localities') or [])
+        parts.append(
+            f"\n\n## SEARCH EXPANSION\n"
+            f"User asked to expand beyond {locs}. Exact geo-coordinates were unavailable "
+            f"so the search is still locality-scoped, but tell the user you're showing the "
+            f"best available results near {locs} and suggest they can name specific "
+            f"neighbouring sectors to add."
+        )
+
     # Session context block
     filters = session.get('active_filters') or {}
     ctx_lines = []
@@ -590,11 +615,44 @@ def _append_data_context(system: str, state: 'BotState', c: dict, session: dict)
         if len(data_lines) > 1:
             parts.append("\n".join(data_lines))
 
-    # NOTE: Carousel items are NOT injected here.
-    # Ordinal/positional references ("second property") are resolved by
-    # resolve_entities_node (orchestrator layer) via entity_refs in the
-    # classification output. The LLM only sees the already-resolved entity data.
-    # Injecting the full carousel list here would violate SRP and waste tokens.
+    # ── Resolved entity context ───────────────────────────────────────────
+    # When the user refers to specific carousel items (by ordinal or description),
+    # resolve_entities_node has already looked them up. Inject those here so the
+    # LLM knows exactly which property/locality the user is asking about.
+    resolved = state.get('resolved_entities') or {}
+    resolved_props = [v for v in resolved.values() if v.get('entity_type') == 'property']
+    if resolved_props:
+        prop_lines = ["\n\n## SPECIFICALLY REFERENCED PROPERTIES (user is asking about these)"]
+        for p in resolved_props:
+            line = f"- {p.get('display_name', 'Property')}"
+            if p.get('price_display'):
+                line += f" | {p['price_display']}"
+            if p.get('locality'):
+                line += f" | {p['locality']}"
+            prop_lines.append(line)
+        parts.append("\n".join(prop_lines))
+
+    # ── Recently shown carousel (property_detail and description-based refs) ──
+    # Injected when intent is property_detail/comparison OR when the user may
+    # be referring to a displayed property by description ("the 1.35Cr 2BHK").
+    # Keeps the LLM grounded in what the user already sees on screen.
+    main_intent = c.get('main_intent', '')
+    carousel = session.get('carousel_state') or {}
+    carousel_items = carousel.get('items') or []
+    needs_carousel_context = (
+        carousel_items and
+        (resolved_props or main_intent in ('property_detail', 'comparison'))
+    )
+    if needs_carousel_context:
+        shown_lines = ["\n\n## PROPERTIES SHOWN TO USER (available for reference)"]
+        for item in carousel_items:
+            line = f"- Property {item.get('ordinal', '')}: {item.get('title', '')}"
+            if item.get('price_display'):
+                line += f" | {item['price_display']}"
+            if item.get('locality'):
+                line += f" | {item['locality']}"
+            shown_lines.append(line)
+        parts.append("\n".join(shown_lines))
 
     return "\n".join(parts)
 
@@ -905,10 +963,14 @@ def is_markdown(text: str) -> bool:
 
 
 async def persist_to_kafka(conversation_id: str, events: list[dict]) -> None:
-    """Async fire-and-forget: publishes message events to Kafka."""
+    """Publish message events to Kafka. All events for one call go in parallel."""
+    if not events:
+        return
     from src.kafka.producer import publish
-    for event in events:
-        await publish('chat.messages', {'conversation_id': conversation_id, 'event': event})
+    await asyncio.gather(*[
+        publish('chat.messages', {'conversation_id': conversation_id, 'event': event})
+        for event in events
+    ])
 
 
 async def update_session_state(session: dict, classification: dict, tool_results: list) -> bool:
@@ -1099,7 +1161,7 @@ async def respond_node(state: BotState, emit_sse: Callable) -> dict:
         event.source_message_state = 'IN_PROGRESS'
         emit_sse('chat_event', event.model_dump(by_alias=True))
 
-    await persist_to_kafka(conversation_id, [e.model_dump(by_alias=True) for e in template_events])
+    asyncio.create_task(persist_to_kafka(conversation_id, [e.model_dump(by_alias=True) for e in template_events]))
     tpl_ids = [e.content.template_id for e in template_events if e.content.template_id]
     emit_sse('pipeline_step', {'step': 'node_result', 'node': 'respond',
                                'status': 'templates_emitted', 'count': len(template_events),
@@ -1206,8 +1268,8 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
             content              = MessageContent(text=validated_text),
         )
         emit_sse('chat_event', followup_event.model_dump(by_alias=True))
-        await persist_to_kafka(conversation_id, [followup_event.model_dump(by_alias=True)])
         bot_response = followup_event.model_dump(by_alias=True)
+        kafka_bot_events = [bot_response]
     else:
         # Empty text — still need to close the turn
         close_event = ChatEventToUser(
@@ -1224,11 +1286,61 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
         )
         emit_sse('chat_event', close_event.model_dump(by_alias=True))
         bot_response = None
+        kafka_bot_events = []
 
-    # Persist user message to Kafka (fire-and-forget, same topic as bot messages)
+    # ── Build updated session — must happen before background task captures it ──
+    session = dict(state['session'])
+
+    session['last_intent'] = {
+        'main_intent': c.get('main_intent', ''),
+        'sub_intent':  c.get('sub_intent', ''),
+    }
+    session['last_domain'] = state.get('domain', '')
+    session['turn_count'] = session.get('turn_count', 0) + 1
+
+    new_llm_messages: list = [{'role': 'user', 'content': state.get('raw_message', '')}]
+    if validated_text:
+        new_llm_messages.append({'role': 'assistant', 'content': validated_text})
+    prior_history: list = list(session.get('turn_history') or [])
+    session['turn_history'] = (new_llm_messages + prior_history)[:20]
+
+    prior_turns: list = list(session.get('last_3_turns') or [])
+    session['last_3_turns'] = ([{
+        'user':        state.get('raw_message', ''),
+        'bot':         validated_text[:400] if validated_text else '',
+        'main_intent': c.get('main_intent', ''),
+        'sub_intent':  c.get('sub_intent', ''),
+    }] + prior_turns)[:3]
+
+    emit_sse('pipeline_step', {'step': 'node_result', 'node': 'followup',
+                               'status': 'completed',
+                               'text_len': len(validated_text),
+                               'has_text': bool(validated_text),
+                               'turn_count': session['turn_count'],
+                               'active_filters': dict(session.get('active_filters') or {}),
+                               'last_intent': session.get('last_intent'),
+                               'carousel_type': (session.get('carousel_state') or {}).get('type'),
+                               'carousel_items': len((session.get('carousel_state') or {}).get('items') or []),
+                               })
+
+    # connection_close signals "turn is over" to the client — emit it before any
+    # I/O so the user can type immediately. Persistence is backend housekeeping
+    # that the frontend has no reason to wait for.
+    emit_sse('connection_close', {'reason': 'response_complete'})
+
+    # Background: both Redis and Kafka. Redis is fast (~2–5ms) and will complete
+    # well before any human follow-up arrives. Kafka is an analytics sink that
+    # the next turn never reads. Neither blocks the user.
+    raw_message = state.get('raw_message', '')
+    tool_results = state.get('tool_results') or []
+    trigger_summary = session['turn_count'] >= 20 and session['turn_count'] % 20 == 0
+
+    # Batch all Kafka events for this turn into one call — bot message(s) + user
+    # message together so persist_to_kafka.gather fires them all in parallel.
+    kafka_events = list(kafka_bot_events)
     raw_message = state.get('raw_message', '')
     if raw_message and not raw_message.startswith('user_action:'):
-        user_event = {
+        kafka_events.append({
             'conversationId': conversation_id,
             'messageId':      source_msg_id,
             'messageType':    'text',
@@ -1237,59 +1349,22 @@ async def followup_node(state: BotState, emit_sse: Callable) -> dict:
             'sender':         {'type': 'user'},
             'content':        {'text': raw_message},
             'createdAt':      now,
-        }
-        await persist_to_kafka(conversation_id, [user_event])
+        })
 
-    # ── Persist session context so the next turn has full history ──────────
-    session = dict(state['session'])   # work on a mutable copy
+    tool_results = state.get('tool_results') or []
+    trigger_summary = session['turn_count'] >= 20 and session['turn_count'] % 20 == 0
 
-    # last_intent / last_domain — feeds Stage 1 and Stage 2 SLM routing context
-    session['last_intent'] = {
-        'main_intent': c.get('main_intent', ''),
-        'sub_intent':  c.get('sub_intent', ''),
-    }
-    session['last_domain'] = state.get('domain', '')
+    async def _persist_turn() -> None:
+        # Redis and Kafka are independent — run them in parallel.
+        redis_coro = update_session_state(session, c, tool_results)
+        kafka_coro = persist_to_kafka(conversation_id, kafka_events)
+        saved, _ = await asyncio.gather(redis_coro, kafka_coro, return_exceptions=True)
+        if saved is False:
+            await reconcile_session_conflict(session, bot_response)
+        if trigger_summary:
+            await _trigger_conversation_summary(session['session_id'])
 
-    # turn_count — persisted (was computed locally and never written back)
-    session['turn_count'] = session.get('turn_count', 0) + 1
-
-    # Anthropic-format turn_history — passed verbatim as `messages` to llm_node
-    # newest message first; capped at 20 messages (~10 turns)
-    new_llm_messages: list = [{'role': 'user', 'content': state.get('raw_message', '')}]
-    if validated_text:
-        new_llm_messages.append({'role': 'assistant', 'content': validated_text})
-    prior_history: list = list(session.get('turn_history') or [])
-    session['turn_history'] = (new_llm_messages + prior_history)[:20]
-
-    # last_3_turns — condensed for Stage 2 classifier context (user message + intent tag)
-    prior_turns: list = list(session.get('last_3_turns') or [])
-    session['last_3_turns'] = ([{
-        'user':        state.get('raw_message', ''),
-        'main_intent': c.get('main_intent', ''),
-        'sub_intent':  c.get('sub_intent', ''),
-    }] + prior_turns)[:3]
-
-    saved = await update_session_state(session, c, state.get('tool_results') or [])
-    if not saved:
-        await reconcile_session_conflict(session, bot_response)
-
-    emit_sse('pipeline_step', {'step': 'node_result', 'node': 'followup',
-                               'status': 'completed',
-                               'text_len': len(validated_text),
-                               'has_text': bool(validated_text),
-                               'turn_count': session['turn_count'],
-                               'session_saved': saved,
-                               'active_filters': dict(session.get('active_filters') or {}),
-                               'last_intent': session.get('last_intent'),
-                               'carousel_type': (session.get('carousel_state') or {}).get('type'),
-                               'carousel_items': len((session.get('carousel_state') or {}).get('items') or []),
-                               })
-
-    # Trigger async conversation summarization every 20 turns (fire-and-forget)
-    if session['turn_count'] >= 20 and session['turn_count'] % 20 == 0:
-        asyncio.create_task(
-            _trigger_conversation_summary(session['session_id'])
-        )
+    asyncio.create_task(_persist_turn())
 
     return {'bot_response': bot_response}
 

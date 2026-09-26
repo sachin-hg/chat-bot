@@ -1,0 +1,515 @@
+{
+  "modules_covered": [11, 12, 13, 14, 15, 16],
+  "gaps": [
+    {
+      "module": 11,
+      "section": "11.1",
+      "topic": "DAU scale math — how 5% peak concurrency is derived",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "Where does the 5% peak concurrency figure come from? You've built Kafka systems at scale — peak traffic is never a clean percentage of DAU. At Uber we model P99 traffic spikes, not averages. Is this industry convention or did you measure it? What happens when a viral listing causes a 30% spike?",
+      "context": "Peak concurrent sessions (5%) row in the scale math table at 11.1",
+      "fix": "Add a callout explaining that 5% is a conservative industry rule-of-thumb for chat workloads, not a measured fact. Explain how to compute your own peak factor: measure your actual concurrency-to-DAU ratio in staging/prod, then add a 2-3x safety margin. Show what happens if the assumption breaks — e.g., gate rejections, 429 cascades — and how to detect it via monitoring. Reference the concurrency gate as the circuit breaker."
+    },
+    {
+      "module": 11,
+      "section": "11.1",
+      "topic": "Redis memory footnote — 15GB vs 750MB TTL difference not explained",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The footnote says 15GB assumes 24h TTL and drops to 750MB with 1h TTL. I don't understand how TTL controls memory usage here. If a session is active, doesn't it stay in memory regardless of TTL? When does TTL actually kick in — what's happening to those sessions after 1 hour?",
+      "context": "*15GB assumes 24h TTL and 20 turns/session avg. With 1h TTL it drops to ~750MB.",
+      "fix": "Add a 2-3 sentence explanation: TTL is the time after last activity before Redis automatically expires (deletes) the key. A 24h TTL means abandoned sessions from yesterday are still occupying memory today. A 1h TTL aggressively evicts idle sessions — users who close the tab come back to a fresh session. Explain the UX tradeoff: 1h TTL = users lose their in-progress conversation if idle for >1h. Show the formula: active_memory = peak_concurrent × session_size (TTL only affects idle sessions sitting in Redis)."
+    },
+    {
+      "module": 11,
+      "section": "11.2",
+      "topic": "Redis Cluster hash tags — what cross-slot transactions means and why it matters",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "You say 'use session_id as the hash tag so all operations for a session land on the same node — avoids cross-slot transactions that can't be batched in a pipeline.' I know Redis but not Redis Cluster. What's a hash tag? What's a slot? What breaks specifically if I don't use them? This needs a concrete example of what actually fails.",
+      "context": "Use session_id as the hash tag so all operations for a session land on the same node — avoids cross-slot transactions that can't be batched in a pipeline.",
+      "fix": "Add an explanation: Redis Cluster shards keys across 16,384 hash slots. The hash tag `{session_id}` forces Redis to compute the slot only on the content inside the braces. Without it, `session:abc:data` and `session:abc:lock` might land on different nodes. MULTI/EXEC transactions and Lua scripts fail with CROSSSLOT error if keys span nodes. Show a concrete key naming example: `{sess_abc}:data`, `{sess_abc}:lock` both hash to the same slot. Without the tag: `session:abc:data` and `session:abc:lock` hash differently and the Lua CAS script throws a CROSSSLOT error at 10K DAU."
+    },
+    {
+      "module": 11,
+      "section": "11.3",
+      "topic": "SSE sticky sessions — what happens during ALB instance rebalancing",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "You say sticky sessions with a 300-second duration. But what happens when an instance goes unhealthy or gets replaced by an autoscaler mid-stream? The lb_cookie still points to the dead instance. Does the ALB silently re-route to a new instance? Does the SSE connection drop? The client would see a stream that just stops — how do you handle reconnection?",
+      "context": "StickinessDurationSeconds: 300 — longer than any LLM response (typically <30s)",
+      "fix": "Add a section on graceful degradation: when the pinned instance dies mid-stream, the ALB will route to a new instance on the next request, but the existing SSE connection to the dead instance will TCP-reset. The client's fetch() ReadableStream will throw. Show the client-side retry: catch the thrown error, check if connection_close was not yet received, and re-send the message with the last known session_id. On the server, the session is in Redis so any new instance can pick it up. Also mention the Redis Pub/Sub alternative eliminates this class of failure entirely."
+    },
+    {
+      "module": 11,
+      "section": "11.4",
+      "topic": "Kafka partition count math — why 10 partitions for 460 events/sec",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "You say '10 partitions (each handles ~1,000 msg/sec max)'. Where does the 1,000 msg/sec per partition limit come from? Is that a Kafka spec, a hardware limit, or something you measured? I Googled this and found different numbers everywhere — some say 10MB/s not 1,000 msg/sec. Can you clarify?",
+      "context": "Peak 10x = 460 events/sec → 10 partitions (each handles ~1,000 msg/sec max)",
+      "fix": "Clarify that the 1,000 msg/sec per partition is a conservative rule-of-thumb that applies to small messages on standard cloud Kafka (Confluent/MSK on typical VMs). Real throughput depends on message size, replication factor, and disk I/O. The more reliable formula is: partitions = desired_throughput / (throughput_per_partition). Start with 2x your peak as headroom. Explain that for this workload the bottleneck is usually the consumer (analytics pipeline) not the producer. Add that you can increase partitions later but never decrease them, so it's safer to over-provision slightly."
+    },
+    {
+      "module": 11,
+      "section": "11.5",
+      "topic": "LLM RPM gate formula — avg 3s latency assumption not explained",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The formula says '50 concurrent × (60s / avg 3s latency) = 1,000 RPM consumed'. Where does the 3 second average latency come from? Is that Haiku? Sonnet? I don't know what 'average LLM latency' is or how I'd know what mine is. How do I measure it?",
+      "context": "50 concurrent × (60s / avg 3s latency) = 1,000 RPM consumed",
+      "fix": "Explain that 3s is a rough estimate for a ~200 output token Haiku response over typical API latency. Actual latency depends on: (1) model tier — Haiku ~1-3s, Sonnet ~3-8s for similar output length; (2) output token count; (3) API tier/region. Tell them how to measure it: log latency_ms per LLM call in LangSmith, take the P90 (not mean, since high-outliers are what cause queue buildup). Show a worked example with Sonnet: 50 concurrent × (60s / 6s latency) = only 500 RPM — same gate, half the throughput."
+    },
+    {
+      "module": 12,
+      "section": "12.1",
+      "topic": "What 'Lua locking' and 'A/B experiment framework' mean — these are listed but never explained here",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "The reusable framework list mentions 'Session management + Lua locking' and 'A/B experiment framework'. I haven't seen these explained anywhere. What is Lua locking and why is it in a Python course? What A/B framework? Is there code for it somewhere I'm supposed to have already seen?",
+      "context": "Session management + Lua locking · Tool executor with caching · A/B experiment framework listed in the Reusable framework column",
+      "fix": "Add forward/back references for each item in the reusable framework list. 'Lua locking → see Module 5 for the Lua CAS script that prevents concurrent session writes'. 'A/B experiment framework → see Module 7'. This is especially important for Module 16 (LLM Fundamentals) students who may read Module 12 before the earlier modules. Alternatively, add a 1-sentence tooltip or hyperlink to the relevant module section for each item."
+    },
+    {
+      "module": 12,
+      "section": "12.2",
+      "topic": "What 'wire_param translations' means in Tool Registry step",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "Step 3 says 'Tool Registry — name, description, params with wire_param translations'. What is a wire_param? What does 'translation' mean here? The example says 'bhk=2' but the API wants 'bedrooms=2' — is that it? Can you just show me a concrete example because I have no idea what this means.",
+      "context": "Step 3: Tool Registry — name, description, params with wire_param translations",
+      "fix": "Replace the one-liner with a 10-line code snippet showing exactly what wire_param means: the mapping between the session state key (e.g., 'bhk') and the downstream API's expected parameter name (e.g., 'bedrooms'). Show a ToolDefinition dataclass with a params dict and a wire_param dict, and a 3-line snippet of the executor translating them before calling the API. This is a non-obvious concept that will cause breakage if students implement it wrong."
+    },
+    {
+      "module": 12,
+      "section": "12.3",
+      "topic": "Healthcare case study — HIPAA compliance not called out as domain-specific complexity",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "You list Healthcare as a case study with 'symptom_check' as an intent, but earlier in Module 10 you said HIPAA requires 6-year audit log retention and AES-256. The Healthcare row in this table doesn't flag any of that. If a student builds a healthcare agent using this framework, what mandatory compliance changes do they need to make? This table implies it's as simple as swapping the taxonomy.",
+      "context": "Healthcare row: symptom_check, doctor_search, appointments / patient_profile, insurance / Complex symptom analysis",
+      "fix": "Add a compliance warning column or footnote to the case studies table. Healthcare and any medical application requires: HIPAA BAA with your cloud provider, encrypted session state (Redis encryption at rest), 6-year audit log retention (not TTL-based deletion), and likely FDA 510(k) clearance for clinical decision support. The current table implies swapping a taxonomy is sufficient, which could lead students into serious legal and technical errors."
+    },
+    {
+      "module": 12,
+      "section": "12.4",
+      "topic": "Node.js EventEmitter example doesn't handle backpressure or async LLM streaming",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The Node.js example uses EventEmitter to replace asyncio.Queue, but EventEmitter is synchronous and has no backpressure. In Python, `await queue.put()` blocks if the queue is full. EventEmitter.emit() just fires and forgets. If the LLM is streaming 100 tokens/sec and the SSE connection is slow, you'll silently drop frames. Why not use a proper async queue like a ReadableStream + TransformStream? That's what the browser API uses anyway.",
+      "context": "// asyncio.Queue → EventEmitter ... queue.emit('frame', { token: 'Hello' }); in the Node.js equivalent",
+      "fix": "Replace the EventEmitter example with a Node.js TransformStream or async generator pattern that has actual backpressure semantics. Alternatively, add a callout explicitly noting that EventEmitter has no backpressure — for production you should use a PassThrough stream or a bounded async queue (e.g., the `p-queue` library). The current code will silently drop frames on slow connections, exactly the failure mode Module 14 warns about."
+    },
+    {
+      "module": 13,
+      "section": "Week 1",
+      "topic": "No concrete output defined for 'Skeleton' — what does 'working' mean?",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "Week 1 says 'FastAPI + SSE endpoint · asyncio.Queue streaming · 3-node LangGraph · Redis session · Basic playground · Structured logging'. But what does the end of Week 1 look like? Is it a hardcoded response? Can it classify anything? What does the user experience in the playground at the end of Week 1 that proves the skeleton works? I need a success criterion.",
+      "context": "Week 1, Skeleton: FastAPI + SSE endpoint · asyncio.Queue streaming · 3-node LangGraph · Redis session · Basic playground · Structured logging",
+      "fix": "Add an acceptance criterion for each phase. Week 1 success = 'You can open the playground, type any message, and see a hardcoded SSE stream that: (1) shows 3 pipeline step events, (2) streams 5 fake tokens letter-by-letter, (3) sends connection_close. Session is persisted to Redis and reloaded on next turn.' This gives students something concrete to verify before moving on."
+    },
+    {
+      "module": 13,
+      "section": "Testing",
+      "topic": "Golden dataset — what format, how to build one from scratch, and what 'version-control' means in practice",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "You say 'The golden dataset is the most valuable asset in this system — more valuable than any code. Version-control it.' I'm completely lost. What does a golden dataset look like? Is it a CSV? A JSON file? Who writes the labels — engineers or PMs? How do I even build one if I'm starting from scratch with no real user data? And what does version-controlling it mean — just put it in git?",
+      "context": "The golden dataset is the most valuable asset in this system — more valuable than any code. Version-control it, review it on every taxonomy change, expand it when a new bug is found.",
+      "fix": "Add a concrete example showing the golden dataset format: a JSON array where each entry has {input: user_message, expected_domain: string, expected_intent: string, expected_filter_delta: object, turn_history: [...], notes: string}. Explain how to bootstrap it: (1) write 5 examples per intent by hand, (2) run your first 100 real user queries through the SLM and manually label the ones it gets wrong, (3) save those as regression tests. 'Version control' = the JSON file lives in your git repo, changes are reviewed in PRs, and you tag the commit when you change the taxonomy prompt."
+    },
+    {
+      "module": 13,
+      "section": "Testing",
+      "topic": "Layer 2 model eval tests — what framework runs them, and how do you alert on accuracy drop",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The layer 2 tests say 'nightly, ~$0.50/run, alert if accuracy drops below threshold'. How? What CI system runs these? Is this a pytest job? A GitHub Actions workflow? What does the alert look like — a Slack message? A failed build? You describe what to do but not how to wire it up.",
+      "context": "Layer 2 — Model eval tests (nightly, ~$0.50/run). Catches prompt regressions when taxonomy prompts are edited. Alert if accuracy drops below threshold (e.g. 90%).",
+      "fix": "Add a concrete implementation sketch: a Python script that (1) loads the golden dataset, (2) runs each input through the SLM, (3) compares against expected intent, (4) computes accuracy, (5) exits with code 1 if accuracy < threshold. This script runs as a GitHub Actions nightly cron job (or similar). The exit code fails the job and sends a notification via whatever the team uses (Slack webhook, email, PagerDuty). Show a 10-line pytest or standalone script example."
+    },
+    {
+      "module": 13,
+      "section": "13.design",
+      "topic": "Reference answer L6 framing assumes familiarity with L5/L6 leveling — not explained",
+      "severity": "low",
+      "engineer": "Priya",
+      "question": "The reference answer mentions 'L5 framing' and 'L6 framing'. I don't know what L5 and L6 mean in this context. Is this Google/Meta engineering levels? What does framing 'at L6 level' actually change in the answer? Are these levels used everywhere or just at specific companies?",
+      "context": "A (L5 framing): ... What makes it L6: add that the playground is the highest-leverage investment...",
+      "fix": "Add a one-line note: 'L5 = Senior Engineer, L6 = Staff Engineer in Google/Meta leveling. L5 answers are correct and complete. L6 answers also articulate the production consequence, the failure mode you're avoiding, and why this principle generalizes beyond the immediate problem. Adapt to your target company's levels.' This context matters because the course explicitly targets MAANG roles."
+    },
+    {
+      "module": 14,
+      "section": "14.2",
+      "topic": "Cascade Tax — no concrete example of which nodes to parallelize",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "Gotcha 14.2 says 'Always run parallel groups in fetch_data_node.' But which calls can be parallelized and which can't? I know asyncio.gather() exists but I don't know when I'm allowed to use it. What if one tool call depends on the result of another? How do I figure out the dependency graph?",
+      "context": "14.2: Always run parallel groups in fetch_data_node. Cache aggressively. Set tight timeouts.",
+      "fix": "Add a worked example showing how to identify parallelizable vs sequential calls. In the housing bot: getPropertyDetails(id) and getLocalityScore(locality) are independent → run in parallel with asyncio.gather. But getPropertyDetails(id) must complete before getNearbyProperties(latitude, longitude) if lat/lng come from the property details → sequential. Show the pattern: draw dependencies as arrows, any node with no incoming arrows can run in parallel. Include a 10-line asyncio.gather example showing two independent tool calls."
+    },
+    {
+      "module": 14,
+      "section": "14.4",
+      "topic": "First-Turn Problem — resolution says 'ask for city' but doesn't show how",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "Gotcha 14.4 says 'Design your taxonomy so every prompt works with empty context. Show me properties with no session → ask for city.' But how does the bot ask for city? Is that a special intent? Does it go through the whole pipeline or short-circuit? The code examples I've seen all assume session state already exists. Show me the actual path for Turn 1.",
+      "context": "14.4: Turn 1 has no session. No active_filters, no last_intent. Design your taxonomy so every prompt works with empty context. 'show me properties' with no session → ask for city (minimum required context).",
+      "fix": "Add a code snippet showing the disambiguation intent path: when the SLM detects 'search_properties' with empty required context (city=None), it classifies as 'needs_clarification' with a clarification_prompt field in the output. The pipeline routes to a template response node that emits the clarification prompt as a carousel or text. No LLM call needed. Show the IntentRecord for 'needs_clarification' (tier=2, required_tools=[], template='ask_city') and the route_node conditional."
+    },
+    {
+      "module": 14,
+      "section": "14.5",
+      "topic": "Version Conflict Spiral — 'log and continue' in Sprint 3 vs 'retry with backoff' in Sprint 4 not explained",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "You say 'For the rest: log and continue in Sprint 3, retry with backoff in Sprint 4.' What do Sprint 3 and Sprint 4 refer to? Is this the Module 13 build timeline? What does 'log and continue' mean for a user — do they silently lose their session update? If two requests write version=4, one succeeds and one is silently dropped, won't the dropped one cause a desync?",
+      "context": "14.5: For 99.9% of users (sequential) this never happens. For the rest: log and continue in Sprint 3, retry with backoff in Sprint 4.",
+      "fix": "Replace 'Sprint 3/4' with module references: 'For initial implementation (Module 5): log the conflict and return the most recently successful write — the user's next message will re-read the correct state. For production hardening (Module 10): implement exponential backoff retry: on Lua CAS failure, wait 50ms, re-read state, re-apply delta, retry write, up to 3 attempts. Track conflict_rate in metrics — if it exceeds 0.1% of sessions, investigate concurrent client behavior.' Also clarify what the user experiences: for 'log and continue', their message is processed but the session update is dropped — their filter change from that turn is lost."
+    },
+    {
+      "module": 14,
+      "section": "14.7",
+      "topic": "'No Text Response' Mystery — debugging steps not connected to playground UI",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "Gotcha 14.7 lists 4 debugging steps but I don't know where to look in the playground for each one. 'chunks_streamed=0' — where do I see that? Is that a field in the pipeline step detail panel? I tried the playground and don't see anything called 'chunks_streamed'. Can you show me a screenshot or point me to the exact UI element?",
+      "context": "14.7: Check: (1) chunks_streamed=0 in playground → LLM made tool call with no text. (2) pre_fetched_data empty → LLM has nothing to say.",
+      "fix": "Add a screenshot or a description of exactly where each diagnostic signal appears in the playground. For each step: (1) 'chunks_streamed=0' — click the llm_node in the pipeline trace, look for the 'chunks_streamed' field in the node detail panel on the right. (2) 'pre_fetched_data empty' — click fetch_data_node, check the 'tool_results' field. (3) 'validate_output stripped' — click validate_output_node, compare input_text vs output_text. Add a 'Debugging with the playground' subsection that maps each gotcha symptom to a specific node + field in the UI."
+    },
+    {
+      "module": 14,
+      "section": "14.8",
+      "topic": "Background task leak — 'graceful shutdown handler' not shown",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "Gotcha 14.8 says 'For slow external APIs in background tasks, add a graceful shutdown handler.' What does a FastAPI graceful shutdown handler look like? How do I know which tasks are still running when a SIGTERM is received? In production at Uber we use explicit task registries — is that what you mean here, or is FastAPI's lifespan mechanism sufficient?",
+      "context": "14.8: For slow external APIs in background tasks, add a graceful shutdown handler.",
+      "fix": "Add a concrete code snippet using FastAPI's lifespan context manager: maintain a set of background tasks, on SIGTERM (lifespan exit), call asyncio.gather(*pending_tasks, return_exceptions=True) with a timeout. Show how to register a task: background_task_set.add(asyncio.create_task(slow_api_call())); task.add_done_callback(background_task_set.discard). Note that for Redis/Kafka (<50ms) this is overkill — only do it for tasks that could run for seconds."
+    },
+    {
+      "module": 15,
+      "section": "15.MENTAL_MODELS",
+      "topic": "7 mental models listed as cards but no codebase file+line reference for each",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "Mental model #1 says 'Each node does exactly one job.' That's SRP. Fine. But I want to verify this in the actual codebase — show me which file exemplifies it. The self-assessment says 'give a concrete codebase example for each' but the module itself doesn't provide those examples. Am I supposed to already know where to find them after 14 modules? Some of us didn't do the modules in order.",
+      "context": "Learning objective: 'State each of the 7 mental models unprompted and give a concrete codebase example for each' — but the mental model cards only have a one-line description.",
+      "fix": "Expand each mental model card to include: (1) the codebase file and function that best exemplifies it, (2) a 2-sentence explanation of what would break if you violated it, (3) the interview question it maps to. Example for #1: 'See fetch_data_node in nodes/fetch.py — it only calls tools and puts results in state.pre_fetched_data. respond_node only reads that data and formats the response. Separating them means you can unit test formatting with fake data and test fetching with a mock HTTP client.'"
+    },
+    {
+      "module": 15,
+      "section": "15.MENTAL_MODELS",
+      "topic": "Mental model #3 — 'LLM is the last resort' but no guidance on what pushes something from Tier 3 down to Tier 2",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "Mental model #3 says 'Push to Tier 0/1/2 → faster, cheaper, more reliable.' I get that. But how do I decide if a new feature goes in Tier 2 (template) vs Tier 3a (Haiku) vs Tier 3b (Sonnet)? Is there a decision tree? My PM keeps asking me to 'add AI' to things and I don't know when to push back.",
+      "context": "Mental model #3: Most user actions don't need the LLM. Push to Tier 0/1/2 → faster, cheaper, more reliable.",
+      "fix": "Add a decision flowchart or table: 'Is the response the same for everyone given the same filters? → Tier 2 template. Is the response structured data (carousel, list)? → Tier 1 action. Does it require summarizing/explaining/comparing properties in natural language? → Tier 3a (Haiku). Does it require multi-step reasoning, contradictions, or nuanced advice? → Tier 3b (Sonnet). When in doubt, start at Tier 2 and promote only when you have evidence that a template doesn't serve users well enough.' Include a real example from the codebase for each tier transition."
+    },
+    {
+      "module": 15,
+      "section": "Appendix A",
+      "topic": "LangGraph — 'typed state, conditional edges, tracing' — why not just custom DAG?",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The tech stack table says LangGraph is chosen for 'typed state, conditional edges, tracing' and the alternative is 'Custom DAG, Prefect'. I could build a typed state machine in 100 lines of TypeScript. What does LangGraph give me that I can't get from a simple async function pipeline? The 'typed state' argument doesn't hold — TypeScript interfaces are typed state. What's the real reason?",
+      "context": "Pipeline: LangGraph — typed state, conditional edges, tracing — Alternatives: Custom DAG, Prefect",
+      "fix": "Expand the 'Why' column: LangGraph's real value-add is (1) native LangSmith integration — every node execution is automatically traced with inputs/outputs, no instrumentation code needed; (2) the conditional edge DSL makes branching explicit and visualizable rather than buried in if-statements; (3) it handles async node execution correctly with asyncio. The honest alternative: a custom async pipeline in Python is 100% feasible and several production systems use it. Choose LangGraph if observability and team familiarity with LangChain ecosystem matter; choose a custom DAG if you want zero framework dependency."
+    },
+    {
+      "module": 15,
+      "section": "Appendix B",
+      "topic": "Production checklist — 'Background tasks don't leak across request boundaries' not actionable",
+      "severity": "low",
+      "engineer": "Priya",
+      "question": "The checklist says 'Background tasks don't leak across request boundaries.' I want to check this in my code but I don't know what 'leak' looks like or how to detect it. Is there a test I can write? Is there a log message that tells me? How do I audit my code for this?",
+      "context": "Production checklist: Background tasks don't leak across request boundaries",
+      "fix": "Add a one-line test recipe for each checklist item. For this one: 'Test: in your load test, kill a request mid-flight and verify no lingering asyncio tasks remain (asyncio.all_tasks() should return to baseline after request ends). Code audit: search for asyncio.create_task() calls — each one must either have an await or be added to a tracked task set with a done callback.'"
+    },
+    {
+      "module": 15,
+      "section": "Appendix B",
+      "topic": "What to Build Next — 'Autonomous Agent Mode' with loop detection — no guidance on loop detection",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The last item says 'Autonomous Agent Mode — Planning node + sub-task decomposition. Add loop detection to prevent infinite cycles.' Loop detection in a DAG is easy because DAGs by definition have no cycles. But if you add loops to the graph, you're no longer in LangGraph's standard flow — you need a way to detect when the agent is spinning. How? What's the mechanism? Max iterations? Visited state hashing?",
+      "context": "Autonomous Agent Mode — Planning node + sub-task decomposition. Add loop detection to prevent infinite cycles.",
+      "fix": "Add a brief description of practical loop detection strategies: (1) max_iterations counter in BotState — if the planning node has re-queued the same sub-task more than N times, force-terminate and return an error response; (2) visited state hashing — hash the (intent, active_filters, last_tool_call) tuple; if seen twice, break; (3) sub-task deduplication — the planning node checks its sub-task queue for duplicates before enqueuing. Note that LangGraph supports cycles via explicit loop edges, but you must set a recursion_limit in the graph compilation to prevent infinite loops."
+    },
+    {
+      "module": 16,
+      "section": "16.1",
+      "topic": "Next-token prediction — no explanation of what 'training' actually did",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "You say 'the model learned statistical patterns from a huge text corpus during training.' But what does 'training' actually mean? Does the model read every Wikipedia article? How does reading text turn into a probability distribution? You jump straight from 'training happened' to 'inference works' without explaining the middle part. I want at least a 2-sentence intuition.",
+      "context": "The LLM is a next-token predictor. It takes a sequence of tokens as input, outputs a probability distribution over the next token... The model learned statistical patterns from a huge text corpus during training.",
+      "fix": "Add a 3-4 sentence intuition for training: 'During training, the model reads billions of text examples and is repeatedly asked to predict the next token in each sequence. When it's wrong, its internal weights (billions of numbers) are slightly adjusted to make the correct token more probable next time. After billions of these adjustments, the model's weights encode which tokens tend to follow which patterns. You never modify these weights at inference time — you only provide context and ask the model to continue.' This is the minimum needed for the engineering consequence (hallucination) to make intuitive sense."
+    },
+    {
+      "module": 16,
+      "section": "16.2",
+      "topic": "Prompt caching — the '10%' figure not explained, and what 'same prefix' means exactly",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "You say 'Anthropic caches the input prefix. Stable parts of your system prompt cost ~10% after the first call.' What does ~10% mean — 10% of the per-token price? Is this automatic or do I have to enable it? What counts as 'same prefix' — same byte-for-byte string? If I inject a timestamp in the system prompt, does that break the cache every time? I need to understand the exact mechanism before I can use it.",
+      "context": "Caching: Anthropic caches the input prefix. Stable parts of your system prompt cost ~10% after the first call. At 1M DAU with 2,000-token stable prefix → saves ~$180/day (Haiku prices)",
+      "fix": "Add a dedicated callout explaining Anthropic prompt caching mechanics: (1) You must explicitly mark cache breakpoints using `cache_control: {type: 'ephemeral'}` on the content block in the API request — it is NOT automatic. (2) The cache key is a hash of the exact text content. Any change (even a space) breaks the cache. (3) The 90% discount means you pay 10% of normal input token price for cached tokens (approximately — check current pricing). (4) The cache expires after 5 minutes of inactivity (as of 2024 — verify current TTL). Add a link to the Anthropic docs. Show the actual API call with cache_control set."
+    },
+    {
+      "module": 16,
+      "section": "16.4",
+      "topic": "Temperature 0 being 'fully deterministic' — this is not strictly true",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The table says temperature=0 is 'Always highest-probability token. Fully deterministic.' That's not true — I've seen identical prompts with temperature=0 return different outputs on different API calls. I know enough about ML to know that GPU floating-point non-determinism exists. Are you simplifying here or is Anthropic actually guaranteed deterministic at temperature=0? What does the Anthropic API actually promise?",
+      "context": "Temperature 0: Always highest-probability token. Fully deterministic.",
+      "fix": "Add an asterisk: 'In practice, temperature=0 is highly consistent but not guaranteed byte-for-byte identical across API calls due to GPU floating-point non-determinism, model updates, and load balancing across backend instances. For production classification, treat it as: the most stable output you can get, with very rare variation. Do not design systems that depend on bit-perfect reproducibility. Use it for: JSON structure consistency, intent classification consistency, not cryptographic reproducibility.' This is an important caveat for engineers designing test suites around exact LLM outputs."
+    },
+    {
+      "module": 16,
+      "section": "16.6",
+      "topic": "Prompt caching savings math — assumes 2,000 token stable prefix but build_prompt_node injects dynamic data",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "Section 16.6 says the stable prefix is 2,000 tokens and saves $180/day. But Module 16.3 shows that build_prompt_node puts search results AND active filters inside the system prompt. Those are dynamic — they change every turn. So what's actually cached? The taxonomy and rules are maybe 500 tokens. The rest changes. Is the $180/day estimate based on realistic cache hit rates or is it the theoretical maximum?",
+      "context": "16.6: First call: pay full price for all tokens. All subsequent calls with same prefix: pay ~10% for cached portion. At 1M DAU with 2,000-token stable prefix → saves ~$180/day (Haiku prices)",
+      "fix": "Clarify that the caching architecture requires a specific prompt structure: the cached prefix must be a prefix (not scattered). In build_prompt_node, the system message should be split into two sections: [STATIC — rules, taxonomy, tool descriptions — 1,500 tokens, mark with cache_control] + [DYNAMIC — search results, active_filters — varies per turn, not cached]. The 2,000-token estimate assumes the static section is 2,000 tokens and dynamic data is appended after. Revise the example in 16.3 to show this split explicitly so students can implement it correctly."
+    },
+    {
+      "module": 16,
+      "section": "16.7",
+      "topic": "Model selection — no guidance on how to measure 'cost × quality on your actual data'",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "You say 'Always measure cost × quality on your actual data. A model that's 90% as good at 50× lower cost is almost always right.' How do I measure 'quality'? How do I define 90% as good? Is this the golden dataset accuracy metric from Module 13? What's the actual evaluation workflow? I want to try Haiku vs Sonnet for my domain but I don't know how to compare them rigorously.",
+      "context": "Always measure cost × quality on your actual data. A model that's 90% as good at 50× lower cost is almost always right.",
+      "fix": "Add an evaluation recipe: (1) Take your golden dataset (50-100 examples per intent). (2) Run Haiku and Sonnet separately, both at temperature=0, for classification tasks — compare accuracy against labels. (3) For generation tasks (Tier 3), have a human or GPT-4 judge score 20 responses from each model on: accuracy (did it reference only real data?), relevance (did it answer the question?), tone. (4) Multiply accuracy score by cost_per_call: lower is better. (5) If Haiku is within 5% accuracy of Sonnet for your specific intents, use Haiku. Link to the Layer 2 testing approach from Module 13 as the implementation."
+    },
+    {
+      "module": 16,
+      "section": "16.8",
+      "topic": "RAG diagram says 'embed query' but doesn't explain where the document embeddings come from or how to build the index",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "The RAG diagram shows [1] EMBED QUERY → [2] VECTOR SEARCH → results. But where do the document vectors come from? Who built the vector database? The diagram shows the query-time flow but not the ingestion/indexing flow. If I'm building this from scratch, what do I do first? How do I get my Housing.com property listings into a vector database?",
+      "context": "RAG diagram: User query → [1] EMBED QUERY → [2] VECTOR SEARCH → [3] RE-RANK → [4] INJECT INTO PROMPT → [5] GENERATE",
+      "fix": "Add a second diagram or section showing the offline indexing pipeline: Documents → Chunk (512 tokens with 10% overlap) → Embed each chunk (call embeddings API) → Store (vector + metadata) in vector DB. Then explain how the query-time flow connects to it. Show a minimal code example: load a document, chunk it, call client.embeddings.create() on each chunk, store in pgvector or Pinecone. Without understanding the indexing step, the query-time diagram looks like magic — students won't know where to start."
+    },
+    {
+      "module": 16,
+      "section": "16.8",
+      "topic": "RAG failure modes table — 'Hybrid search (BM25 + vector)' and 'Graph RAG' mentioned without explanation",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The RAG failure modes table lists 'Hybrid search (BM25 + vector)' and 'Graph RAG' as fixes. I have no idea what BM25 is. I Googled it and got 'Best Match 25 probabilistic retrieval'. That means nothing to me. Can you ELI5 what BM25 does that vector search doesn't, and when Graph RAG matters? These are listed as fixes but I can't apply them without understanding them.",
+      "context": "Retrieval miss: Fix: Hybrid search (BM25 + vector), query expansion. Multi-hop failure: Fix: Iterative retrieval or Graph RAG.",
+      "fix": "Add a callout: 'BM25 is keyword-based search (like Ctrl+F over your documents). Vector search is semantic (finds similar meaning even with different words). Hybrid search runs both and combines scores — keyword search catches exact matches that vector search misses (e.g., a property ID number), while vector search catches synonyms that keyword search misses. Most production RAG uses both. Graph RAG is for documents with complex relationships (person→company→event) where a single chunk doesn't contain the full answer — it stores documents as a knowledge graph. For Housing.com listings, you likely don't need Graph RAG; hybrid search is the right first upgrade.' Link to a simple hybrid search example with pg_search + pgvector."
+    }
+  ],
+  "quiz_questions": [
+    {
+      "module": 11,
+      "type": "mcq",
+      "question": "Your chatbot has 100K DAU. Peak concurrent sessions are 5,000. Each session is 15KB. Your Redis instance has 2GB RAM allocated for session data. What should you do?",
+      "options": [
+        "A. Nothing — 5,000 × 15KB = 75MB, well within 2GB",
+        "B. Set a 1-hour TTL to keep active data under 750MB",
+        "C. Immediately move to Redis Cluster since 75MB is close to the 10GB threshold",
+        "D. Compress session data with gzip to stay within limits"
+      ],
+      "answer": "A",
+      "explanation": "At 100K DAU with 5% peak concurrency, active session data is ~75MB — trivially within a 2GB allocation. Redis Cluster is only needed when active session data exceeds ~10GB (roughly 1M+ DAU with long TTLs). Option B is premature — 1h TTL affects idle sessions, not active ones. Option C is wrong: 75MB is far from the 10GB threshold. Option D adds complexity for no reason at this scale. The key insight: plan based on ACTIVE sessions (concurrency × session size), not total users."
+    },
+    {
+      "module": 11,
+      "type": "design",
+      "question": "You're deploying a FastAPI SSE streaming chatbot on AWS with ALB. A load test shows that when you deploy a new version and ALB drains connections, ~2% of users see their chat stream silently stop mid-response. What is the root cause and what are your two options to fix it?",
+      "options": [
+        "A. The SSE timeout is too short; increase StickinessDurationSeconds to 3600",
+        "B. The asyncio.Queue lives in process memory; options are (1) sticky sessions to pin client to instance, or (2) move queue to Redis Pub/Sub so any instance can serve the stream",
+        "C. ALB doesn't support SSE; migrate to WebSockets",
+        "D. FastAPI is not thread-safe; use gunicorn workers instead of uvicorn"
+      ],
+      "answer": "B",
+      "explanation": "The root cause is that asyncio.Queue is in-process memory — when the instance drains and a new connection hits a different instance, the queue doesn't exist there. Fix 1: sticky sessions (lb_cookie) with StickinessDurationSeconds > longest possible LLM response — this prevents re-routing during active streams. Fix 2: Redis Pub/Sub/Streams replace the asyncio.Queue — any instance can consume events from any session. Fix 2 eliminates the problem entirely but adds ~0.5ms Redis round-trip per SSE frame. Option A misunderstands the problem — the issue is routing, not timeout. Option C is false — ALB supports SSE. Option D is a red herring."
+    },
+    {
+      "module": 12,
+      "type": "mcq",
+      "question": "You want to adapt this housing chatbot framework for an e-commerce product. Which of the following files do you NOT need to change?",
+      "options": [
+        "A. prompts/slm/domains/property_search.md (taxonomy prompt)",
+        "B. intent_registry.py (intents and tiers)",
+        "C. The SSE streaming infrastructure and asyncio.Queue logic",
+        "D. tool_registry.py (tool definitions)"
+      ],
+      "answer": "C",
+      "explanation": "The SSE streaming infrastructure, asyncio.Queue, session management, LangSmith observability, and the 19-node pipeline structure are domain-agnostic — they stay the same regardless of whether you're selling houses or t-shirts. What you swap: the taxonomy prompt (A) defines what intents exist for your domain, the intent registry (B) maps those intents to tiers and behavior, and the tool registry (D) defines which APIs to call. The streaming plumbing never knows or cares about the domain."
+    },
+    {
+      "module": 12,
+      "type": "gotcha",
+      "question": "A teammate builds a travel chatbot using this framework. Their taxonomy prompt describes the 'book_flight' intent as: 'User wants to book a flight.' In testing, the SLM frequently misclassifies 'what's the cheapest route to Goa next week?' as 'search_flights' instead of 'book_flight'. What's the root cause and the fix?",
+      "options": [
+        "A. The SLM is not powerful enough; upgrade to Sonnet",
+        "B. The intent description is too vague — it doesn't distinguish between browsing and booking intent, and there are no few-shot examples showing this edge case",
+        "C. The SLM context window is too small; add more intents",
+        "D. The taxonomy has too many intents; merge 'search_flights' and 'book_flight'"
+      ],
+      "answer": "B",
+      "explanation": "Section 12.2 explicitly warns: 'Vague descriptions cause hallucination.' The description 'User wants to book a flight' doesn't help the model distinguish exploratory queries ('what's the cheapest route') from transactional ones ('book me the 6am flight'). The fix: rewrite as 'User has selected a specific flight and is ready to proceed with payment — they provide flight number, date, and payment intent. Distinguished from search_flights by commitment: book_flight implies the user has decided.' Add 3 few-shot examples: (query → correct intent) pairs showing the boundary. Upgrading the model (A) is an expensive workaround for a prompt quality problem."
+    },
+    {
+      "module": 13,
+      "type": "mcq",
+      "question": "At the end of Week 3 (Filters & State), a junior engineer on your team wants to skip straight to Week 5 (LLM Response) so they can 'show stakeholders something impressive.' What's your response and why?",
+      "options": [
+        "A. Allow it — the LLM node doesn't depend on filters, it just takes the raw message",
+        "B. Allow it — you can always backfill filter_apply_node later without breaking the LLM output",
+        "C. Reject it — the LLM node depends on build_prompt_node which depends on pre-fetched tool data which depends on the filter state being correct",
+        "D. Allow it with a feature flag — run LLM node with empty filters and add real filters later"
+      ],
+      "answer": "C",
+      "explanation": "Module 13's reference answer explains exactly this: 'The LLM node depends on everything upstream: validated state, applied filters, pre-fetched tool data, and a built prompt. Without those, the LLM response will be wrong, and you won't know why.' An LLM demo with no filters and no real pre-fetched data will produce hallucinated responses — the model will invent property data because fetch_data_node hasn't run. This misleads stakeholders into thinking the system works. Option D (feature flag) is the closest to tempting but still produces misleading outputs that could create false confidence in product decisions."
+    },
+    {
+      "module": 13,
+      "type": "design",
+      "question": "Your golden dataset has 100 labeled examples. After updating the taxonomy prompt to add 3 new intents, the nightly model eval shows overall accuracy dropped from 94% to 87%. What are your next 3 steps in order?",
+      "options": [
+        "A. Roll back the taxonomy change; re-run eval; confirm rollback restored accuracy",
+        "B. Upgrade from Haiku to Sonnet for the classifier; re-run eval to check improvement",
+        "C. (1) Diff which examples now fail; (2) check if failures cluster around the 3 new intents or existing ones; (3) if new intents: add more few-shot examples; if existing: check for prompt interference",
+        "D. Expand the golden dataset to 500 examples and re-run to get a more statistically valid accuracy number"
+      ],
+      "answer": "C",
+      "explanation": "The structured diagnosis path: first understand which examples broke and whether it's the new intents or regressions in existing ones. New intents failing = they need more few-shot examples and clearer descriptions. Existing intents failing = the new taxonomy text is interfering with their classification (e.g., a new intent's description overlaps with an existing one's). Option A (rollback) skips diagnosis and doesn't help you ship the new intents. Option B (model upgrade) is expensive and treats a symptom. Option D (more data) is valuable long-term but doesn't tell you why the drop happened — you need to fix the prompt first."
+    },
+    {
+      "module": 14,
+      "type": "gotcha",
+      "question": "In production, some users report that their chat stream just stops — no error, no response, just silence. In LangSmith traces you see the llm_node completed successfully and chunks were streamed. The playground shows connection_close was never sent. Looking at the sse_generator code, you find the yield 'connection_close' line is placed after the try/finally block. What is happening and how do you fix it?",
+      "options": [
+        "A. The LLM timed out before streaming finished; increase the LLM timeout from 10s to 30s",
+        "B. If redis.decr() raises in the finally block, the generator exits with that exception and the yield after try/finally never executes — move the yield inside the while loop, immediately after the sentinel break",
+        "C. The asyncio.Queue is full; increase the queue size from 100 to 1000",
+        "D. The SSE connection was closed by the client before connection_close was sent; add retry logic on the client side"
+      ],
+      "answer": "B",
+      "explanation": "This is Gotcha 14.1 verbatim. The try/finally block catches all exceptions — if any code in finally raises (e.g., Redis is temporarily unavailable and decr() throws), Python exits the generator with that exception. Code placed after the try/finally block is unreachable in that case. The fix: move yield 'data: connection_close\\n\\n' inside the while loop, immediately after the break statement (when the sentinel None is received). This guarantees the close frame is sent before the finally cleanup runs. LangSmith showing chunks_streamed=N but no connection_close is the diagnostic signal."
+    },
+    {
+      "module": 14,
+      "type": "mcq",
+      "question": "The IntentRecord dataclass has a field called clear_keys: list[str] that lists session keys to clear when this intent fires. A junior engineer adds clear_keys=['saved_comparisons', 'active_sort'] to the reset_filters intent, commits it, and closes the ticket. Two months later, users complain that saved_comparisons is never cleared on reset. What happened?",
+      "options": [
+        "A. The clear_keys field has a naming conflict with a Python built-in",
+        "B. clear_keys is defined in the schema and populated, but no code in the pipeline ever reads record.clear_keys — the field is dead config that creates false confidence",
+        "C. The clear_keys list is cleared by the Lua atomic script but the Redis TTL resets the keys before the client reads them",
+        "D. clear_keys only works for Tier 1 intents; reset_filters is Tier 1 but the code path skips it"
+      ],
+      "answer": "B",
+      "explanation": "This is Gotcha 14.6. The field was designed with intent but no implementation was ever written to consume it. filter_apply_node hardcodes the reset logic for reset_filters rather than reading record.clear_keys generically. The fix: either delete the field to remove false confidence, or write: `for key in intent_cfg.clear_keys: state.session.pop(key, None)`. The broader principle: never design a schema field without immediately writing (or pointing to) the code that consumes it. Dead config is worse than no config."
+    },
+    {
+      "module": 15,
+      "type": "design",
+      "question": "In a MAANG system design interview, you're asked: 'A PM wants to use GPT-4 for every message to maximize quality. What's your response?' What is the L6-level answer?",
+      "options": [
+        "A. 'GPT-4 is expensive but if quality matters, it's worth it. We can optimize later.'",
+        "B. 'We should use Claude instead of GPT-4 because it has better instruction-following.'",
+        "C. 'The first question is: what percentage of user intents actually require complex reasoning? For structured actions and template responses (Tiers 0-2), a large model adds cost with zero quality gain — those paths don't generate text. For Tier 3, I'd split: Haiku for simple generation, Sonnet for multi-step reasoning. Measure quality on your golden dataset before committing to any model tier.'",
+        "D. 'We should A/B test GPT-4 vs Haiku on 1% of traffic and see which users prefer.'"
+      ],
+      "answer": "C",
+      "explanation": "Mental model #3: The LLM is the last resort, not the first. The L6 answer demonstrates that most pipeline paths don't use an LLM at all (Tiers 0-2 don't generate text), so blanket LLM usage conflates the problem. The answer names the decision framework (tier system), proposes measurement (golden dataset), and gives a concrete split (Haiku vs Sonnet by reasoning complexity). Option A defers the problem. Option B is a vendor preference argument without engineering reasoning. Option D is reasonable but incomplete — it doesn't explain the tier system insight that most paths don't need any LLM."
+    },
+    {
+      "module": 15,
+      "type": "gotcha",
+      "question": "A new node in your pipeline calls an external geolocation API AND formats the resulting address into a display string. A teammate reviews it and says 'this violates mental model #1.' What is the production consequence they're warning about, and what's the fix?",
+      "options": [
+        "A. The node is too slow; split it to run the API call in parallel with other nodes",
+        "B. Single responsibility is violated — you can't test the format logic without triggering the external call, can't cache or reuse the fetch result independently, and an API schema change forces you to debug formatting logic too. Fix: fetch_geo_node puts raw API response in state.geo_data; format_address_node reads state.geo_data and builds the display string.",
+        "C. The node doesn't emit an SSE event; add a pipeline_step event before the API call",
+        "D. External API calls should only happen in fetch_data_node; move both the API call and formatting there"
+      ],
+      "answer": "B",
+      "explanation": "The L6 answer from the Module 15 rubric: mixing fetch and format in one node means (1) tests require live API or mocks for what should be pure logic tests, (2) if the API changes its schema, you're debugging a formatting bug too, (3) you can't cache the raw API response and reuse it in a different format later. Option D is closer but still wrong — moving both operations to fetch_data_node just relocates the violation without fixing it. The correct fix is two nodes: one that fetches (side effect) and one that formats (pure function). Pure functions are trivially testable."
+    },
+    {
+      "module": 16,
+      "type": "mcq",
+      "question": "Your housing chatbot system prompt includes: 'You are a helpful housing assistant. [500 tokens of rules]. Current search results: [{property data, changes every turn}]. Active filters: {changes every turn}.' You want to use Anthropic's prompt caching. What change must you make?",
+      "options": [
+        "A. Nothing — Anthropic automatically detects and caches repeated prefixes",
+        "B. Move the dynamic content (search results, active filters) to after a cache breakpoint marker on the stable prefix (rules section), and mark the stable prefix with cache_control in the API request",
+        "C. Cache the entire system prompt in Redis before sending to Anthropic",
+        "D. Use temperature=0 to make outputs deterministic, which enables caching automatically"
+      ],
+      "answer": "B",
+      "explanation": "Anthropic's prompt caching requires two things: (1) you must explicitly mark the cache breakpoint using cache_control: {type: 'ephemeral'} on the content block in the API request — it is NOT automatic; (2) the cached prefix must be a true prefix (beginning of the message) and must be identical across calls. If dynamic content (search results, filters) is embedded inside the stable rules text, the cache key changes every turn. The fix: structure the system message as [stable rules — mark with cache_control] + [dynamic data — not cached]. Option A is wrong — caching requires explicit opt-in. Option C caches locally but doesn't reduce Anthropic billing. Option D has nothing to do with caching."
+    },
+    {
+      "module": 16,
+      "type": "design",
+      "question": "A user asks your housing chatbot: 'What properties are available in Bandra?' You have a RAG system with property listings indexed as vectors. Your system returns 10 results. The user then asks: 'Which of those have a gym AND are under ₹2Cr?' The bot answers confidently but gets the gym amenity wrong. What RAG failure mode is this and what's the fix?",
+      "options": [
+        "A. Context overflow — 10 results exceeded the context window; reduce to 3 results",
+        "B. Retrieval miss caused by query-document vocabulary mismatch; fix with BM25 hybrid search",
+        "C. Chunk too large — the amenity information is buried in a 2,000-token chunk that the LLM's lost-in-the-middle problem causes it to miss; fix with smaller chunks (256-512 tokens) or a dedicated amenity metadata field",
+        "D. The embedding model doesn't understand real estate terminology; fine-tune it on Housing.com data"
+      ],
+      "answer": "C",
+      "explanation": "The symptom — LLM has the right document but misses a specific attribute — is the 'Chunk too large / Lost-in-the-Middle' failure mode. If a property listing is chunked as one 2,000-token document, the LLM anchors on the beginning (title, price, location) and often misses details in the middle (amenities listed on line 80). Fix: chunk at 256-512 tokens so each chunk is dense signal, or better for structured data: extract amenity information as a structured metadata field that is always in the chunk header. Option A (reduce results) might help context but doesn't fix the within-chunk problem. Option B is for retrieval misses (right document not returned), not extraction errors (right document returned but misread)."
+    }
+  ],
+  "diagram_requests": [
+    {
+      "module": 11,
+      "title": "SSE Stickiness vs Redis Pub/Sub — Traffic Flow Comparison",
+      "description": "Two side-by-side diagrams. Left: sticky session architecture — Client → ALB (lb_cookie) → always Instance A → asyncio.Queue in memory → LLM → SSE frames back. Shows what breaks when Instance A dies mid-stream. Right: Redis Pub/Sub architecture — Client → ALB → any Instance → subscribe to Redis channel keyed on session_id → LLM on Instance B publishes tokens → Instance A (serving SSE) receives and forwards. Shows why any instance can serve the stream. Needed because Module 11.3 describes both options in text but engineers can't visualize the routing difference without seeing it. Alex would Google 'ALB sticky sessions vs Redis pub sub SSE diagram' before accepting the text description."
+    },
+    {
+      "module": 11,
+      "title": "LLM Concurrency Gate — RPM Throttling Mechanism",
+      "description": "Timeline diagram showing: 50 concurrent requests enter the gate (semaphore permits=50). Each request holds a permit for ~3s (LLM call duration). The release of a permit unblocks the next queued request. Show RPM calculation visually: if each permit is held for 3s, in 60s each slot can be used 20 times → 50 slots × 20 = 1,000 RPM consumed. Also show what happens when LLM latency spikes to 6s — same 50 slots now only cycle 10 times = 500 RPM, half the throughput. Needed because the math in 11.5 is presented as a formula without visual intuition. Priya specifically said she doesn't understand the 3s assumption."
+    },
+    {
+      "module": 12,
+      "title": "Domain-Specific Swap Map — What Changes vs What Stays",
+      "description": "A visual of the 19-node pipeline with nodes color-coded: green = stays the same across all domains (safety_node, session_node, validate_slm, route_node, fetch_data_node, llm_node, validate_output, followup_node), orange = configuration-driven (classify_node reads from domain taxonomy, respond_node reads from templates), red = fully domain-specific (processing.py filter logic, tool_registry.py). On the right: a file tree with the same color coding showing which files to copy unchanged vs which files to replace. This directly answers the question both engineers would ask: 'Show me exactly what I replace when I build a new domain agent.'"
+    },
+    {
+      "module": 13,
+      "title": "8-Week Build Timeline with Dependency Arrows",
+      "description": "A Gantt-style diagram showing the 8 phases with explicit dependency arrows: Week 1 Skeleton must complete before Week 2 Classification can start. Week 2 must complete before Week 3 (Filters & State). Week 3 before Week 4 (Tools). Week 4 before Week 5 (LLM Response). Weeks 6-7 (Production Hardening) can partially overlap Week 5 — show which hardening tasks depend on LLM node vs which are parallel (Kafka, A/B framework, rate limiting). Week 8+ advanced features as optional branches. Include acceptance criteria for each phase as a tooltip/annotation. Currently the phase timeline is presented as sequential cards with no visual dependencies, making it unclear what truly blocks what."
+    },
+    {
+      "module": 14,
+      "title": "Cascade Tax — Sequential vs Parallel Node Execution Timeline",
+      "description": "A swimlane timeline diagram showing: Top row = sequential execution (what you get by default): classify(200ms) → sanitize(10ms) → filter_apply(5ms) → fetch_tool_1(300ms) → fetch_tool_2(250ms) → fetch_tool_3(200ms) → llm_node(2000ms) = 2,965ms total. Bottom row = parallel execution in fetch_data_node: first 3 nodes same, then asyncio.gather([tool_1, tool_2, tool_3]) all running simultaneously at max(300ms,250ms,200ms) = 300ms → llm_node(2000ms) = 2,515ms total. Savings: 450ms = 15% latency reduction. This directly illustrates Gotcha 14.2 and answers Priya's question about which calls can be parallelized. Show the dependency arrow: tool_3 uses data from tool_1's result → must be sequential, can't be parallelized."
+    },
+    {
+      "module": 15,
+      "title": "7 Mental Models Decision Tree",
+      "description": "A single-page visual with 7 labeled boxes, each with: the model name, a one-sentence description, a codebase example (file + function), and the interview question it answers. Arrows connecting models where they're related: Model #1 (single responsibility) → leads to Model #7 (cascade latency) because split nodes are easier to cache and parallelize. Model #3 (LLM last resort) → connects to Model #4 (state flows forward) because Tier decisions happen at route_node before any LLM call. This makes the models feel like an integrated system rather than 7 disconnected rules. Needed because the current module presents them as a grid of cards with no connections."
+    },
+    {
+      "module": 16,
+      "title": "RAG Full Pipeline — Offline Indexing + Online Query Flow",
+      "description": "Two-part diagram. Part 1 (Offline/Indexing, runs once): Documents → Text Chunker (512 tokens, 10% overlap) → Embedding API (text-embedding-3-small) → 1536-dimensional vectors → Vector Database (pgvector/Pinecone). Part 2 (Online/Query, runs per request): User query → Embedding API (same model) → Vector DB similarity search → Top-K chunks → (optional) Cross-encoder reranker → Inject into system prompt → LLM → Grounded response. Show which parts of the existing pipeline (fetch_data_node → build_prompt_node → llm_node) map to which RAG steps. This is critical because the current diagram only shows the query-time flow, leaving students confused about where the indexed data comes from — Priya specifically asked this."
+    },
+    {
+      "module": 16,
+      "title": "Prompt Caching Structure — Cached vs Uncached Regions",
+      "description": "A visual of the actual API message structure showing: System message split into two content blocks. Block 1 (green background): 'CACHED — rules, taxonomy, tool descriptions, personality' + cache_control: ephemeral marker. Block 2 (red/orange background): 'NOT CACHED — search results, active filters, session context'. Below this: a cost calculation showing Turn 1 (full price for all tokens), Turn 2 (90% discount on Block 1, full price on Block 2), Turn 10 (same as Turn 2 — Block 2 always changes). Show the dollar amounts: 2000 cached tokens × 0.025 per 1M × 0.1 cache multiplier = $0.000005 vs $0.00005 uncached. This directly addresses the confusion Alex raised about what '10% cost' and 'same prefix' actually mean in practice."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "module": "Module 8",
+  "student_notes": "Questions from production engineer review. Focus on practical application.",
+  "questions": [
+    {
+      "id": "m8q1",
+      "type": "short",
+      "difficulty": 3,
+      "question": "You are adapting this framework for a travel booking agent. A user says 'I want to fly to Goa next weekend and also need a hotel near the beach'. Identify which components you must customize (vs. reuse unchanged) and what the biggest design challenge is.",
+      "options": [],
+      "answer": "Customize: (1) Domain taxonomy prompts \u2014 add flight_search, hotel_search domains. (2) Intent registry \u2014 add intents like flight_search/one_way, hotel_search/beach_hotel with appropriate data_requirements. (3) Tool registry \u2014 register searchFlights, searchHotels, getPriceCalendar tools. (4) filter_apply/derive logic \u2014 add date parsing ('next weekend' \u2192 specific dates), traveler count, cabin class. (5) Session schema \u2014 active_filters needs origin, destination, travel_dates, passengers. Reuse unchanged: SSE streaming, asyncio.Queue pattern, Redis session with optimistic locking, LangGraph pipeline structure, LangSmith observability, A/B framework. The biggest design challenge is multi-intent detection: 'fly to Goa AND need a hotel' is a single message with two intents requiring sequential execution (flight first, then hotel with arrival date from flight result). This requires the multi_intent decomposition path in the pipeline, which runs both intents and merges the responses. The course's Appendix C ('Multi-Intent Decomposition') is exactly this problem.",
+      "explanation": "This tests whether students can separate framework from domain logic and identify where multi-intent handling is genuinely complex.",
+      "hint": ""
+    }
+  ]
+}

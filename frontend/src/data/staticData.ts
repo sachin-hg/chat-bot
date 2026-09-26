@@ -1,0 +1,147 @@
+export interface NodeInfo {
+  phase: 'classify' | 'process' | 'response';
+  job: string;
+  tip: string;
+}
+
+export const NODE_INFO: Record<string, NodeInfo> = {
+  safety:         { phase: 'classify', job: 'Block prompt injection & jailbreaks before spending tokens.', tip: 'Pattern-based, zero LLM cost.' },
+  normalize:      { phase: 'classify', job: 'Fix typos, handle Unicode, lowercase, strip whitespace.', tip: 'SLMs trained on clean text — noisy input degrades accuracy.' },
+  route_domain:   { phase: 'classify', job: 'Stage 1 SLM: which domain? (property_search, locality_research, out_of_scope)', tip: 'Tiny prompt, 20ms, cheap Haiku call.' },
+  classify:       { phase: 'classify', job: 'Stage 2 SLM: main_intent, sub_intent, filter_delta, entity_refs.', tip: 'Sees last_3_turns including bot responses for context.' },
+  validate_slm:   { phase: 'classify', job: 'Sanity-check SLM JSON. Fix structural issues.', tip: 'Prevents invalid classification from propagating downstream.' },
+  filter_apply:   { phase: 'process',  job: 'Merge filter_delta into session.active_filters.', tip: 'Lists replaced (not appended). filter_clear nulls keys.' },
+  sanitize:       { phase: 'process',  job: 'Validate filter values against enums. Remove impossible combos.', tip: 'bhk:[7] → removed. price_max:1000 → flag.' },
+  derive:         { phase: 'process',  job: 'Convert high-level signals to concrete API params.', tip: 'price/sqft+area→price_range. text anchor→lat/lng.' },
+  clarify:        { phase: 'process',  job: 'Short-circuit with clarification question if SLM flagged it.', tip: 'Must persist session here — followup_node won\'t run.' },
+  resolve_entities: { phase: 'process', job: 'Named entities → UUIDs. Ordinal refs → carousel IDs.', tip: '\'the second one\' → carousel_state.items[1].' },
+  route:          { phase: 'process',  job: 'Assign tier (0-3b) and model. Execute Tier 0/1/2 immediately.', tip: 'Tier 0=login, Tier 1=action, Tier 2=template, Tier 3=LLM.' },
+  summary:        { phase: 'response', job: 'Emit deterministic \'Searching for X…\' before data fetch.', tip: 'User sees activity within 50ms. Only emits on high confidence.' },
+  experiment:     { phase: 'response', job: 'Resolve active A/B experiment. May override model.', tip: 'Config hot-loaded every 60s. No deploy needed.' },
+  fetch_data:     { phase: 'response', job: 'Pre-fetch all tool data in parallel before LLM call.', tip: 'Parallel groups. Group 2 waits for Group 1 on dependent fetches.' },
+  respond:        { phase: 'response', job: 'Emit carousel/template events from pre-fetched data.', tip: 'Carousel appears before LLM text. Saves carousel_state.' },
+  build_prompt:   { phase: 'response', job: 'Assemble LLM system prompt with all context injected.', tip: 'System prompt cached (Anthropic caching → 90% cheaper).' },
+  llm:            { phase: 'response', job: 'Stream LLM response. Handle residual tool calls.', tip: 'Each token → queue → generator → browser. Real-time.' },
+  validate_output: { phase: 'response', job: 'Strip URLs, phone numbers, prohibited content.', tip: 'Logs violations for prompt monitoring.' },
+  followup:       { phase: 'response', job: 'Emit final response, connection_close, persist session (background).', tip: 'connection_close BEFORE Redis/Kafka. User never waits for infra.' },
+};
+
+export interface Gotcha {
+  num: string;
+  title: string;
+  body: string;
+}
+
+export const GOTCHAS: Gotcha[] = [
+  {
+    num: '14.1',
+    title: 'The connection_close Trap',
+    body: `<code>connection_close</code> must be yielded <em>inside</em> the generator's while loop on sentinel, not after the try/finally block. If the finally block throws (e.g. Redis decr fails), code after try/finally never runs. The user gets a blank screen. We learned this in production.`,
+  },
+  {
+    num: '14.2',
+    title: 'The Cascade Tax',
+    body: `5 nodes × 200ms each = 1 second before the LLM even starts. Every sequential external call adds latency.<br><br><strong>Which calls to parallelize in fetch_data:</strong><br><pre style="font-size:11px;background:#161b22;color:#e6edf3;padding:8px;border-radius:4px;overflow-x:auto"># BAD: sequential — 200+200+150 = 550ms total
+listings = await search_properties(filters)
+locality  = await get_locality_detail(locality_id)
+emi_info  = await fetch_emi_rates()
+
+# GOOD: parallel group 1 then sync calc — 200ms total
+listings, locality, emi_rates = await asyncio.gather(
+    search_properties(filters),         # 200ms
+    get_locality_detail(locality_id),   # 200ms  (runs in parallel)
+    fetch_emi_rates(),                  # 150ms  (runs in parallel)
+)</pre>Rules: group calls that have no data dependency on each other.`,
+  },
+  {
+    num: '14.3',
+    title: 'The SLM Context Window',
+    body: `The classifier SLM has a small context window. If last_3_turns contains full bot responses, the SLM truncates the beginning. <strong>Always truncate bot responses to 400 chars</strong> in last_3_turns. The full response lives in turn_history for the LLM.`,
+  },
+  {
+    num: '14.4',
+    title: 'The First-Turn Problem',
+    body: `Turn 1 has no session. No active_filters, no last_intent. Design your taxonomy so every prompt works with empty context.<br><br><strong>How it flows through the pipeline:</strong><br><pre style="font-size:11px;background:#161b22;color:#e6edf3;padding:8px;border-radius:4px;overflow-x:auto">User: "show me properties"
+  ↓
+validate_slm_node detects city=None, locality=None
+  → sets clarification_needed=True, missing_slot="city"
+  ↓
+clarify_node generates: "Which city are you looking in?"</pre>Key design: validate_slm_node enforces the "minimum required context" contract.`,
+  },
+  {
+    num: '14.5',
+    title: 'The Version Conflict Spiral',
+    body: `Two simultaneous requests both read version=3, both try to write version=4. One conflicts (Lua returns 0). For 99.9% of users (sequential browsing) this never happens.<br><br><strong>Sprint 4 — retry with exponential backoff:</strong><br><pre style="font-size:11px;background:#161b22;color:#e6edf3;padding:8px;border-radius:4px;overflow-x:auto">for attempt in range(3):
+    result = await lua_write(session_id, state, expected_version)
+    if result == 1:
+        break
+    await asyncio.sleep(0.05 * (2 ** attempt))
+    state = await redis.hgetall(session_id)
+    expected_version = int(state["version"])</pre>After 3 failures: log warning + serve response without persisting (degraded mode).`,
+  },
+  {
+    num: '14.6',
+    title: 'The clear_keys Graveyard',
+    body: `Dead config is worse than no config — it creates false confidence. <code>clear_keys</code> was defined in every IntentRecord for months before anyone noticed no code ever read it. If you design a schema field, immediately write the code that consumes it.`,
+  },
+  {
+    num: '14.7',
+    title: 'The "No Text Response" Mystery',
+    body: `When validated_text is empty, the user sees "No text response received." Debug steps:<br><br><strong>Step 1</strong> — Pipeline tab: look at validate_output node. If chunks_streamed = 0, the LLM returned no text at all — it made a tool call only.<br><strong>Step 2</strong> — State Inspector: check pre_fetched_data. If it's {} or null, fetch_data_node returned nothing.<br><strong>Step 3</strong> — LLM Input/Output tab: read the raw LLM response. If it shows a tool_use block with no text sibling, your system prompt is suppressing prose.`,
+  },
+  {
+    num: '14.8',
+    title: 'The Background Task Leak',
+    body: `asyncio.create_task in a short-lived HTTP request context means the task might outlive the connection.<br><br><strong>Graceful shutdown handler:</strong><br><pre style="font-size:11px;background:#161b22;color:#e6edf3;padding:8px;border-radius:4px;overflow-x:auto">_background_tasks: set[asyncio.Task] = set()
+
+def create_tracked_task(coro):
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task</pre>Rule: Redis/Kafka writes (&lt;50ms) → bare create_task is fine. External HTTP calls (&gt;100ms) → use create_tracked_task.`,
+  },
+];
+
+export interface MentalModel {
+  num: string;
+  title: string;
+  desc: string;
+}
+
+export const MENTAL_MODELS: MentalModel[] = [
+  {
+    num: '1',
+    title: 'Nodes are compiler passes, not ChatGPT wrappers',
+    desc: `Each node does exactly one job. If you find a node doing two things, split it.<br><small style="color:#8b949e">📂 <code>src/pipeline/nodes/fetch.py → fetch_data_node</code> — only calls tools and puts results in <code>state.pre_fetched_data</code>. <code>nodes/response.py → build_prompt_node</code> — only reads that data and formats the prompt.</small>`,
+  },
+  {
+    num: '2',
+    title: 'Emit SSE for UX, not for logic',
+    desc: `No node should make a decision based on what was emitted. SSE is fire-and-forget.<br><small style="color:#8b949e">📂 <code>src/pipeline/nodes/processing.py → emit_sse()</code> — every call is put_nowait into the queue, never awaited or checked. No node reads from the queue.</small>`,
+  },
+  {
+    num: '3',
+    title: 'The LLM is the last resort, not the first',
+    desc: `Most user actions don't need the LLM. Push to Tier 0/1/2 → faster, cheaper, more reliable.<br><small style="color:#8b949e">📂 <code>src/pipeline/graph.py → route_node</code> — the conditional edge decides which tier handles the request before any LLM call happens.</small>`,
+  },
+  {
+    num: '4',
+    title: 'State flows forward, never backward',
+    desc: `A node never reads keys that later nodes write. The pipeline is a DAG. If you need to backtrack, you've designed the wrong graph.<br><small style="color:#8b949e">📂 <code>src/pipeline/nodes/processing.py</code> — each node accesses only the state keys that previous nodes populated.</small>`,
+  },
+  {
+    num: '5',
+    title: 'Design for the next engineer, not the compiler',
+    desc: `Every design decision should be legible to someone reading the code 6 months later. Name functions like followup_node, not process().<br><small style="color:#8b949e">📂 <code>src/pipeline/graph.py</code> — every node function has a name that tells you what it does.</small>`,
+  },
+  {
+    num: '6',
+    title: 'Infrastructure shouldn\'t touch UX timing',
+    desc: `Redis, Kafka, Postgres are housekeeping. connection_close before persistence. Background tasks for everything after the response.<br><small style="color:#8b949e">📂 <code>src/api/chat.py → stream_chat()</code> — the SSE generator yields connection_close before the asyncio task that writes to Redis/Kafka starts.</small>`,
+  },
+  {
+    num: '7',
+    title: 'The cascade of small latencies kills UX',
+    desc: `200ms classification + 500ms fetch + 2000ms LLM = 2.7s. Add one more 200ms node and you've crossed the 'feels slow' threshold.<br><small style="color:#8b949e">📂 <code>src/pipeline/nodes/fetch.py</code> — multiple tool calls run via asyncio.gather() to collapse sequential latencies into a single parallel group.</small>`,
+  },
+];

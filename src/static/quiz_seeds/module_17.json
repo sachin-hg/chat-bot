@@ -1,0 +1,31 @@
+{
+  "module": "Module 10",
+  "student_notes": "Questions from production engineer review. Focus on practical application.",
+  "questions": [
+    {
+      "id": "m10q1",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "Gotcha 10.6 describes the clear_keys graveyard \u2014 a schema field defined but never consumed. What engineering practice prevents this category of bug?",
+      "options": [
+        "A. Code reviews \u2014 a reviewer should catch unused fields",
+        "B. Write the consumer code in the same PR as the schema field; never merge a schema field without its consumer",
+        "C. Static analysis \u2014 mypy will flag unused TypedDict fields",
+        "D. Integration tests \u2014 they will fail if a configured field has no effect"
+      ],
+      "answer": "B",
+      "explanation": "Code reviews catch obvious bugs but are unreliable for 'designed but not implemented' issues, especially when the field was added speculatively ('we'll implement this in Sprint 4'). Mypy checks types, not whether a field is read. Integration tests only fail if the field's absence causes a behavior change \u2014 a field that exists and is never read causes no behavior change. The only reliable prevention is the discipline of never merging a data structure field without the code that reads it. If the consumer isn't ready, don't add the field yet.",
+      "hint": ""
+    },
+    {
+      "id": "m10q2",
+      "type": "short",
+      "difficulty": 3,
+      "question": "A version conflict (Gotcha 10.5) occurs when two simultaneous requests for the same session both read version=5, both try to write version=6, and one gets Lua return 0. The current code logs and continues. Why is this acceptable for 99.9% of users but what specific scenario makes it dangerous?",
+      "options": [],
+      "answer": "It is acceptable because human typing behavior is sequential \u2014 a user reads the bot's response (150ms+ reaction time) before typing the next message. Redis writes complete in 2-5ms. The probability of two genuine HTTP requests from the same session overlapping is near zero in practice. The dangerous scenario: a client with connection retry logic. If the client times out a request and immediately retries, the original request may still be running in the pipeline. Both requests share the same session_id, load the same version=5, and race to write version=6. The first writer wins; the second gets Lua return 0 and logs 'session_version_conflict' without retrying. The retried request then produces a response based on stale session state (missing filters written by the first request). The fix for Sprint 4 \u2014 exponential backoff with a full session reload on conflict \u2014 is the correct solution. The current log-and-continue is acceptable for Sprint 3 only because the conflict is logged and can be detected in monitoring.",
+      "explanation": "This question tests understanding of why concurrent systems bugs are hard to reproduce: they require the specific timing window created by client retry behavior, not just 'two requests at once'.",
+      "hint": ""
+    }
+  ]
+}

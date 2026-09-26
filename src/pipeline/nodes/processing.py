@@ -456,6 +456,10 @@ async def resolve_entities_node(state: BotState, executor=None, emit_sse=None) -
             ordinal_resolved[ref_key] = {
                 "uuid": entity_id, "display_name": item.get("title", ref_key),
                 "entity_type": "property", "confidence": 1.0, "property_id": entity_id,
+                # Include carousel display fields so LLM gets price/location context
+                "price_display": item.get("price_display", ""),
+                "locality":      item.get("locality", ""),
+                "ordinal":       item.get("ordinal", ""),
             }
             log.info("entity_ref_resolved_property", ref=ref_key, id=entity_id)
         elif ctype == "locality":
@@ -463,6 +467,8 @@ async def resolve_entities_node(state: BotState, executor=None, emit_sse=None) -
             ordinal_resolved[ref_key] = {
                 "uuid": entity_id, "display_name": item.get("name", ref_key),
                 "entity_type": "locality", "confidence": 1.0,
+                "city":    item.get("city", ""),
+                "ordinal": item.get("ordinal", ""),
             }
             log.info("entity_ref_resolved_locality", ref=ref_key, id=entity_id)
 
@@ -653,6 +659,75 @@ async def execute_tier2_action(state: BotState, executor=None) -> dict:
         searches = session.get('recent_searches') or []
         return {'template_id': 'recent_searches', 'data': {'searches': searches}}
 
+    # ── pick_nearby_localities — find closest localities to the last radius centroid ──
+    if sub_intent == 'pick_nearby_localities':
+        expand_ctx  = session.get('last_expand_context') or {}
+        from_locs   = expand_ctx.get('from_localities') or []
+        centroid_lat = expand_ctx.get('lat')
+        centroid_lng = expand_ctx.get('lng')
+        city         = filters.get('city') or session.get('city', '')
+
+        nearby: list[dict] = []
+        if executor is not None:
+            try:
+                from src.tools.executor import get_tool_cache_ttl
+                data = await executor.execute(
+                    'getTrendingLocalities',
+                    {'city': city},
+                    get_tool_cache_ttl('getTrendingLocalities'),
+                )
+                all_locs = data.get('localities') or []
+
+                if centroid_lat and centroid_lng:
+                    # Sort by Euclidean distance from the radius centroid and exclude
+                    # the localities that were already in the original search.
+                    from_set = {loc.lower() for loc in from_locs}
+                    def _dist(loc: dict) -> float:
+                        c = loc.get('coordinates') or {}
+                        la = float(c.get('lat') or c.get('latitude', 0))
+                        lo = float(c.get('lng') or c.get('longitude', 0))
+                        if la == 0.0 and lo == 0.0:
+                            return float('inf')
+                        return (la - centroid_lat) ** 2 + (lo - centroid_lng) ** 2
+
+                    candidates = [
+                        loc for loc in all_locs
+                        if (loc.get('name') or '').lower() not in from_set
+                    ]
+                    candidates.sort(key=_dist)
+                    nearby = candidates[:8]
+                else:
+                    # No centroid — exclude the original localities, take top 8 by trend rank
+                    from_set = {loc.lower() for loc in from_locs}
+                    nearby = [
+                        loc for loc in all_locs
+                        if (loc.get('name') or '').lower() not in from_set
+                    ][:8]
+            except Exception as exc:
+                log.warning('pick_nearby_localities_fetch_failed', error=str(exc))
+
+        if not nearby:
+            # Fallback: suggest the user types the localities they want
+            return {
+                'template_id': 'text_response',
+                'data': {
+                    'text': (
+                        f"I wasn't able to fetch nearby localities right now. "
+                        f"Please type the specific localities you'd like to search in "
+                        f"(e.g. \"Sector 14, Sector 17\") and I'll filter for you."
+                    ),
+                },
+            }
+
+        return {
+            'template_id': 'locality_picker',
+            'data': {
+                'question':        f"Which localities near {', '.join(from_locs)} would you like to search in?",
+                'localities':      [{'name': loc.get('name', ''), 'id': loc.get('id', '')} for loc in nearby],
+                'from_localities': from_locs,
+            },
+        }
+
     # ── portfolio fetches — require executor ─────────────────────────────
     if executor is None:
         return {'template_id': 'text_response', 'data': {'text': 'Your portfolio data will be available once the service is fully connected.'}}
@@ -821,7 +896,7 @@ async def resolve_landmark_anchor(anchor_text: str, session: dict) -> dict:  # n
 # Node: derive_node  (CHAT-P-010a)
 # ---------------------------------------------------------------------------
 
-async def derive_node(state: BotState, emit_sse=None) -> dict:
+async def derive_node(state: BotState, emit_sse=None, executor=None) -> dict:
     """Convert derived filter signals to concrete API params.
 
     Amount strings are already numeric by the time this node runs
@@ -864,6 +939,72 @@ async def derive_node(state: BotState, emit_sse=None) -> dict:
         filters["outer_radius"] = anchor["outer_radius_metres"]
         del filters["search_anchor"]
         derived.update(anchor)
+
+    # ── explore_nearby from localities → centroid + radius ─────────────────
+    # When the user asks "show me properties in nearby localities" and the session
+    # has explicit locality filters (e.g. Sector 15/16), convert to a geo-radius
+    # search centred on those localities instead of re-running the same locality
+    # query.  We call resolveEntity for each locality to get lat/lng, compute the
+    # centroid, then replace the localities list with lat/lng + outer_radius so
+    # searchProperties returns results from surrounding areas too.
+    c = state.get("classification") or {}
+    if (
+        c.get("main_intent") == "property_search"
+        and c.get("sub_intent") == "explore_nearby"
+        and filters.get("localities")
+        and not filters.get("lat")          # not already geo-resolved
+        and not filters.get("search_anchor")
+    ):
+        locality_names = list(filters["localities"])
+        coords: list[tuple[float, float]] = []
+
+        if executor is not None:
+            from src.tools.executor import get_tool_cache_ttl
+            ttl = get_tool_cache_ttl("resolveEntity")
+            for name in locality_names:
+                try:
+                    result = await asyncio.wait_for(
+                        executor.execute("resolveEntity", {"query": name, "city": filters.get("city", "")}, ttl),
+                        timeout=2.0,
+                    )
+                    raw_coords = (result or {}).get("coordinates")
+                    if raw_coords and len(raw_coords) == 2:
+                        lat, lng = float(raw_coords[0]), float(raw_coords[1])
+                        if lat != 0.0 or lng != 0.0:
+                            coords.append((lat, lng))
+                except Exception:
+                    pass
+
+        if coords:
+            centroid_lat = sum(c[0] for c in coords) / len(coords)
+            centroid_lng = sum(c[1] for c in coords) / len(coords)
+            expand_radius = 5000   # 5 km — covers neighbouring sectors
+            filters["lat"]          = centroid_lat
+            filters["lng"]          = centroid_lng
+            filters["outer_radius"] = expand_radius
+            del filters["localities"]
+            expand_ctx = {
+                "from_localities": locality_names,
+                "lat": centroid_lat, "lng": centroid_lng,
+                "radius_m": expand_radius,
+            }
+            derived["expand_nearby_centroid"] = expand_ctx
+            # Persist to session so the NEXT turn (pick_nearby_localities) can
+            # find nearby localities relative to this centroid.
+            session["last_expand_context"] = expand_ctx
+            log.info("explore_nearby_centroid_resolved",
+                     localities=locality_names, lat=centroid_lat, lng=centroid_lng)
+        else:
+            # Fallback when executor stub returns no coordinates: store the
+            # expansion intent so the LLM can explain the search context even
+            # though we're still using locality-based params.
+            expand_ctx = {
+                "from_localities": locality_names,
+                "note": "geo_coords_unavailable_using_locality_expansion",
+            }
+            derived["expand_nearby_fallback"] = expand_ctx
+            session["last_expand_context"] = expand_ctx
+            log.info("explore_nearby_no_coords_fallback", localities=locality_names)
 
     # Apply resolved entity UUIDs to active_filters.localities
     # resolve_entities_node stores UUIDs in state['resolved_entities'], but the

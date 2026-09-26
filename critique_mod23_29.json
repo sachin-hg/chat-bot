@@ -1,0 +1,616 @@
+{
+  "modules_covered": [23, 24, 25, 26, 27, 28, 29],
+  "gaps": [
+    {
+      "module": 23,
+      "section": "23.1",
+      "topic": "LangChain vs raw API — actual runtime difference",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The code comparison shows LangChain wrapping the OpenAI call in 2 lines vs 4 lines. That's not a compelling reason to add a 50MB dependency to a production service. What's actually happening at runtime? Is the pipe operator lazy — does it build a computation graph and execute later, like RxJS observables? Or is it eager — does `chain.invoke()` just call each step immediately? And what's the error handling model — if the LLM call fails, do I get the provider's raw error or something LangChain wraps? I need to understand the runtime semantics before I can reason about failure modes.",
+      "context": "LCEL uses | (pipe) to compose Runnable objects. Every component — prompt, model, parser, retriever — implements the same interface.",
+      "fix": "Add a box explaining the Runnable protocol: what `.invoke()` actually does (synchronous, sequential, no lazy evaluation), how exceptions propagate (LangChain wraps provider exceptions in its own error types), and why the interface matters (component swapping without rewiring). Add a concrete failure example: what happens when the LLM call throws a RateLimitError mid-chain — does the chain retry, re-raise, or return a partial result? Compare to a plain try/except around the raw API call."
+    },
+    {
+      "module": 23,
+      "section": "23.2",
+      "topic": "RunnableParallel — thread model and error isolation",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "I've done parallel execution at scale with Kafka consumers and Promise.all in Node. The course says RunnableParallel runs chains 'concurrently (like Promise.all)'. But what's the actual concurrency model? Are these Python threads, asyncio tasks, or subprocesses? If one chain in the parallel set throws, does the whole thing fail immediately or do the other chains complete? At Uber I've been burned by Promise.all where one failed request kills the entire batch — is this the same footgun? And if I'm running this inside FastAPI with its own event loop, does RunnableParallel play nicely or does it spin up competing loops?",
+      "context": "Parallel: both chains run concurrently (like Promise.all) — parallel = RunnableParallel(intent=intent_chain, sentiment=sentiment_chain)",
+      "fix": "Explain the concurrency model explicitly: when called with `.invoke()` (sync), RunnableParallel uses a thread pool executor; when called with `.ainvoke()` (async), it uses asyncio.gather. Document the fail-fast behavior: if one branch raises, the exception propagates immediately. Show the async version with `.ainvoke()` and note it is the preferred form inside FastAPI. Add a note: 'If you need partial results when one branch fails, use `RunnableParallel` with individual try/except inside each branch or a `with_fallbacks()` wrapper.'"
+    },
+    {
+      "module": 23,
+      "section": "23.3",
+      "topic": "Memory types — concrete token math is missing",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The table says ConversationBufferMemory breaks at '~20+ turns overflows 8K context'. But I have no idea how to calculate when I'm approaching that limit. Is one 'turn' my message plus the AI's reply? If I ask a short question and get a long answer, how do I count tokens? Do I have to count manually before every message? And the summary memory 'hallucinates' — what does that mean here? The AI makes up things that were said in the conversation? That sounds really bad. Is there a way to verify the summary is accurate?",
+      "context": "ConversationBufferMemory: Entire conversation verbatim. When it breaks: ~20+ turns overflows 8K context",
+      "fix": "Add concrete token math: 'One turn = user message + assistant response. Average conversational turn is 100–200 tokens. At 8K context, you fit ~20-40 turns assuming 200-400 tokens per turn. Use tiktoken to count: `import tiktoken; enc = tiktoken.get_encoding(\"cl100k_base\"); len(enc.encode(text))`.' Add a worked example. On hallucination: clarify with an example — 'The summary model might write \"User requested a 3BHK\" when the user said 2BHK — it paraphrases and can introduce errors. You can detect this by comparing the summary against source turns, but there is no built-in verification.'"
+    },
+    {
+      "module": 23,
+      "section": "23.5",
+      "topic": "Chunking — why not just send the whole document",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "I'm completely lost on what 'chunking' means in practice. Does the AI read one chunk at a time like scrolling? Can't I just send the whole PDF? Claude's context window is 200K tokens — a 100-page PDF is what, maybe 50K tokens? It fits! Why am I splitting it into 512-character pieces and doing all this retrieval complexity? What am I actually gaining? And what is 'chunk_overlap=50' — does the text literally repeat itself across chunks? Show me a before/after of what a real document looks like after chunking.",
+      "context": "Default: RecursiveCharacterTextSplitter. Switch to MarkdownHeaderTextSplitter when document structure matters.",
+      "fix": "Add a concrete before/after: show a 3-paragraph property listing being split into chunks at 512 chars with 50-char overlap, showing where text repeats. Then explain the retrieval-based argument clearly: with 10,000 properties in your database, you cannot stuff all 10,000 into every prompt — you retrieve the 5 most relevant chunks. Chunking determines what those 5 pieces look like. Add a callout: 'If you genuinely have one document and a 200K context model, you can skip RAG entirely and send it all — that is called long-context inference and is covered in Module 29.6. RAG is for corpora too large to fit in context.'"
+    },
+    {
+      "module": 23,
+      "section": "23.6",
+      "topic": "BM25 — what it is for someone who has never seen it",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "What is BM25? The code just says 'BM25Retriever.from_documents(docs)' and calls it 'keyword' search. Is this just a regex? A full-text search like Postgres tsvector? I know ElasticSearch exists — is this the same thing? The 'weights=[0.4, 0.6]' in EnsembleRetriever — are those confidence weights, importance weights, or something else? What happens if I set them to [0.5, 0.5]? And the hybrid retriever gets 5 results from BM25 and 5 from vector — does it return 10 total or 5 total after merging?",
+      "context": "Hybrid: keyword + semantic (best default for production) — bm25 = BM25Retriever.from_documents(docs); bm25.k = 5",
+      "fix": "Add a sidebar: 'BM25 (Best Match 25) is a classic keyword relevance algorithm — same family as Elasticsearch and Postgres full-text search. It scores documents by term frequency and rarity. If the user says \"rate limiting\" and your doc says \"API throttling\", BM25 scores zero; vector search still finds it. The weights are interpolation coefficients: [0.4, 0.6] means final_score = 0.4 × bm25_score + 0.6 × cosine_score. EnsembleRetriever deduplicates and re-ranks the combined results — you get k=5 final results, not 10.'"
+    },
+    {
+      "module": 23,
+      "section": "23.7",
+      "topic": "format_instructions injection — what does it actually inject",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The PydanticOutputParser calls `parser.get_format_instructions()` and injects it into the system prompt. What does that actually produce? Does it inject the JSON schema? A natural language description? Both? Because I'm thinking about token cost — if I have 15 fields in my Pydantic model and the format instructions repeat the entire schema in every call, that could add 500 tokens to every LLM request. And what happens when the LLM doesn't follow the format — does it throw a Pydantic ValidationError? What's the retry strategy when parsing fails?",
+      "context": "prompt = ChatPromptTemplate.from_messages([...]).partial(format_instructions=parser.get_format_instructions())",
+      "fix": "Show the actual output of `parser.get_format_instructions()` for the PropertyIntent model — print it so readers see it is a natural-language description plus a JSON schema example, typically 150-300 tokens. Add: 'For a model fine-tuned on JSON output (like Haiku), you can skip format instructions and use `JsonOutputParser()` instead — it just parses raw JSON output with no prompt injection.' Document the retry pattern: `chain.with_retry(stop_after_attempt=2)` as the standard approach when parsing fails."
+    },
+    {
+      "module": 23,
+      "section": "23.8",
+      "topic": "Callbacks vs LangSmith — which should I use",
+      "severity": "low",
+      "engineer": "Both",
+      "question": "Alex: Callbacks look like middleware. But the course shows callbacks AND LangSmith tracing in separate modules — Module 23 has callbacks, Module 25 has LangSmith. Are these competing tools or do they compose? If I have LangSmith set up, do I still need callbacks for cost tracking or does LangSmith capture token usage automatically? Priya: I don't understand when I would write a custom callback vs just looking at the LangSmith dashboard. Is the callback approach for people who don't have LangSmith?",
+      "context": "Callbacks fire at chain/LLM/tool/retriever start and end. Use them for cost tracking, custom logging, and error alerting when LangSmith is not available.",
+      "fix": "Add a clear comparison table: LangSmith captures everything automatically including token counts — you do not need a custom callback for cost tracking if LangSmith is enabled. Callbacks are for: (1) writing to your own internal metrics system without LangSmith, (2) triggering side effects like sending alerts to PagerDuty, (3) non-LangChain code that cannot use @traceable. Add: 'If you have LangSmith, you only need callbacks for custom business logic side-effects.'"
+    },
+    {
+      "module": 24,
+      "section": "24.1",
+      "topic": "LangChain vs LangGraph — which one should I actually use",
+      "severity": "high",
+      "engineer": "Both",
+      "question": "Alex: So now I have two frameworks to learn — LangChain (Module 23) and LangGraph (Module 24). The course says 'for a simple Q&A call with no cycles, a plain LCEL chain is sufficient.' But the codebase uses LangGraph for everything including the simple stuff like safety checks and normalization. When exactly does LCEL stop being sufficient? Is there a rule of thumb — like 'if you have more than N nodes, use LangGraph'? Priya: I'm confused — can I use LangGraph without LangChain? Are they the same package? Do I need both installed?",
+      "context": "LangGraph is the right tool when your pipeline has branching logic, loops, or human checkpoints. For a simple Q&A call with no cycles, a plain LCEL chain is sufficient.",
+      "fix": "Add a decision heuristic: 'Use LCEL if: single linear pass, no branching, no loops, no multi-turn state. Use LangGraph if: any conditional routing, multi-turn persistence, human approval steps, or you want visual debugging in LangSmith. In practice: start with LangGraph even for simple pipelines — the overhead is minimal and you avoid a rewrite when requirements grow.' Add a package note: LangGraph is a separate pip package (`langgraph`) that depends on LangChain core. You need both installed: `pip install langgraph langchain-core`."
+    },
+    {
+      "module": 24,
+      "section": "24.2",
+      "topic": "Annotated reducer — the TypeScript engineer mental model is incomplete",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The code has a comment saying TypeScript 'can't express this natively.' I appreciate the effort but I need to understand the actual mechanism, not just 'Python's runtime metadata is more flexible.' What is happening when LangGraph reads the Annotated[list, add_messages] annotation at runtime? Is it using Python's `get_type_hints()` at graph compilation time? And more practically — if I return `{'messages': [new_msg]}` from a node without the annotation, does LangGraph silently replace the list or throw an error? I'd rather know the failure mode than just the happy path.",
+      "context": "messages: Annotated[list, add_messages] — the add_messages gotcha: Without the add_messages reducer annotation, returning {'messages': [new_msg]} replaces the entire message list.",
+      "fix": "Add a concrete failure demonstration: show what happens without the annotation — the messages list gets replaced with a single-element list, losing all history. Show the runtime inspection: LangGraph calls `get_type_hints(AgentState, include_extras=True)` at `StateGraph.compile()` time and extracts the second argument of `Annotated` as the reducer function. Add a debugging tip: 'If your conversation history keeps resetting to one message, check that you have `Annotated[list, add_messages]` and not just `list` for the messages field.'"
+    },
+    {
+      "module": 24,
+      "section": "24.3",
+      "topic": "Infinite loop — how do I actually debug when it happens",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The course says 'Always add an attempts counter with a hard limit.' I tried to run the example and hit an infinite loop before I added the counter. But the process just hung — there was no error message, no timeout, no indication. How do I detect an infinite loop in a LangGraph graph during development? Is there a built-in timeout parameter? And when the recursion limit triggers, what exception is raised — so I can catch it and return a graceful fallback response instead of a 500 error?",
+      "context": "Always add an attempts counter in state with a hard limit. Without it, a consistently poor retriever creates an infinite loop.",
+      "fix": "Add: LangGraph has a built-in `recursion_limit` parameter on compile: `graph.compile(recursion_limit=25)`. When exceeded, it raises `GraphRecursionError` from `langgraph.errors`. Show how to catch it in the FastAPI handler. Also mention: during development, set `recursion_limit=10` to fail fast. Add the import: `from langgraph.errors import GraphRecursionError`. Show the production pattern: `try: result = app.invoke(input) except GraphRecursionError: return fallback_response()`."
+    },
+    {
+      "module": 24,
+      "section": "24.4",
+      "topic": "Checkpointing — what exactly gets persisted",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "I'm confused about what checkpointing actually saves. Does it save the entire AgentState? So if my state has a huge list of 50 messages, each checkpoint saves all 50 messages again? And what about the second turn — the course says 'LangGraph loads full prior state automatically.' But if my state has `classification: dict | None` and the user sends a new message, does the classification from the previous turn carry over, or does it get reset to None? I need to understand what state flows between turns vs what gets reset.",
+      "context": "thread_id isolates each conversation's state — Next turn: LangGraph loads full prior state automatically from checkpoint",
+      "fix": "Add a concrete example of what gets written to the checkpoint store: show the full JSON blob for AgentState after turn 1, then show what the loaded state looks like at the start of turn 2. Clarify: all state fields persist including `classification` from the previous turn — your nodes must explicitly reset fields they don't want to carry over (e.g., `return {'classification': None, 'messages': [new_msg]}`). Add a warning: 'This is the most common multi-turn bug: stale classification from turn 1 routing turn 2 incorrectly because the node returned without setting classification.'"
+    },
+    {
+      "module": 24,
+      "section": "24.5",
+      "topic": "HITL — how does the graph actually pause without blocking a thread",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "This is what I really want to understand: when `interrupt_before=['execute_action']` pauses the graph, what happens to the server thread? Is it blocked waiting? At Uber we'd never accept a thread sitting idle waiting for a human to click Approve — that could be minutes or hours. So how does LangGraph serialize the graph state to the checkpoint store and release the thread, then resume later? And if the server restarts between the interrupt and the resume, does the checkpoint survive and allow resumption from a cold start?",
+      "context": "Pause BEFORE executing 'execute_action' — action has NOT run yet. Human reviews proposed action from state.",
+      "fix": "Clarify the execution model explicitly: `app.invoke()` with `interrupt_before` executes up to the interrupt point, serializes the full graph state to the checkpoint store, and returns immediately — the thread is released. The HTTP request completes. When the human approves, a new HTTP request calls `app.invoke(Command(resume=None), config=config)` which loads state from the checkpoint and continues. The server can restart in between — as long as the checkpoint backend (SQLite/Postgres) is durable. Show the full request/response cycle as a sequence diagram or numbered steps."
+    },
+    {
+      "module": 24,
+      "section": "24.7",
+      "topic": "Streaming — stream_mode values and what they produce",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The code shows `app.astream(input, stream_mode='messages')` for token streaming. But what are all the valid values of `stream_mode`? The first example without `stream_mode` gives node completion events — is that the default? And in the token streaming example, `event[0].content` — what type is `event`? Is it a tuple? A list? I tried to run this and got an AttributeError on `event[0]` and I have no idea why. The course just says 'if hasattr(event[0], \"content\")' without explaining what event actually contains.",
+      "context": "async for event in app.astream(input, config=config, stream_mode='messages'): if hasattr(event[0], 'content'): print(event[0].content, end='', flush=True)",
+      "fix": "Document the stream_mode values: 'values' (default, full state after each node), 'updates' (only changed keys), 'messages' (LLM token chunks as AIMessageChunk tuples). For stream_mode='messages', event is a tuple of (AIMessageChunk, metadata_dict). The hasattr check is needed because tool call chunks and human messages also appear in the stream without a content attribute. Add a print(type(event), event) debugging line so learners can inspect the actual structure. Consider showing a minimal working example with a simple LLM-only graph."
+    },
+    {
+      "module": 25,
+      "section": "25.1",
+      "topic": "LangSmith pricing and free tier limits",
+      "severity": "high",
+      "engineer": "Both",
+      "question": "Alex: Before I integrate this into a production pipeline, I need to know the cost. The course says 'always — this is your debugging interface' but gives zero pricing information. At Uber we had to justify every external service cost. Is there a free tier? What are the rate limits? If I'm tracing 100K requests/day with 5 spans each, that's 500K spans/day — does LangSmith charge per span? Priya: I went to sign up and it asked me to pick a plan. The Developer plan says '5,000 traces/month free' but I don't know if my integration will send 50K or 50 traces — how do I estimate?",
+      "context": "Traces: Records every LLM call, tool call, and chain step with inputs/outputs/latency/cost. When you need it: Always — this is your debugging interface",
+      "fix": "Add a callout on pricing: 'As of 2025, LangSmith Developer plan: 5,000 traces/month free, then $0.005/trace. Each @traceable function call = 1 trace. One pipeline invocation with 19 nodes + 2 LLM calls = 1 parent trace with ~21 spans. Estimate: 10K daily users × 1 trace/user = 300K traces/month ≈ $1,475/month. Consider sampling in production: tag 10% of traces for full tracing, flag all error traces.' Also: add the LANGCHAIN_TRACING_V2 env var table showing how to disable tracing in test environments."
+    },
+    {
+      "module": 25,
+      "section": "25.3",
+      "topic": "Annotation queue workflow — who are the annotators in practice",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The course says 'Annotators review and correct labels in the LangSmith UI.' But who is doing this? Is this the engineering team? Do I need to hire data labelers? How long does it take to label 100 examples? I'm a senior engineer at Housing.com — am I supposed to be spending time labeling? And the 'evaluation flywheel' sounds like it runs automatically, but does CI actually block a deploy if the dataset grows and accuracy drops? I'd love to see the full GitHub Actions or CI yaml for this.",
+      "context": "Annotators review and correct labels in the LangSmith UI. Approved examples flow into the dataset. CI experiments run against the expanded dataset on next deploy.",
+      "fix": "Add a realistic workflow description: 'In a small team, engineers do the first 50 annotations (1–2 hours). Once patterns emerge, domain experts (product managers, sales) handle edge cases. Budget 30–60 seconds per example for classification tasks. A dataset of 200 examples takes 2–3 hours total.' Add a real GitHub Actions example: a pytest job that calls `evaluate()` and fails if `intent_match < 0.90`. Include the `langsmith` Python package call and the assertion. This is the most asked question in production AI teams."
+    },
+    {
+      "module": 25,
+      "section": "25.4",
+      "topic": "Evaluator function signature — run and example objects",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The evaluator function takes `(run, example)` parameters. What type are these? What fields do they have? The course accesses `run.outputs.get('intent')` and `example.outputs.get('intent')` but gives no type hints. If my chain produces a Pydantic model object rather than a plain dict, does `run.outputs` contain the model or the dict? And when the evaluator returns `{'key': 'intent_match', 'score': 1}` — why is the key 'intent_match' and not something else? Can I return multiple scores from one evaluator?",
+      "context": "def intent_match(run, example): predicted = run.outputs.get('intent'); expected = example.outputs.get('intent')",
+      "fix": "Document the types: `run` is `langsmith.schemas.Run`, `example` is `langsmith.schemas.Example`. Key fields: `run.inputs` (dict), `run.outputs` (dict — your chain's return value serialized to dict), `run.error` (str or None). `example.inputs` and `example.outputs` match what you passed to `create_examples()`. Add: 'If your chain returns a Pydantic model, LangSmith serializes it via `.model_dump()`. Always `.get()` defensively.' Show a multi-score evaluator returning `[{'key': 'exact_match', 'score': 1}, {'key': 'partial_match', 'score': 0.5}]`."
+    },
+    {
+      "module": 25,
+      "section": "25.5",
+      "topic": "Statistical significance — 50 examples is not always enough",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The course says 'minimum dataset size: 50 examples for ±5% accuracy confidence.' I know enough statistics to know that depends on the baseline accuracy and the effect size you care about. If my current model is at 94% accuracy and I'm trying to detect a 1% improvement, 50 examples gives me basically zero statistical power — I'd need hundreds. The ±5% confidence claim also doesn't account for class imbalance. Is the 50-example rule just a practical shortcut, or is there a formula I can use to calculate what I actually need?",
+      "context": "Minimum dataset size: 50 examples for ±5% accuracy confidence. Run the baseline first — you need a number to beat.",
+      "fix": "Add a note: 'The 50-example guideline applies when you expect ≥5% accuracy change and have balanced classes. For detecting smaller improvements or highly imbalanced datasets, use the formula: n = (Z²×p×(1-p)) / E² where Z=1.96, E=desired margin of error, p=baseline accuracy. Example: 94% baseline, ±2% margin → n ≈ 230 examples.' Add a link to a sample size calculator. Also: mention bootstrapping as an alternative for small datasets where generating 50 labeled examples is expensive."
+    },
+    {
+      "module": 25,
+      "section": "25.6",
+      "topic": "Online monitoring — faithfulness evaluator cost at 10% sampling",
+      "severity": "low",
+      "engineer": "Alex",
+      "question": "The course says 'sample 10% of traces, run faithfulness evaluator, alert if rolling 1h avg faithfulness < 3.5.' Faithfulness evaluation uses an LLM-as-judge — that's another LLM call. So for 100K daily users at 10% sampling, I'm making 10K extra LLM calls per day just for monitoring. At GPT-4o prices that could be significant. What model does the faithfulness evaluator use by default, and can I configure it to use a cheaper model? And the alert threshold of 3.5 — is that out of 5? Out of 10? What scale is this?",
+      "context": "Configure in LangSmith UI: sample 10% of traces, run faithfulness evaluator, alert if rolling 1h avg_faithfulness < 3.5",
+      "fix": "Add: 'RAGAS faithfulness is scored 0–1, not 0–5. The threshold 3.5 in the example appears to be from an older 0–5 scale — use 0.7 for a 0–1 scale.' Explain the evaluator cost: 'The default faithfulness evaluator uses GPT-4o-mini or Claude Haiku for the judge model (~$0.0002/evaluation). At 10K daily evaluations: ~$2/day. You can configure the judge model in LangSmith settings.' Add the scale clarification prominently — the 3.5 threshold as written will silently never trigger alerts if the actual score range is 0–1."
+    },
+    {
+      "module": 26,
+      "section": "26.1",
+      "topic": "What is an embedding — the fundamental question",
+      "severity": "high",
+      "engineer": "Both",
+      "question": "Priya: I have no idea what '1536 dimensions' means. The course shows '2BHK in Bandra' becoming [0.12, -0.87, 0.44, ..., 0.31] (1536 dims) but I don't understand why those numbers encode meaning. Who decided that -0.87 in position 2 means something about apartments? How did the model learn to put similar texts close together? I keep trying to find the meaning in individual numbers but I think I'm looking at it wrong. Alex: I understand that a neural network trained on text would cluster similar documents — that's just representation learning. But I genuinely don't understand what cosine similarity is computing and why it's better than Euclidean distance for text. Can you explain with numbers?",
+      "context": "'2BHK in Bandra' → [0.12, -0.87, 0.44, ..., 0.31] (1536 dims). Cosine similarity = 0.97 ← semantically near",
+      "fix": "Add a 2D intuition diagram first: show 5 texts plotted in 2D space (not 1536D) where property listings cluster together, greetings cluster separately, price queries are their own cluster. Explain: 'The numbers themselves are meaningless — it is their spatial relationships that encode meaning. Two texts are semantically similar if their vectors point in the same direction.' For Alex's cosine vs Euclidean question: add a numerical example with vectors of different magnitudes showing why cosine ('angle between vectors') ignores document length while Euclidean distance penalizes it. A long and short document about the same topic have similar cosine similarity but very different Euclidean distance."
+    },
+    {
+      "module": 26,
+      "section": "26.2",
+      "topic": "ChromaDB persistence — what 'survives restarts' actually means",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The code says `PersistentClient(path='./chroma_db')` 'survives restarts.' But I ran this in Docker and lost all my data when the container restarted. I think this is because the path is inside the container. How do I mount a volume? And when I call `create_collection()` a second time after a restart, does it create a new empty collection or load the existing one? I got an error: 'Collection already exists.' The course doesn't show how to handle this case. Is there a `get_or_create_collection()` method?",
+      "context": "client = chromadb.PersistentClient(path='./chroma_db') — survives restarts",
+      "fix": "Show the Docker volume mount: `docker run -v $(pwd)/chroma_db:/app/chroma_db myimage`. Add the idempotent collection creation pattern: `collection = client.get_or_create_collection('property_docs', embedding_function=ef)` — this is the production pattern that doesn't fail on restart. Add a callout: 'In production, never use relative paths — use an absolute path from an environment variable: `CHROMA_PATH=/data/chroma`. The `create_collection()` call in the example is for first-time setup only.'"
+    },
+    {
+      "module": 26,
+      "section": "26.3",
+      "topic": "Pinecone upsert — what happens if the same ID is upserted twice",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The code does `index.upsert(vectors=[{'id': 'prop_001', ...}])`. In my DB background, upsert means 'insert or update.' If a property listing changes — new price, updated description — and I re-embed and re-upsert with the same ID, does the old vector get replaced atomically? Or is there a window where prop_001 is partially updated? And the comment says 'batch 100 vectors at a time for efficiency' — is 100 a hard limit from Pinecone's API or a recommendation? What happens if I upsert 1000 at once?",
+      "context": "# Upsert — batch 100 vectors at a time for efficiency",
+      "fix": "Clarify upsert semantics: Pinecone upsert is atomic per vector — if you upsert the same ID twice, the second write overwrites the first entirely. There is no partial update. The 100-vector batch is a recommendation, not a hard limit — Pinecone's limit is 2MB per request (approximately 1,000 vectors at 1536 dimensions). For large initial loads, use async batching: `asyncio.gather(*[index.upsert(batch) for batch in batches])`. Add: 'When updating a listing, you must re-embed the full updated text — you cannot update just the metadata without touching the vector.'"
+    },
+    {
+      "module": 26,
+      "section": "26.4",
+      "topic": "pgvector HNSW — table lock during index creation",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The decision tree mentions 'HNSW index creation locks table — use pg_partman for large datasets' as a caveat, but then the SQL example just runs `CREATE INDEX` without any of that. I've been burned by accidental table locks in Postgres at Uber — a simple ALTER TABLE killed query performance for 30 seconds. How long does this HNSW index creation take for a 1M-vector table? Is it the same as a B-tree index lock? Can I create it `CONCURRENTLY` like a regular Postgres index?",
+      "context": "CREATE INDEX ON property_embeddings USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64); Caveat: HNSW index creation locks table — use pg_partman for large datasets",
+      "fix": "Show the `CONCURRENTLY` syntax: `CREATE INDEX CONCURRENTLY ON property_embeddings USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);` — this avoids table locking but takes 2-4× longer. Add timing: HNSW index on 1M 1536-dim vectors takes 15-45 minutes on a c5.4xlarge; IVFFlat takes 5-10 minutes but requires a training step first. Add: 'Never run CREATE INDEX without CONCURRENTLY in production. The non-concurrent version takes a ShareLock that blocks all writes for the duration.'"
+    },
+    {
+      "module": 26,
+      "section": "26.7",
+      "topic": "Embedding model lock-in — what happens when you change models",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The course says 'start with text-embedding-3-small and tune chunk size via RAGAS before switching models.' But I've worked on systems where you can't easily change a foundational dependency after launch. If I start with text-embedding-3-small and 6 months later want to switch to BGE-large — do I have to re-embed every single document in my database? Can I run both models simultaneously with separate indexes during migration? What does a zero-downtime embedding model migration look like?",
+      "context": "The embedding model matters more than the DB choice. Start with text-embedding-3-small and tune chunk size via RAGAS context relevance before switching embedding models.",
+      "fix": "Add a migration pattern: 'Yes — switching embedding models requires re-embedding all documents because vectors from different models are not comparable (different dimensions, different semantic spaces). Zero-downtime migration: (1) create new collection/index with new model; (2) re-embed and populate new index while old index stays live; (3) A/B test: route 10% of traffic to new index; (4) promote new index when RAGAS score is confirmed better; (5) decommission old index. This takes 1-5 days depending on corpus size. This is why choosing the right model upfront matters.'"
+    },
+    {
+      "module": 27,
+      "section": "27.1",
+      "topic": "RAG fundamental misunderstanding — what the LLM actually sees",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "Wait — does the LLM not know things by itself? The course diagram shows chunks being 'stuffed into the system prompt' but I thought LLMs were trained on the internet and knew everything. Why does it need a search engine? Is the LLM just doing copy-paste from the retrieved chunks into the answer? Or is it actually reasoning over them? And if it's just copy-paste, why do we need an LLM at all — couldn't I just return the retrieved text directly? I'm genuinely confused about what role the LLM plays in RAG.",
+      "context": "stuff retrieved chunks into system prompt → LLM",
+      "fix": "Add a fundamental RAG explanation callout: 'The LLM has parametric knowledge from training (it knows Python syntax, general facts, world history) but it does NOT have your company's specific data — your property listings, prices, availability, internal policies. RAG gives the LLM your data at query time by injecting it into the context. The LLM's job is to reason, synthesize, and generate a natural-language answer from that data — not just copy it. Without RAG, asking \"what is the price of Oberoi Exquisite project?\" gets a hallucinated answer. With RAG, it gets the real data from your database, synthesized into a readable response.'"
+    },
+    {
+      "module": 27,
+      "section": "27.2",
+      "topic": "HyDE — why would a hypothetical document work better than the real query",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "HyDE generates a fake document to use as the search query. This seems backwards — you're adding noise by generating an answer that might be wrong, then searching with that. My intuition says a wrong hypothetical answer would retrieve worse results than the original query. Can you show a concrete example where HyDE actually beats direct query embedding? And what if the LLM generates a completely wrong hypothetical — does the retrieval quality collapse or degrade gracefully?",
+      "context": "HyDE — embed a hypothetical answer, not the question. Answers share vocabulary with documents; questions often don't.",
+      "fix": "Add a concrete vocabulary mismatch example: Query: 'What are the penalties for late payment?' Documents use the word 'surcharge' not 'penalties.' Direct embedding misses it. HyDE generates: 'Late payments incur a monthly surcharge of 2%.' — now 'surcharge' appears and retrieval works. Add a failure mode note: 'If the LLM generates a factually wrong hypothetical (e.g., wrong city, wrong property type), the retrieved documents will be from the wrong category. HyDE works best when vocabulary mismatch is the problem, not when the LLM lacks domain knowledge. Always A/B test HyDE vs MultiQueryRetriever — HyDE costs 1 extra LLM call per query.'"
+    },
+    {
+      "module": 27,
+      "section": "27.3",
+      "topic": "Modular RAG routing — how do you classify the query_type",
+      "severity": "high",
+      "engineer": "Priya",
+      "question": "The routing code has `if query_type == 'factual_lookup'` but where does `query_type` come from? Is there another LLM call before this that classifies the query? Or is it based on the intent classifier from earlier modules? The course shows the routing logic but not how to determine which route to take. How does the system know whether a query is 'factual_lookup' vs 'semantic' vs 'multi_hop'? This feels like the most important piece and it's completely missing.",
+      "context": "def route(query: str, query_type: str): if query_type == 'factual_lookup': return bm25_retriever.invoke(query)",
+      "fix": "Add the routing classifier: show how query_type is determined — either via a dedicated LLM classification call (`'Classify this query as factual_lookup, semantic, or multi_hop: {query}'`) or via heuristics (queries with entity names → factual, queries with 'similar to' → semantic, queries with 'and also' or multiple entities → multi_hop). Show the integration: the route function is called with the output of the classifier, making this a two-step process. Note: 'This is a second LLM call per request — budget ~50-100ms and ~$0.00005 for Haiku. Only worth it at high query volume with diverse query types.'"
+    },
+    {
+      "module": 27,
+      "section": "27.4",
+      "topic": "Graph RAG — how is the knowledge graph actually built",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The course says Graph RAG 'builds a knowledge graph' but doesn't show any code for building it. The diagram shows `(Bandra Project) --approved_by→ (J. Smith)` — how did those entities and relationships get extracted from raw text? Is this another LLM call? A rule-based NER system? Named entity recognition? And the $10-$100 indexing cost estimate — is that for building the graph or for running queries? At Uber scale with millions of documents, is Graph RAG even feasible?",
+      "context": "Graph RAG builds a knowledge graph so queries can traverse relationships. Graph construction is expensive ($10–$100 to index a large corpus with LLM-based entity extraction).",
+      "fix": "Add a brief graph construction overview: 'Building the graph: for each document, an LLM is called with a prompt like \"Extract entities and relationships from this text as (subject, predicate, object) triples.\" This is 1 LLM call per chunk — for 10K chunks at $0.001/call = $10. The $10-$100 is one-time indexing cost. Query cost is normal RAG cost plus graph traversal (microseconds in Neo4j/NetworkX). Add code: `from langchain_experimental.graph_transformers import LLMGraphTransformer` — this is the LangChain integration for entity extraction into a knowledge graph.'"
+    },
+    {
+      "module": 27,
+      "section": "27.6",
+      "topic": "Agentic RAG — ReAct loop termination and infinite tool calling",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The Agentic RAG section shows `create_react_agent` but doesn't show how the agent decides to stop calling tools. In the example 'EMI at 8.5% for 20 years', the agent calls SearchDocs then CalcEMI. But what if CalcEMI gives a result the LLM doesn't trust and it calls SearchDocs again? How many tool calls can it make before stopping? Is there a max_iterations parameter? And what's the cost model — if the agent makes 5 tool calls, is that 5 LLM calls? 6 (plus the final response)?",
+      "context": "agent = create_react_agent(llm, tools=[search_tool, emi_tool], prompt=react_prompt)",
+      "fix": "Add: `create_react_agent` defaults to a `max_iterations=15` stop condition. Each ReAct step (Thought → Action → Observation) is one LLM call. For the EMI example: 1 call to decide SearchDocs, 1 call to decide CalcEMI, 1 call to formulate final answer = 3 LLM calls total + 2 tool calls. Pass `max_iterations=5` to limit runaway agents. Show: `from langchain.agents import AgentExecutor; executor = AgentExecutor(agent=agent, tools=tools, max_iterations=5, early_stopping_method=\"generate\")`. The '~3× token cost of Naive RAG' note in 27.7 refers to these additional LLM calls."
+    },
+    {
+      "module": 28,
+      "section": "28.1",
+      "topic": "chunk_size=512 — is that characters or tokens",
+      "severity": "high",
+      "engineer": "Both",
+      "question": "Alex: The course says `chunk_size=512` and then in Module 28.2 it clarifies '512 characters (≈128 tokens)' — but in Module 23.5 it just says `chunk_size=512` without units, and the RAGAS loop in 28.8 says 'smaller chunk size: 512 → 256 tokens.' So is 512 characters or tokens? I tried both splitters and got very different chunk counts. Priya: When I set chunk_size=512, how big is that in practice — is it like one paragraph? One sentence? I have no intuition for this.",
+      "context": "splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50) and 'Try smaller chunk size: 512 → 256 tokens'",
+      "fix": "Fix the inconsistency throughout: RecursiveCharacterTextSplitter uses characters by default (512 chars ≈ 100-130 tokens, roughly 1-2 short paragraphs). TokenTextSplitter uses tokens. The RAGAS loop section incorrectly says '512 → 256 tokens' when RecursiveCharacterTextSplitter uses characters — this should say '512 → 256 characters.' Add a concrete example: paste a real 512-character text snippet showing what one chunk looks like. Add: 'To use token-based splitting with RecursiveCharacterTextSplitter, pass `length_function=tiktoken_len` where tiktoken_len counts tokens instead of characters.'"
+    },
+    {
+      "module": 28,
+      "section": "28.3",
+      "topic": "SemanticChunker — how does it actually decide where to split",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "I tried SemanticChunker on my test document and got chunks of wildly different sizes — one was 50 words and another was 500 words. The `breakpoint_threshold_type='percentile'` parameter is completely opaque to me. What does the 95th percentile mean here? 95th percentile of what? And the cost note says '10K sentences ≈ $0.02' — does that mean it embeds every sentence individually, not just the chunks? That could be slow if my document has thousands of sentences.",
+      "context": "SemanticChunker(embeddings=OpenAIEmbeddings(), breakpoint_threshold_type='percentile') — Cost: ~1 embedding call per sentence. 10K sentences ≈ $0.02",
+      "fix": "Explain the algorithm: 'SemanticChunker embeds every sentence, then computes the cosine similarity between adjacent sentence pairs. It finds the pairs where similarity drops most sharply (the breakpoints). `percentile` means: split at the top 5% of similarity drops (the largest topic shifts). This is why chunks vary in size — a section on pricing might be 2 sentences; a section on legal terms might be 20.' Add timing: '10K sentences at batch_size=512 takes ~30 seconds and 20K API calls. For a large corpus, pre-compute sentence embeddings and cache them. Only use SemanticChunker for documents where you expect abrupt topic changes.'"
+    },
+    {
+      "module": 28,
+      "section": "28.6",
+      "topic": "ParentDocumentRetriever — InMemoryStore is not production-ready",
+      "severity": "high",
+      "engineer": "Alex",
+      "question": "The code uses `InMemoryStore()` as the docstore and says to use `RedisStore for production`. But there's no code for RedisStore. How do I configure that? And more importantly — the child chunks get embedded in the vector store, but the parent chunks are only in the InMemoryStore. If my service restarts, the vector store (ChromaDB persistent) survives but the InMemoryStore is wiped — now I have child chunk vectors pointing to parent IDs that no longer exist. That seems like a critical data loss bug. What's the correct initialization sequence?",
+      "context": "ParentDocumentRetriever(vectorstore=vectorstore, docstore=InMemoryStore(), ...) — RedisStore for production",
+      "fix": "Add the RedisStore code: `from langchain_community.storage import RedisStore; docstore = RedisStore(redis_url='redis://localhost:6379', key_prefix='parent_docs:')`. Explain the data model: child chunk vectors store the parent doc ID in their metadata. At query time, the retriever looks up the parent ID in the docstore. If the docstore is wiped, retrieval silently fails (returns empty results for matched chunks). Add an initialization check: 'Always verify docstore and vectorstore are populated before serving. In production, populate both in a batch job, not in the application startup path.'"
+    },
+    {
+      "module": 28,
+      "section": "28.7",
+      "topic": "MMR lambda_mult — what diversity actually means here",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "I don't understand what 'diversity' means for search results. The code says `lambda_mult=0.5` balances relevance and diversity, with 0=max diversity and 1=max relevance. If I'm searching for '2BHK in Bandra', why would I NOT want all 5 results to be 2BHK in Bandra listings? When is diversity actually useful? And `fetch_k=20` — does this make 20 vector lookups before selecting 5? That means paying for 20 embedding comparisons to return 5 results?",
+      "context": "MMR: avoid 5 near-identical chunks — balance relevance + diversity. vectorstore.max_marginal_relevance_search(query, k=5, fetch_k=20, lambda_mult=0.5)",
+      "fix": "Add a concrete example of why redundant results hurt: 'A property has 10 similar listings. With standard top-5, you might get 5 variations of the same building (different floors, similar prices). The LLM sees the same facts repeated and cannot answer \"what other options exist in Bandra?\" MMR ensures the 5 results span different buildings, price ranges, or localities. For question-answering, lambda_mult=0.7 (more relevance) is better. For exploratory browsing, lambda_mult=0.3 (more diversity) is better.' On performance: fetch_k=20 is 1 ANN search returning 20 candidates, then MMR scoring is done in-memory — it is not 20 separate ANN queries."
+    },
+    {
+      "module": 28,
+      "section": "28.8",
+      "topic": "RAGAS — how do I actually run it, it's never shown",
+      "severity": "high",
+      "engineer": "Both",
+      "question": "Priya: RAGAS is mentioned everywhere as the evaluation tool but I never see actual code for running it. How do I install it? What does it need as input — just the question and answer, or also the retrieved chunks? Alex: I want to integrate RAGAS into CI. The '200 samples, ~$1.00, ~3 min' estimate — is that using a cheap model for judging? If I use GPT-4o as the judge, does it cost 10× more? And can I run RAGAS without any OpenAI API key if my main pipeline uses Claude?",
+      "context": "Run RAGAS eval (200 samples, ~$1.00, ~3 min)",
+      "fix": "Add a complete RAGAS setup example: `pip install ragas`. Show a minimal eval: `from ragas import evaluate; from ragas.metrics import faithfulness, context_relevancy, answer_relevancy; from datasets import Dataset`. Show the required input format: `{'question': [...], 'answer': [...], 'contexts': [[chunk1, chunk2], ...], 'ground_truth': [...]}`. Note: 'The ~$1.00 estimate uses GPT-3.5-turbo as the evaluator model. Using GPT-4o costs ~$15 for 200 samples. You can configure Claude as the evaluator: `ragas.llms.langchain_llm(ChatAnthropic(...))`. The contexts field must include the actual retrieved chunks — not just the final answer.'"
+    },
+    {
+      "module": 29,
+      "section": "29.1",
+      "topic": "MMLU benchmark — what it actually measures",
+      "severity": "medium",
+      "engineer": "Both",
+      "question": "Alex: The table shows MMLU scores like 88.7% for GPT-4o. What is MMLU? Is it measuring coding ability? Reasoning? General knowledge? If I'm building a property search chatbot and MMLU tests high school chemistry and law, why should I care about that benchmark? Priya: The scores are from 82% to 92.3% — that feels like a really narrow range. Does 88.7% vs 90.1% actually matter in practice? How does a 1.4% MMLU difference translate to real-world accuracy on my task?",
+      "context": "GPT-4o: MMLU 88.7%. Claude Sonnet 4.6: MMLU 90.1%",
+      "fix": "Add a callout: 'MMLU (Massive Multitask Language Understanding) tests general knowledge across 57 academic subjects — it is a proxy for overall reasoning capability, not domain-specific performance. A 1-2% MMLU difference rarely translates to meaningful differences on your specific task. Always run your own task-specific evaluation (your RAGAS dataset, your intent classification golden set) rather than relying on MMLU rankings. The table is useful for understanding the capability ceiling; your offline eval tells you actual task performance.' Add: HumanEval (for code) and MT-Bench (for instruction following) as more actionable benchmarks for typical AI engineering tasks."
+    },
+    {
+      "module": 29,
+      "section": "29.2",
+      "topic": "MoE — how does the model know which expert to activate",
+      "severity": "medium",
+      "engineer": "Priya",
+      "question": "The callout says Mixtral activates '2 of 8 experts' per token. How does it decide which 2? Is there a separate neural network that looks at the token and picks the experts? And since it activates different experts for different tokens, does a single sentence use different experts for different words? That means the 'experts' aren't specializing in topics like 'housing' vs 'legal' — they're activating at the token level? I want to understand this before I recommend it to my team.",
+      "context": "Mixtral 8×7B has 47B total parameters but only activates 13B per token (two of eight experts). MoE — GPT-3.5 quality at 13B inference cost",
+      "fix": "Add a brief MoE explanation: 'Each transformer layer has 8 separate feed-forward networks (experts). A small router network (the gating function) looks at the input token representation and outputs weights for all 8 experts — the top 2 by weight are activated. Yes, different tokens in the same sentence activate different expert combinations. The experts do NOT specialize by topic — they learn complementary patterns during training, similar to how attention heads in a standard transformer learn different patterns. The key insight: you pay inference cost for 2 experts (13B params) but get the capacity of 8 (47B params) because capacity builds during training.'"
+    },
+    {
+      "module": 29,
+      "section": "29.4",
+      "topic": "5-axis framework — the weights are arbitrary, how do I adjust them",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The 5-axis framework has hardcoded weights: Cost 30%, Latency 25%, Capability 20%, Privacy 15%, Operational Control 10%. But for Housing.com's context these weights are completely wrong — we're a B2C consumer app, so latency and UX quality matter more than privacy (no medical data). And in a healthcare context, privacy might be 60%. Who decided 30/25/20/15/10? Is there a methodology for setting these weights, or is it just vibes? And the star ratings — what does 3 stars vs 4 stars for latency actually mean in milliseconds?",
+      "context": "Score these five axes for your specific use case, then weight by priority. Cost per call: Weight 30%. Latency p95: Weight 25%",
+      "fix": "Clarify the framework is a template, not a formula: 'The weights (30/25/20/15/10) are an example for a cost-sensitive B2B SaaS product. You must set your own weights based on: (1) interview the product owner for their top 2 constraints; (2) cost weight should reflect whether you have a per-call pricing constraint; (3) privacy weight goes to 40%+ for healthcare/finance/legal. Define the star ratings explicitly: Latency ★★★★★ = <100ms p95, ★★★★ = <300ms, ★★★ = <600ms, ★★ = <1.5s, ★ = >1.5s. Show how Housing.com would actually weight it: Latency 35% (consumer UX), Cost 30% (scale), Capability 20%, Privacy 10%, Control 5%.'"
+    },
+    {
+      "module": 29,
+      "section": "29.5",
+      "topic": "TCO calculation — MLOps cost is underestimated",
+      "severity": "medium",
+      "engineer": "Alex",
+      "question": "The self-hosted calculation says '0.5 FTE MLOps at ~$50K/year.' That's $100K for a full FTE — way below market rate for an MLOps engineer in MAANG territory, which is $200-300K total comp. At realistic numbers, the break-even changes significantly. Also, the GPU cost uses 2× A100 at $3/hr — that's a dedicated bare metal instance. In practice you'd use spot instances at 60-70% discount, or a managed service like AWS SageMaker which has different pricing. Can you show the full cost model with realistic numbers?",
+      "context": "Self-hosted (Llama 3.1 70B on 2× A100 80GB): GPU rental: 2× A100 at $3/hr × 24hr = $144/day. Engineering: ~$50K/year (0.5 FTE MLOps). Annual: ~$103K/year",
+      "fix": "Update the cost model with realistic ranges: 'GPU: on-demand A100 $3/hr, spot ~$1.20/hr (60% discount), SageMaker adds ~20% overhead. On-demand annual: $105K; spot annual: $43K. MLOps engineering: 0.5 FTE at realistic market rate $250K TC = $125K/year. Total self-hosted range: $168K-$230K/year. Hosted Haiku: $263K/year as calculated. Break-even: spot instances make self-hosting cheaper around 500K calls/day. The decision is also about risk tolerance — self-hosted requires 24/7 on-call coverage for GPU failures, model updates, and CUDA dependency management.'"
+    },
+    {
+      "module": 29,
+      "section": "29.6",
+      "topic": "RAG vs long context — when does context window size actually matter",
+      "severity": "medium",
+      "engineer": "Both",
+      "question": "Priya: The table says '32K–128K: Lost-in-the-middle past 8K' but I thought these models were trained on 128K contexts. If the model can handle 128K, why does it lose things in the middle past 8K? Alex: The course says 'chunked RAG + reranking consistently outperforms stuff-everything-into-context even when context is large enough.' I want to see the evidence for this claim. What's the benchmark? Where is the crossover point where long-context becomes better than RAG? Gemini's 1M context — is it actually reliable at 500K tokens?",
+      "context": "Lost-in-the-middle past 8K. Chunked RAG + reranking consistently outperforms 'stuff everything into context' — even when the context window is large enough.",
+      "fix": "Add a reference to the 'Lost in the Middle' paper (Liu et al., 2023) which empirically shows LLM performance degradation when relevant content is not at the beginning or end of context. Add a practical rule: 'For queries where the relevant passage is unknown in advance (most RAG scenarios), retrieval to find the relevant 2-3 chunks outperforms stuffing all 100 chunks. For tasks where you need the full document structure (legal contract review, code audit), long context wins because chunking destroys structural context.' For Gemini 1M: note that benchmark performance at 1M tokens is significantly degraded vs 32K; Gemini's reliability above 128K is not well-established as of 2025."
+    }
+  ],
+  "quiz_questions": [
+    {
+      "module": 23,
+      "type": "mcq",
+      "question": "You have a chain: `chain = prompt | llm | parser`. When you call `chain.invoke({'query': 'test'})`, the LLM call raises a `RateLimitError`. What happens?",
+      "options": [
+        "A. LCEL automatically retries 3 times before raising",
+        "B. The exception propagates up to the caller unchanged — no automatic retry",
+        "C. LCEL returns `None` and logs the error internally",
+        "D. The chain switches to a fallback LLM automatically"
+      ],
+      "answer": "B",
+      "explanation": "LCEL does not retry by default. Exceptions propagate unchanged. To add retry behavior, you must explicitly wrap with `.with_retry(stop_after_attempt=3)`. Option A is false — no automatic retry. Option C is false — nothing is suppressed. Option D requires explicit `.with_fallbacks([backup_llm])` configuration. This matters in production: an unhandled RateLimitError will bubble up as a 500 unless your API handler catches it."
+    },
+    {
+      "module": 23,
+      "type": "gotcha",
+      "question": "You use `RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)` to split a 5,000-character product manual. Your RAGAS context_relevance score is 0.45 — very poor. Before changing the chunk size, what should you check FIRST?",
+      "options": [
+        "A. Increase chunk size to 1024 characters",
+        "B. Switch to SemanticChunker",
+        "C. Check if the document has clear section headers and try MarkdownHeaderTextSplitter instead",
+        "D. Switch to a better embedding model (BGE-large)"
+      ],
+      "answer": "C",
+      "explanation": "Low context relevance means the retrieved chunks don't match the query — the wrong content is being returned. For a structured document with sections, RecursiveCharacterTextSplitter ignores structure and can split a 'Pricing' section in the middle, destroying coherence. MarkdownHeaderTextSplitter splits by heading, keeping all pricing information together and making metadata-based filtering possible. Only after confirming the splitter choice should you tune chunk size (A) or embedding model (D). SemanticChunker (B) adds $0.02 embedding cost and is overkill before trying structure-aware splitting."
+    },
+    {
+      "module": 24,
+      "type": "gotcha",
+      "question": "Your LangGraph agent's conversation history keeps resetting after every turn — each new message sees an empty history. Your AgentState definition is: `class AgentState(TypedDict): messages: list`. What is the bug?",
+      "options": [
+        "A. You need to use a Pydantic model instead of TypedDict",
+        "B. The messages field needs the Annotated[list, add_messages] reducer annotation",
+        "C. You must use SqliteSaver checkpointer instead of MemorySaver",
+        "D. Your node is not returning the messages field"
+      ],
+      "answer": "B",
+      "explanation": "Without `Annotated[list, add_messages]`, each node's return value of `{'messages': [new_msg]}` completely replaces the messages list. With the annotation, LangGraph uses add_messages as a reducer that appends. This is the single most common LangGraph mistake. Option A is wrong — TypedDict is correct for LangGraph state. Option C is wrong — MemorySaver works fine for within-process persistence. Option D would show up as a missing key error, not a reset. Fix: `messages: Annotated[list, add_messages]` from `from langgraph.graph.message import add_messages`."
+    },
+    {
+      "module": 24,
+      "type": "design",
+      "question": "You're building a content moderation agent that: (1) classifies incoming content, (2) auto-approves safe content, (3) pauses for human review on borderline content. After human review, borderline content may be approved or rejected. Which LangGraph features would you use for this workflow?",
+      "options": [
+        "A. Conditional edges for routing + no checkpointer needed (same request lifecycle)",
+        "B. Conditional edges for routing + interrupt_before on the human_review node + SqliteSaver checkpointer",
+        "C. Subgraphs for each content type + MemorySaver checkpointer",
+        "D. A single node with if/else logic and no graph features beyond a linear chain"
+      ],
+      "answer": "B",
+      "explanation": "Human review means the HTTP request completes and a human acts hours later in a separate request — you cannot handle this in one request lifecycle. `interrupt_before=['human_review']` pauses the graph and serializes state. SqliteSaver persists state across server restarts. A separate endpoint calls `app.invoke(Command(resume=None), config=config)` after the human decision. Conditional edges route safe content to the auto-approve path, bypassing the interrupt. Option A fails because human review is async — you cannot block a thread for hours. Option C adds complexity without addressing the async persistence problem. Option D is a 400-line if/else tree that can't persist state."
+    },
+    {
+      "module": 25,
+      "type": "mcq",
+      "question": "Your production chatbot serves 50,000 daily users. You want to detect quality degradation before users notice. Which online monitoring strategy is most cost-effective?",
+      "options": [
+        "A. Trace 100% of requests and run LLM-as-judge faithfulness evaluator on all of them",
+        "B. Trace 100% of requests but run faithfulness evaluator on only 10% sampled randomly, alert on rolling 1h average dropping below threshold",
+        "C. Trace only requests where the user sends a follow-up question (proxy for dissatisfaction)",
+        "D. Run RAGAS evaluation nightly on yesterday's full traffic log"
+      ],
+      "answer": "B",
+      "explanation": "Option B balances coverage and cost: full tracing (100%) captures all data for debugging, but the expensive LLM-as-judge runs on only 10% (5,000/day), making it affordable (~$1/day at Haiku rates). The rolling 1h average gives timely alerts. Option A is 10× the cost with marginal benefit — statistical sampling is sufficient for trend detection. Option C creates selection bias — you'd miss silent hallucinations where users don't follow up. Option D has 24h detection lag — users have already had a bad experience. The 10% sampling with alerting is the standard production pattern from Module 25.6."
+    },
+    {
+      "module": 25,
+      "type": "short",
+      "question": "What is the minimum recommended dataset size for running a LangSmith prompt experiment, and why? What could go wrong if you use only 10 examples?",
+      "options": [],
+      "answer": "50 examples minimum for ±5% accuracy confidence",
+      "explanation": "With 10 examples, a 1-example difference (1 correct vs 0 correct on an edge case) swings your accuracy metric by 10 percentage points. Random variation in LLM outputs makes small-sample results unreliable. You might promote a worse prompt because it happened to get lucky on 10 specific inputs. The 50-example minimum ensures that a measured improvement of 5% represents a real signal, not noise. For high-stakes systems or small effect sizes (detecting a 1-2% improvement), you need 200-500 examples. Always run the baseline (original prompt) on the same dataset first — you need a number to beat before comparing variants."
+    },
+    {
+      "module": 26,
+      "type": "mcq",
+      "question": "You have 2 million property listings stored in PostgreSQL with a pgvector HNSW index. A new requirement needs adding a `tenant_id` column and filtering vector searches by tenant. What is the correct approach?",
+      "options": [
+        "A. Add the column and recreate the HNSW index with CONCURRENTLY to avoid table locks",
+        "B. Add the column normally; HNSW index automatically handles new column filters",
+        "C. Create a separate pgvector table and index per tenant",
+        "D. Drop the HNSW index, add the column, rebuild with CREATE INDEX (non-concurrent)"
+      ],
+      "answer": "A",
+      "explanation": "HNSW index creation without CONCURRENTLY takes a table lock that blocks all writes for the duration — on 2M vectors, this could be 15-45 minutes, causing a production outage. `CREATE INDEX CONCURRENTLY` avoids the lock at the cost of 2-4× longer build time. Option B is wrong — adding a column does not affect an existing index; the index is on the embedding column only, and metadata filters are applied post-ANN-search in pgvector. Option C would fragment your data across hundreds of tables. Option D would cause a production outage. After adding the column, update your SQL query to include `WHERE metadata->>'tenant_id' = $2`."
+    },
+    {
+      "module": 26,
+      "type": "gotcha",
+      "question": "You switch your embedding model from `text-embedding-3-small` (1536 dims) to `BAAI/bge-large-en-v1.5` (1024 dims). Your vector database is Pinecone. What must you do?",
+      "options": [
+        "A. Nothing — Pinecone automatically handles different dimension sizes",
+        "B. Update the dimension parameter in your index configuration; existing vectors are automatically re-dimensioned",
+        "C. Create a new Pinecone index with dimension=1024, re-embed all documents, verify with RAGAS before switching traffic",
+        "D. Use dimension reduction (PCA) to project 1536-dim vectors to 1024 dims to avoid re-embedding"
+      ],
+      "answer": "C",
+      "explanation": "A Pinecone index has a fixed dimension set at creation — you cannot mix 1536-dim and 1024-dim vectors in the same index. Vectors from different embedding models are not comparable even if you reduce dimensions. Option A is false. Option B is false — Pinecone does not re-dimension vectors. Option D (PCA projection) would destroy the semantic relationships that make the embedding useful. The correct migration: create new index at 1024 dims, re-embed the full corpus with BGE, run RAGAS on the new index to confirm quality improvement before routing production traffic. This is the zero-downtime migration described in Module 26.7."
+    },
+    {
+      "module": 27,
+      "type": "mcq",
+      "question": "Your RAG chatbot's RAGAS faithfulness score is 0.45 — very low. This means the answers contain claims not found in the retrieved context. Which change addresses the ROOT CAUSE?",
+      "options": [
+        "A. Increase chunk size from 256 to 1024 tokens",
+        "B. Switch from RecursiveCharacterTextSplitter to SemanticChunker",
+        "C. Add 'Answer ONLY from the provided context' to the system prompt AND lower temperature to 0.2",
+        "D. Add more documents to the vector database"
+      ],
+      "answer": "C",
+      "explanation": "Low faithfulness = LLM is hallucinating — adding content not in the retrieved chunks. This is a generation problem, not a retrieval problem. The fix is constraining the LLM's behavior via prompt engineering ('answer only from context') and reducing temperature (lower temperature = less creative, more grounded). Option A (larger chunks) might help if the LLM lacks sufficient context to answer, but the RAGAS signal for that is low faithfulness AND low answer relevance together. Option B (SemanticChunker) is a retrieval fix for context relevance problems. Option D (more documents) doesn't constrain hallucination. If faithfulness is still low after prompt + temperature fixes, try ParentDocumentRetriever to give the LLM more complete context."
+    },
+    {
+      "module": 27,
+      "type": "design",
+      "question": "You're designing a RAG system for a legal contract review tool. Lawyers need answers to questions like 'What are the liability obligations of Party A if Party B fails to deliver clause 3.2?' Which RAG architecture is most appropriate and why?",
+      "options": [
+        "A. Naive RAG — legal documents are dense prose, keep it simple",
+        "B. Advanced RAG with hybrid search and reranking",
+        "C. Graph RAG — legal questions often require traversing entity relationships (party → clause → obligation → remedy)",
+        "D. Self-RAG — legal documents are factual and retrieval is always needed"
+      ],
+      "answer": "C",
+      "explanation": "The query requires traversing: Party A → liability obligations → under condition 'Party B fails' → specific clause 3.2. This multi-hop relationship traversal is exactly what Graph RAG is designed for. Standard vector search might return chunks about 'Party A' and chunks about 'clause 3.2' separately, but cannot link them via their obligation relationship. Option A (Naive RAG) would miss the relationship. Option B (Advanced RAG) improves retrieval quality but still returns isolated chunks — it cannot traverse entity relationships. Option D (Self-RAG) is about deciding when to retrieve, not how to structure the knowledge. For legal review, also note: HITL review before presenting answers is critical given liability risk of hallucination."
+    },
+    {
+      "module": 28,
+      "type": "mcq",
+      "question": "Your RAG pipeline has: context_relevance=0.85 (good) and faithfulness=0.82 (good) but answer_relevance=0.48 (poor). Users complain the answers are accurate but don't actually address their question. What is the most likely root cause?",
+      "options": [
+        "A. The chunks are too small — increase chunk_size from 256 to 1024",
+        "B. The LLM is hallucinating despite good retrieval",
+        "C. The conversation turn_history from prior turns is diluting the current query intent in the prompt",
+        "D. The embedding model is poor quality — switch to BGE-large"
+      ],
+      "answer": "C",
+      "explanation": "High context relevance (0.85) means the right chunks are being retrieved. High faithfulness (0.82) means the LLM is staying grounded in the context. Low answer relevance means the generated text doesn't address the specific question — the LLM is answering a different question. The most common cause per Module 28.8 is turn_history diluting the current query: if the conversation history contains 10 prior turns, the LLM may anchor to an earlier question's context. Fix: add 'Directly answer: {question}' at the end of the prompt, or reduce the turn_history window. Option A is a retrieval fix (irrelevant here given good context_relevance). Option B is a faithfulness problem (good faithfulness rules this out). Option D is also a retrieval fix."
+    },
+    {
+      "module": 28,
+      "type": "gotcha",
+      "question": "You implement ParentDocumentRetriever with ChromaDB as vectorstore and InMemoryStore as docstore. Your service deploys successfully. After a server restart due to a deployment, users report that all property searches return empty results. What happened and how do you fix it?",
+      "options": [
+        "A. ChromaDB lost its data on restart — switch to PersistentClient",
+        "B. The InMemoryStore was wiped on restart — child vectors in ChromaDB point to parent IDs that no longer exist in docstore; fix by using RedisStore and a startup population check",
+        "C. The embedding model API key expired",
+        "D. ChromaDB's HNSW index needs to be rebuilt after restart"
+      ],
+      "answer": "B",
+      "explanation": "ChromaDB PersistentClient (correctly used) survives restarts — the vectors are intact. But InMemoryStore loses all parent documents on restart. When the retriever finds a matching child chunk vector, it looks up the parent ID in the docstore — and gets None because the store is empty. The retriever returns no results. Fix: use RedisStore (`from langchain_community.storage import RedisStore`) with a persistent Redis instance. Add a startup health check that verifies both stores are populated. Option A is wrong if PersistentClient is used correctly. Option C would cause embedding errors, not empty results. Option D is wrong — ChromaDB's HNSW index persists with PersistentClient."
+    },
+    {
+      "module": 29,
+      "type": "mcq",
+      "question": "Your team needs to choose an LLM for a healthcare chatbot handling patient appointment scheduling. Data privacy regulations prohibit sending patient data to external APIs. The queries are simple (schedule/cancel/reschedule), not complex reasoning. Which model choice fits the 5-axis framework?",
+      "options": [
+        "A. GPT-4o — best capability score ensures highest accuracy",
+        "B. Claude Sonnet 4.6 — best MMLU score for instruction following",
+        "C. Llama 3.1 8B self-hosted via vLLM — data privacy is the overriding constraint, and simple scheduling tasks don't require frontier capability",
+        "D. Gemini 2.0 Flash — cheapest frontier option with strong reasoning"
+      ],
+      "answer": "C",
+      "explanation": "The 5-axis framework with privacy as the overriding constraint (weight should be 50%+ for healthcare) eliminates all API-based options (A, B, D) — they all send data to external providers. Within self-hosted options, Llama 3.1 8B at 73% MMLU is sufficient for simple appointment scheduling (not complex reasoning). Self-hosted on vLLM with 1 A100 handles hundreds of concurrent users. Options A and B fail the privacy axis entirely. Option D fails privacy. The correct approach: set privacy as a hard constraint (pass/fail), then optimize cost and latency among remaining options. This is the key interview insight: privacy is sometimes a binary eliminator, not a weighted axis."
+    },
+    {
+      "module": 29,
+      "type": "design",
+      "question": "At 1M daily calls with 500 tokens average, your current Haiku 4.5 API bill is $263K/year. Your CTO asks if self-hosting Llama 3.1 70B would save money. Walk through the analysis.",
+      "options": [
+        "A. Self-hosting always saves money at 1M calls/day — the answer is obviously yes",
+        "B. Self-hosting breaks even at 6-8 months but requires MLOps investment; evaluate total cost including engineering, GPU, and operational risk",
+        "C. Self-hosting is never worth it due to engineering complexity",
+        "D. Use Gemini 2.0 Flash API instead — at $0.10/1M tokens it's 8× cheaper than Haiku"
+      ],
+      "answer": "B",
+      "explanation": "The full analysis: GPU cost = 2× A100 at $3/hr = $144/day = $52K/year. Engineering = 0.5 FTE MLOps at market rate ($150-250K TC) = $75-125K/year. Total self-hosted: $127-177K/year vs $263K hosted. Break-even: 6-12 months. BUT: Llama 3.1 70B has lower capability than Haiku for some tasks — run offline eval first. Option D (Gemini Flash) is a valid alternative that avoids MLOps overhead: 1M calls × 500 tokens × $0.10/1M = $50/day = $18K/year — actually the cheapest option if capability is sufficient. The CTO question should trigger: (1) capability eval first, (2) consider Gemini Flash as the 'third option' neither the CTO nor you considered, (3) only then evaluate self-hosting."
+    }
+  ],
+  "diagram_requests": [
+    {
+      "module": 23,
+      "title": "LCEL Runnable Protocol — What Each Operator Does at Runtime",
+      "description": "Show the Runnable interface as a box with 5 methods: invoke, ainvoke, batch, stream, astream. Show how the | pipe operator creates a RunnableSequence wrapping two Runnables. Show the RunnableParallel as a box that forks into multiple branches with a thread pool (sync) or asyncio.gather (async), merging results into a dict. Include error propagation arrows showing where exceptions bubble. This answers Alex's 'what are the runtime semantics' question and Priya's 'what actually happens when I call .invoke()' question."
+    },
+    {
+      "module": 23,
+      "title": "Text Splitter Decision Tree — Before and After",
+      "description": "Two side-by-side panels. Left: a real 800-word property listing document. Right: four chunking outputs shown simultaneously — RecursiveCharacter at 512 chars (paragraph-like chunks), MarkdownHeader (section-based), Semantic (topic-shift boundaries), Code splitter (if it were Python). Show chunk boundaries as colored dividers. Show overlap regions in a different color. This makes 'chunk_size=512' concrete for Priya who has no intuition for it, and shows Alex what MarkdownHeaderSplitter actually does vs RecursiveCharacter for structured docs."
+    },
+    {
+      "module": 24,
+      "title": "LangGraph State Mutation — With and Without Reducer",
+      "description": "Three columns: (1) AgentState with `messages: list` (no reducer) — show turn 1 returning [msg1], turn 2 returning [msg2], result is [msg2] only. (2) AgentState with `messages: Annotated[list, add_messages]` — show turn 1 giving [msg1], turn 2 giving [msg2], result is [msg1, msg2]. (3) A classification field with no reducer — show it persisting from turn 1 into turn 2 even when the node doesn't return it, causing stale routing. This directly addresses the two most common LangGraph bugs in one diagram."
+    },
+    {
+      "module": 24,
+      "title": "HITL Execution Flow — Across Multiple HTTP Requests",
+      "description": "A sequence diagram with 4 actors: User Browser, FastAPI Server, LangGraph App, Checkpoint Store (SQLite). Show: (1) Request 1: user sends message → graph runs to interrupt_before → state serialized to checkpoint → HTTP response returns 'pending approval'. (2) Async gap (hours). (3) Request 2: human approver calls /approve endpoint → app.invoke(Command(resume=None)) → graph loads state from checkpoint → continues execution → final response. This answers Alex's 'does the thread block?' question and shows the production async approval pattern."
+    },
+    {
+      "module": 26,
+      "title": "Vector Space Intuition — 2D Projection of Semantic Clusters",
+      "description": "A 2D scatter plot (t-SNE projection of real embeddings, simplified) showing 20-30 text examples as labeled dots. Cluster 1: property listings (BHK, city, price). Cluster 2: price queries ('how much', 'budget', 'under 2Cr'). Cluster 3: greetings/small talk. Cluster 4: legal/document queries. Show cosine similarity as angle between two vectors from the origin, and Euclidean distance as a straight line between two points. Show two documents in the same cluster with small angle (high cosine) but large Euclidean distance (different vector magnitudes). This directly addresses both Priya's 'what do 1536 numbers mean' question and Alex's 'why cosine not Euclidean' question."
+    },
+    {
+      "module": 26,
+      "title": "HNSW Index Structure — How ANN Search Navigates the Graph",
+      "description": "A layered graph diagram showing 3 layers. Top layer: few nodes (entry points), highly connected. Middle layer: more nodes. Bottom layer: all vectors. Show a query vector entering at the top layer, navigating to approximate nearest neighbors, descending to lower layers for refinement. Compare with a brute-force 'compare to every vector' approach. Annotate: 'HNSW = O(log n) comparisons vs O(n) brute force.' Show memory usage: each node stores edges to ~16 neighbors (m=16 parameter). This answers Alex's question about what HNSW actually does vs IVF."
+    },
+    {
+      "module": 27,
+      "title": "RAG Architecture Progression — Naive → Advanced → Agentic",
+      "description": "A horizontal progression showing 4 architectures side-by-side as pipeline diagrams. (1) Naive RAG: query → embed → top-k → stuff into prompt → LLM. (2) Advanced RAG: query → multi-query expansion → hybrid search → rerank → compression → LLM. (3) Self-RAG: query → classify(need retrieval?) → if yes: retrieve → groundedness check → if no: direct answer. (4) Agentic RAG: query → LLM → decide tool → SearchDocs | CalcEMI | web_search → observe → LLM → loop until done. Show token cost multiplier under each (1× / 1.5× / 0.7× / 3×). This addresses Priya's fundamental confusion about what each architecture adds and when to use which."
+    },
+    {
+      "module": 28,
+      "title": "Three Chunking Failure Zones — Visual with Real Text",
+      "description": "Three rows, each showing a real property description (~200 words). Row 1 (Zone 1 — too small, 50 tokens): show 6-8 tiny chunks, most lacking complete sentences, with a query 'price of 3BHK Bandra' pointing to a chunk containing only '₹2.5Cr' with no context about what property it refers to. Row 2 (Zone 2 — too large, 1500 tokens): one giant chunk with an annotation 'LLM attention: high at start and end, low in middle' shown as a gradient — parking details buried in the middle are missed. Row 3 (Zone 3 — boundary mismatch, 512 chars): sentence split across chunk boundary, with 'The price includes maintenance' in red at the end of chunk 1 and '...charges of ₹5,000' in red at the start of chunk 2. Row 4: optimal 256-token chunk showing a complete, self-contained fact."
+    },
+    {
+      "module": 29,
+      "title": "5-Axis Model Selection Radar Chart — Three Use Cases",
+      "description": "Three radar/spider charts side by side, each with 5 axes (Cost, Latency, Capability, Privacy, Control). Use case 1: Housing.com chatbot (consumer B2C) — show Haiku as the winner with high cost and latency scores, medium capability. Use case 2: Healthcare appointment bot — show Llama 3.1 70B self-hosted as winner because Privacy axis must be maximum; API models shown as failing the privacy axis entirely. Use case 3: Legal reasoning assistant — show Claude Sonnet as winner with high capability required. This makes the 5-axis framework actionable rather than abstract and shows how the weights shift by use case."
+    },
+    {
+      "module": 29,
+      "title": "TCO Waterfall Chart — Hosted vs Self-Hosted Cost Buildup",
+      "description": "Two waterfall/stacked bar charts showing annual cost buildup. Left (Hosted Haiku): Input tokens cost + Output tokens cost = $263K/year. Right (Self-hosted Llama 70B): GPU rental ($52K) + MLOps engineering ($125K) + monitoring/infra overhead ($15K) = $192K/year, with a 'break-even line' showing hosted is cheaper below ~500K calls/day. Add a third bar for Gemini 2.0 Flash at $18K/year with a note 'if capability is sufficient.' This directly addresses the CTO scenario in Alex's quiz question and makes the TCO calculation visually intuitive."
+    }
+  ]
+}

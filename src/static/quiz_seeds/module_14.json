@@ -1,0 +1,31 @@
+{
+  "module": "Module 9",
+  "student_notes": "Questions from production engineer review. Focus on practical application.",
+  "questions": [
+    {
+      "id": "m9q1",
+      "type": "mcq",
+      "difficulty": 3,
+      "question": "You are in Phase 1 (skeleton) of a new agent project. You have FastAPI + SSE + minimal LangGraph (3 nodes) working. A teammate suggests adding LangSmith integration now. Is this the right time? Why or why not?",
+      "options": [
+        "A. No \u2014 LangSmith should be added in Phase 6 (production hardening), not Phase 1",
+        "B. Yes \u2014 adding LangSmith in Phase 1 means every LLM call from Day 1 is traced, making debugging 10x faster during development",
+        "C. No \u2014 LangSmith requires the full 19-node pipeline to be useful",
+        "D. Yes, but only if you have a production API key, not a development key"
+      ],
+      "answer": "B",
+      "explanation": "The course recommends LangSmith in Phase 2 (classification). In practice, adding it in Phase 1 is even better. The @traceable decorator is a 2-line change per adapter. From the moment your first SLM call runs, you can see the exact prompt, the response, the token count, and the latency in LangSmith. When your Phase 1 skeleton produces wrong classifications, you find out why in 30 seconds instead of adding log statements and re-running. The cost is $0 for development traces up to the free tier. The opportunity cost of NOT having it is hours of print-debugging.",
+      "hint": ""
+    },
+    {
+      "id": "m9q2",
+      "type": "short",
+      "difficulty": 3,
+      "question": "You finish Phase 5 (LLM response pipeline working end-to-end). Before moving to Phase 6 (production hardening), what is the single most important regression test you should write, and what does it verify?",
+      "options": [],
+      "answer": "The most important test is an e2e pipeline test that verifies the SSE stream for a multi-turn conversation produces a valid connection_close event exactly once, even when a downstream component (Redis, Kafka) fails mid-pipeline. This test catches the most production-critical failure mode: a user whose request never terminates. Use bot_env=mock, inject a simulated Redis failure in the gate.release() path, invoke the pipeline via the HTTP endpoint, and assert that (a) an error event is emitted, (b) connection_close is emitted, (c) the response.body stream closes. Without this test, the connection_close trap (Gotcha 10.1) is invisible until it hits production.",
+      "explanation": "Unit tests verify individual nodes. This test verifies the system's failure handling contract \u2014 that no infrastructure failure can leave a user's connection hanging.",
+      "hint": ""
+    }
+  ]
+}

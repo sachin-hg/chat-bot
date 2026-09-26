@@ -115,6 +115,24 @@ INTENT_REGISTRY: list[IntentRecord] = [
     description='User wants to search by proximity: either to their live location ("near me") or to a named POI anchor ("near Manyata Tech Park").',
   ),
 
+  IntentRecord(
+    main_intent='property_search',
+    sub_intent='pick_nearby_localities',
+    tier=2,
+    model=None,    # Tier 2 — no LLM call
+    data_requirements=[
+      DataRequirement(tool='getTrendingLocalities', params_source='session', parallel_group=1),
+    ],
+    residual_tools=[],
+    session_inject=['city'],
+    carry_over_keys=['transaction_type', 'city', 'bhk', 'price_min', 'price_max',
+                     'property_type', 'amenities', 'price_max', 'last_expand_context'],
+    clear_keys=[],
+    pre_resolve_entities=False,
+    requires_auth=False,
+    description='User rejected the radius expansion and wants to pick specific nearby localities from a list.',
+  ),
+
   # ── property_detail ───────────────────────────────────────────────────
   IntentRecord(
     main_intent='property_detail',
